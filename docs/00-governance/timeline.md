@@ -61,3 +61,5 @@ evidence: []
 | 2026-11-16T17:50:00+08:00 | REQ-API-002 | 探针 v5/v6：语义封装 22 项（场景对象/组件/Prefab/材质/资产），能力总数 42 | lead |  | probe/DSHBridgeProbe.cs.tpl |
 | 2026-11-16T17:51:00+08:00 | AA-TYPE-001 | 实测缺陷：类型只认全名导致 BoxCollider 等短名不可用，FindType 增加短名解析与缓存 | lead |  | probe/DSHBridgeProbe.cs.tpl |
 | 2026-11-16T17:52:00+08:00 | REAL-ENV-005 | P376 重启加载 v6：场景对象/组件/材质/资产/Prefab 全链路实测通过，测试产物已清理 | lead |  | P376 |
+| 2026-11-16T18:00:00+08:00 | REL-0.0.1 | 首个公开版本发布：仓库 seeseeczl/DSH-Bridge + Release v0.0.1；插件版本统一为 0.0.1 | lead | 38c3123 | https://github.com/seeseeczl/DSH-Bridge/releases/tag/v0.0.1 |
+| 2026-11-16T18:05:00+08:00 | ENV-FIX-001 | 修复本机 plugin_manager 的 Invalid URL：profile 中 dsh-cursorx 的 scp 风格 git+ssh 地址改为标准 URL 形式 | lead |  | ~/.dsh/profiles/desktop/package.json |
