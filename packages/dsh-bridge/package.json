@@ -1,0 +1,33 @@
+{
+  "name": "@local/dsh-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "description": "DSH-side bridge that discovers and controls local creative apps (Unity first) without MCP servers or listening ports.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.mjs",
+    "core",
+    "transport",
+    "adapters",
+    "safety",
+    "tools",
+    "locale",
+    "docs",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "source_roots": ["src", "app", "lib", "packages"],
+  "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".java", ".rb", ".cs", ".php", ".vue", ".svelte"],
+  "ignore_dirs": [".git", "node_modules", "vendor", "dist", "build", "coverage", ".next", ".turbo", ".codegraph"],
+  "thresholds": {
+    "ui": { "warning": 180, "limit": 300 },
+    "service": { "warning": 200, "limit": 300 },
+    "source": { "warning": 250, "limit": 400 },
+    "test": { "warning": 400, "limit": 600 },
+    "config": { "warning": 160, "limit": 200 }
+  },
+  "audit": {
+    "output_dir": "docs/05-audits",
+    "reuse_legacy_history": true
+  }
+}

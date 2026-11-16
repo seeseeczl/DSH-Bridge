@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH 桥",
+    "description": "让 DSH 直接控制本机已打开的创作软件（首期 Unity，后续 Blender/C4D），无需安装 MCP 服务、无需开放端口。",
+    "detail": "docs/DETAIL.md"
+  }
+}

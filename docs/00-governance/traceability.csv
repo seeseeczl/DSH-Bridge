@@ -1,0 +1,10 @@
+source_id,source_type,status,architecture_or_design,module_or_contract,task_or_commit,regression_id,last_verification,release_id,owner,notes
+PRJ-0001,project-charter,approved,ARCH-REQ-0001,MOD-0005,TASK-0001..0014,,2026-11-16,,lead,治理基线
+CR-ADD-UNITY-ADAPTER,change-request,approved,ADR-0001,MOD-0003,TASK-0005,REG-INSTALL-001,2026-11-16,,lead,openspec/changes/add-unity-bridge-adapter
+FR-0001,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0004,REG-DISCOVERY-001,2026-11-16,,lead,实例发现
+FR-0002,functional,approved,ADR-0001,MOD-0002,TASK-0002,REG-TRANSPORT-001,2026-11-16,,lead,零端口通道（含 NFR-0001 零监听端口）
+FR-0003,functional,approved,ADR-0002,MOD-0003,TASK-0005/TASK-0006,REG-INSTALL-001,2026-11-16,,lead,探针安装与卸载（含 NFR-0005 可卸载）
+FR-0004,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0007,REG-CAPABILITY-001,2026-11-16,,lead,能力调用
+FR-0005,functional,approved,ARCH-REQ-0001,MOD-0001,TASK-0003,REG-ISOLATION-001,2026-11-16,,lead,多实例隔离（含 NFR-0003 超时恢复）
+FR-0006,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0010,REG-EVENTS-001,2026-11-16,,lead,事件游标
+FR-0007,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0013,REG-EXTEND-001,2026-11-16,,lead,适配器可扩展

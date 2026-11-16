@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+coverage/
+dist/
+
+# Unity 探针会写入目标工程（不在本仓库），此处仅防御性忽略
+Assets/DSHBridge/

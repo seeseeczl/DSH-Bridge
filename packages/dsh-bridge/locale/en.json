@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH Bridge",
+    "description": "Control local creative apps (Unity now, Blender/C4D later) from DSH without installing an MCP server or opening a port.",
+    "detail": "docs/DETAIL.md"
+  }
+}

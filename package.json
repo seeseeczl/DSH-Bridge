@@ -1,0 +1,19 @@
+{
+  "name": "dsh-bridge-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "DSH-Bridge workspace: DSH-side bridge plugin and its governance artifacts.",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "test:unit": "node --test \"tests/unit/*.test.mjs\"",
+    "test:e2e": "node --test \"tests/e2e/*.test.mjs\"",
+    "check:probe": "node tests/unity-probe/compile-check.mjs",
+    "doctor": "node scripts/bridge-doctor.mjs",
+    "verify": "npm run test && npm run check:probe && npm run check:docs && openspec validate --specs && openspec validate add-unity-bridge-adapter && python3 /Users/long/.dsh/skills/project-architect/scripts/check_project_architecture.py --root . --check-docs --check-kickoff --check-traceability --check-fitness --strict",
+    "check:docs": "node scripts/check-doc-consistency.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
