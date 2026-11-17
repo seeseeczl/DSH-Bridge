@@ -15,13 +15,16 @@
 - [x] 2.2 实现探针模板生成与安装预览
 - [x] 2.3 实现安装/升级/卸载
 - [x] 2.4 实现握手与能力清单
-- [x] 2.5 实现 8 个内置能力：`editor.status`、`console.read`、`hierarchy.list`、`asset.find`、`menu.execute`、`playmode.set`、`asset.refresh`、`reflect.invoke`
+- [x] 2.5 实现首批 8 个内置能力：`editor.status`、`console.read`、`hierarchy.list`、`asset.find`、`menu.execute`、`playmode.set`、`asset.refresh`、`reflect.invoke`
+  - 后续增量（时间线记录，已登记为 FR-0008/0009/0013）：通用执行面 12 项、语义封装 22 项，能力总数 42 项
+  - `unity.menu.execute` 在探针侧永久关闭（无配置可开启）
 - [x] 2.6 实现事件游标读取
 
 ## 3. DSH 插件
 
 - [x] 3.1 插件清单、`cordis.patch.yml`、locale、图标、详情文档
-- [x] 3.2 注册 4 个工具并使用 `defineTool` 契约
+- [x] 3.2 注册工具并使用 `defineTool` 契约
+  - 后续增量（FR-0011/FR-0010）：`bridge_preinstall`、`bridge_knowledge_save/list/read/delete`，当前共 8 个工具
 - [x] 3.3 首次启动自动发现与状态提示
 
 ## 4. 验证
@@ -37,3 +40,4 @@
 - [x] 5.1 架构与需求基线
 - [x] 5.2 任务章程
 - [x] 5.3 用户使用说明与限制声明
+- [x] 5.4 归档前的需求对齐：能力清单登记为 FR-0008/FR-0009/FR-0013，工具面登记为 FR-0010/FR-0011

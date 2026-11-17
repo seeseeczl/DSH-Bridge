@@ -83,6 +83,12 @@ kickoff_completion: complete
 | NFR-0003 | 非功能 | 可恢复性：超时/崩溃后无悬挂调用、无残留锁 | 杀死对端后调用在 deadline 内失败 | P0 | `specs/bridge-core` | approved |
 | NFR-0004 | 非功能 | 最小权限与审计：目录 0700、危险能力默认拒绝、每次调用可追溯 | 审计日志包含请求、实例、能力、结果 | P0 | `specs/bridge-core` | approved |
 | NFR-0005 | 非功能 | 可卸载性：删除探针即完全回滚，无后台进程 | 卸载后 `git status` 无残留 | P0 | `specs/unity-adapter` | approved |
+| FR-0008 | 功能 | 通用执行面：对象查找、任意 API 调用与成员发现、内容检索、资产读写与创建、导入设置读写、场景与选择控制 | 反射与菜单执行默认关闭；路径越界返回 `path_escape`；`search.content` 有预算并回传 `truncated` | P1 | `specs/unity-adapter`、REG-SEC-002/003、REG-LIMIT-001 | approved |
+| FR-0009 | 功能 | 语义封装：场景对象、组件、Prefab、材质与资产操作按语义封装为独立能力，而非要求调用方拼反射 | 42 项能力全部由探针 `Execute` 分发；语义用例覆盖越权拒绝与空参数 | P1 | `specs/unity-adapter`、REG-SEC-003 | approved |
+| FR-0010 | 功能 | 主题知识库：把功能实现方案落成本地 Markdown，支持保存/列表/读取/删除 | 文档落 `~/.dsh/bridge/knowledge/`，不进目标工程；主题名不得路径穿越 | P2 | REG-KNOWLEDGE-001 | approved |
+| FR-0011 | 功能 | 工程扫描与预植入：在目标软件未运行时提前写入探针，首次启动即完成编译 | 默认只预览；`apply: true` 才写入；运行中工程默认跳过 | P2 | `specs/unity-adapter`、REG-INSTALL-001 | approved |
+| FR-0012 | 功能 | 后台实例唤醒：编辑器失去焦点时心跳与轮询停止，调用前临时激活并在完成后恢复前台应用 | 心跳陈旧时先激活；结束后恢复原前台应用；非 darwin 平台退化为直接调用 | P2 | REG-RECOVERY-001 | approved |
+| FR-0013 | 功能 | 事件与拒绝可观测：编译状态三态、`request_rejected` 事件、通道积压统计 | 编译未知时 `ok:null` 且 `stateKnown:false`；越权尝试产生事件；`bridge_targets` 暴露积压 | P1 | `specs/unity-adapter`、REG-EVENT-001、REG-SEC-003 | approved |
 
 ## 推荐技术路径
 

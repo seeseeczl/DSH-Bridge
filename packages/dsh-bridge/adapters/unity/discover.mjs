@@ -1,25 +1,28 @@
 // Unity / 团结引擎 进程发现：进程名 → 工程路径 → instanceId。
 // 只用 ps/lsof（macOS/Linux 通用），不依赖目标软件配合。
 import { execFile } from 'node:child_process'
-import { readFile, readdir, realpath } from 'node:fs/promises'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { instanceIdFor } from '../../core/identity.mjs'
 
 const run = promisify(execFile)
 
+// 只认「.app 的主可执行文件」这一个精确位置。
+// 历史实现还有一条 `/Unity\.app/i` 兜底，它把编辑器自带的工具进程也算了进来——
+// 团结引擎会常驻 ILPP.Runner / TuanjieAutoQuitter / TuanjieShaderCompiler（都在 `.app/Contents/Tools/` 下），
+// 这些进程没有 -projectPath，只能靠 cwd 推断，于是被当成「同工程的第二个编辑器」，
+// 进而让 pidMismatch 恒为真、所有调用都被 instance_ambiguous 拒绝。
 export const ENGINE_PATTERNS = [
-  { engine: 'unity', re: /\/Unity\.app\/Contents\/MacOS\/Unity(\s|$)/ },
-  { engine: 'tuanjie', re: /\/Tuanjie\.app\/Contents\/MacOS\/Tuanjie(\s|$)/ },
-  { engine: 'unity-linux', re: /\/Editor\/Unity(\s|$)/ },
+  { engine: 'unity', re: /\/Unity\.app\/Contents\/MacOS\/Unity(?=\s|$)/ },
+  { engine: 'tuanjie', re: /\/Tuanjie\.app\/Contents\/MacOS\/Tuanjie(?=\s|$)/ },
+  { engine: 'unity-linux', re: /\/Editor\/Unity(?=\s|$)/ },
 ]
 
 export function engineOf(command) {
   for (const entry of ENGINE_PATTERNS) {
     if (entry.re.test(command)) return entry.engine
   }
-  if (/Unity\.app/i.test(command)) return 'unity'
-  if (/Tuanjie\.app/i.test(command)) return 'tuanjie'
   return null
 }
 
@@ -157,12 +160,23 @@ export async function discoverUnityInstances({ ps = processList } = {}) {
   return out
 }
 
-/** 探针是否存在于该工程（不判断心跳）。 */
+/**
+ * 探针是否存在于该工程（不判断心跳）。
+ * 探针已迁到 embedded package（Packages/com.dsh.bridge/Editor/），旧的 Assets/DSHBridge 只作为
+ * 迁移前的兼容位置检查——否则 bridge_preinstall 会对已装好的工程反复误判为"未安装"。
+ */
 export async function probePresent(projectPath) {
-  try {
-    const entries = await readdir(join(projectPath, 'Assets', 'DSHBridge'))
-    return entries.includes('DSHBridgeProbe.cs')
-  } catch {
-    return false
+  const candidates = [
+    join(projectPath, 'Packages', 'com.dsh.bridge', 'Editor', 'DSHBridgeProbe.cs'),
+    join(projectPath, 'Assets', 'DSHBridge', 'DSHBridgeProbe.cs'),
+  ]
+  for (const file of candidates) {
+    try {
+      const info = await stat(file)
+      if (info.isFile()) return true
+    } catch {
+      // 继续检查下一个候选位置
+    }
   }
+  return false
 }

@@ -31,6 +31,7 @@ export async function preinstallProjects(bridge, {
   }
 
   if (!apply) {
+    await bridge.audit.record({ event: 'preinstall', apply: false, scanned: candidates.length })
     return {
       apply: false,
       scanned: candidates.length,
@@ -49,7 +50,7 @@ export async function preinstallProjects(bridge, {
       skipped.push({ ...item, reason: 'running' })
       continue
     }
-    const result = await adapter.installStandalone(item.projectPath, {})
+    const result = await adapter.installStandalone(item.projectPath, { allowDangerous: bridge.allowDangerous })
     applied.push({
       projectPath: item.projectPath,
       version: item.version,
@@ -58,5 +59,6 @@ export async function preinstallProjects(bridge, {
     })
     await bridge.audit.record({ event: 'preinstall', projectPath: item.projectPath, changed: result.changed })
   }
+  await bridge.audit.record({ event: 'preinstall', apply: true, scanned: candidates.length, applied: applied.length, skipped: skipped.length })
   return { apply: true, scanned: candidates.length, applied, skipped }
 }

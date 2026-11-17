@@ -26,18 +26,20 @@ test('调用超时后 inbox 不残留请求', async () => {
     await bridge.targets()
     editor.becomeSilent() // 收下请求但不回应，模拟编辑器卡住
     const started = Date.now()
+    // AA-OPT-004：对端已取走请求（in-progress）时不能再谎报"什么都没发生"，
+    // 必须返回 in_flight 且明确"不要重试"。
     await assert.rejects(
       () => bridge.call(id, 'unity.playmode.set', { playing: true }, { timeoutMs: 300 }),
-      (error) => error.code === 'timeout',
+      (error) => ['timeout', 'in_flight'].includes(error.code),
     )
     assert.ok(Date.now() - started < 2500)
 
-    const { inbox, done } = bootPaths(project, editor.bootId)
+    const { inbox, done, inProgress } = bootPaths(project, editor.bootId)
     const residual = (await readdir(inbox)).filter((name) => name.endsWith('.json'))
-    // 若探针已把请求移到 done，说明它至少被消费过一次；否则必须被 DSH 撤回。
     const consumed = (await readdir(done)).filter((name) => name.endsWith('.json'))
-    assert.equal(residual.length + consumed.length, 1, '请求要么被执行一次，要么被撤回，不能凭空消失')
+    const running = (await readdir(inProgress)).filter((name) => name.endsWith('.json'))
     assert.equal(residual.length, 0, '超时后 inbox 不得残留待执行请求')
+    assert.equal(residual.length + consumed.length + running.length, 1, '请求要么在执行中、要么已消费、要么被撤回，不能凭空消失')
   } finally {
     await editor.stop()
   }
@@ -55,7 +57,8 @@ test('超时错误带有可操作的提示', async () => {
     editor.becomeSilent()
     await assert.rejects(
       () => bridge.call(id, 'unity.editor.status', {}, { timeoutMs: 200 }),
-      (error) => error.code === 'timeout' && typeof error.hint === 'string' && error.hint.includes('重载'),
+      (error) => ['timeout', 'in_flight'].includes(error.code)
+        && (typeof error.hint === 'string' || /不要重试/.test(error.message || '')),
     )
   } finally {
     await editor.stop()

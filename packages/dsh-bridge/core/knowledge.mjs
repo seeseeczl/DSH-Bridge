@@ -2,11 +2,22 @@
 // 只存结论，不存全工程清单；文件位于 DSH 侧，不进目标工程。
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 export function knowledgeRoot(instanceId) {
   const safe = String(instanceId ?? 'unknown').replace(/[^a-zA-Z0-9._-]/g, '_')
   return join(homedir(), '.dsh', 'bridge', 'knowledge', safe)
+}
+
+/** 主题文件名只允许安全字符；任何 ../ 与绝对路径都会被收纳成普通名字（AA-OPT-016）。 */
+export function safeTopicName(slugOrTopic) {
+  const raw = String(slugOrTopic ?? '').trim()
+  const base = raw.replace(/\.md$/i, '')
+  if (!base) throw Object.assign(new Error('缺少 topic'), { code: 'invalid_argument' })
+  if (base.includes('/') || base.includes('\\') || base.startsWith('.') || base.includes('..')) {
+    throw Object.assign(new Error(`topic 名称不合法：${base}`), { code: 'invalid_argument' })
+  }
+  return base
 }
 
 export function slugify(topic) {
@@ -17,6 +28,16 @@ export function slugify(topic) {
     .replace(/^-|-$/g, '')
   // 纯中文主题在部分文件系统上仍可用，但保留长度上限避免路径过长。
   return (base || 'topic').slice(0, 80)
+}
+
+/** 确保最终路径仍在 topics 目录内（防止符号链接或异常 slug 逃逸）。 */
+function assertInsideTopics(dir, file) {
+  const base = resolve(dir)
+  const full = resolve(file)
+  if (full !== base && !full.startsWith(`${base}${sep}`)) {
+    throw Object.assign(new Error(`知识库路径越界：${file}`), { code: 'path_escape' })
+  }
+  return full
 }
 
 async function writeAtomic(path, text) {
@@ -33,7 +54,7 @@ export async function saveTopic(instanceId, { topic, content, sources = [], summ
   const dir = join(root, 'topics')
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const slug = slugify(topic)
-  const file = join(dir, `${slug}.md`)
+  const file = join(dir, `${safeTopicName(slug)}.md`)
   const createdAt = new Date().toISOString()
   const header = [
     '---',
@@ -48,7 +69,7 @@ export async function saveTopic(instanceId, { topic, content, sources = [], summ
     ? `\n\n## 来源\n${sources.map((item) => `- \`${item}\``).join('\n')}\n`
     : '\n'
   const body = `${header}${content.trim()}\n${sourceBlock}`
-  await writeAtomic(file, body)
+  await writeAtomic(assertInsideTopics(dir, file), body)
   return { path: file, slug, topic, bytes: Buffer.byteLength(body, 'utf8'), updated: createdAt }
 }
 
@@ -76,9 +97,9 @@ export async function listTopics(instanceId) {
 /** 读取一个主题；slug 或标题都可。 */
 export async function readTopic(instanceId, slugOrTopic) {
   const dir = join(knowledgeRoot(instanceId), 'topics')
-  const direct = join(dir, `${slugOrTopic.replace(/\.md$/, '')}.md`)
+  const direct = join(dir, `${safeTopicName(slugOrTopic)}.md`)
   try {
-    const text = await readFile(direct, 'utf8')
+    const text = await readFile(assertInsideTopics(dir, direct), 'utf8')
     return { path: direct, content: text }
   } catch {
     // 回退：按标题匹配
@@ -92,9 +113,9 @@ export async function readTopic(instanceId, slugOrTopic) {
 
 /** 删除一个主题。 */
 export async function removeTopic(instanceId, slugOrTopic) {
-  const file = join(knowledgeRoot(instanceId), 'topics', `${slugOrTopic.replace(/\.md$/, '')}.md`)
+  const file = join(knowledgeRoot(instanceId), 'topics', `${safeTopicName(slugOrTopic)}.md`)
   try {
-    await rm(file, { force: true })
+    await rm(assertInsideTopics(join(knowledgeRoot(instanceId), 'topics'), file), { force: true })
     return true
   } catch {
     return false

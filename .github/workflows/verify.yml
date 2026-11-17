@@ -1,0 +1,63 @@
+# CI 门禁（审计 P1.6 / AUD-BUILD-001）
+#
+# 目标：每次 push / PR 都执行 `npm run verify`，让"声明与实现一致性"不再依赖本地手工。
+# 与本地门禁的唯一差异是环境准备：探针验证需要 mono（csc + 运行时）。
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install C# toolchain
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install mono
+          else
+            sudo apt-get update
+            sudo apt-get install -y mono-devel
+          fi
+
+      - name: Verify toolchain is actually available
+        run: |
+          csc --version || csc -help | head -3
+          mono --version
+          node tests/unity-probe/toolchain.mjs
+
+      # OpenSpec CLI：本地开发用 Homebrew 版 1.7.0；CI 用 npm 全局安装并校验版本可用。
+      - name: Install OpenSpec CLI
+        run: |
+          npm install -g @fission-ai/openspec@latest
+          openspec --version
+
+      - name: Run verify
+        run: npm run verify
+
+      - name: Doctor (self-check, non-blocking when no target app is running)
+        run: npm run doctor -- --json > doctor.json || true
+        if: always()
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doctor-${{ matrix.os }}
+          path: doctor.json
+          if-no-files-found: ignore

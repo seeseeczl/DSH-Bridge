@@ -78,19 +78,26 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
 - 传输基于文件轮询（约 80ms），单次调用延迟通常 100–300ms。
-- `unity.reflect.invoke` 默认关闭。
+- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与资产破坏性能力默认关闭；`unity.menu.execute` 永久关闭。
 - 本机信任模型：同用户进程可读取通道身份文件；配对校验防的是跨用户与误投递，不是同用户恶意进程。
 
 ## 安全边界
 
-通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转）。
+传输层：通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转），审计覆盖全部 6 个工具。
+
+执行层（探针内，见 `DETAIL.md`）：
+
+- **路径边界**：`asset.read` / `asset.create` / `importer.*` / `asset.*` 的所有路径强制落在工程根之内，越界返回 `path_escape`，只受理文本类资产扩展名。
+- **能力闸门**：反射执行面需 `allowDangerous` 授权才会在探针里解锁；`unity.menu.execute` 永久关闭；未授权请求即使绕过 DSH 直写 inbox 也会被拒绝。
+- **成员黑名单**：即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `System.Diagnostics.Process` 等类型与 `ExecuteMenuItem` / `Exit` 等成员。
+- **执行期超时可观测**：请求被取走后超时返回 `in_flight`（`retryable: false`），避免 Agent 把"可能已生效"当成"没发生"而重复执行。
 
 ## 配置
 
 ```yaml
 config:
   auditPath: ~/.dsh/bridge/audit.log
-  allowDangerous: []          # 例如 [unity.reflect.invoke]
+  allowDangerous: []          # 例如 [unity.reflect.invoke, unity.api.invoke]；unity.menu.execute 无法开启
   preinstallAuto: false       # 启动时自动预植入
   preinstallRoots: []         # 省略则用常见工程位置
 ```
@@ -106,3 +113,31 @@ adapters/   适配器契约 + unity（发现/安装/探针/唤醒/扫描）+ ble
 safety/     危险能力、路径校验、审计
 tools/      10 个 DSH 工具
 ```
+
+## 平台支持
+
+| 平台 | 实例发现 | 自动激活（唤醒） | 状态 |
+| --- | --- | --- | --- |
+| macOS（darwin） | 支持（`ps` + `lsof`） | 支持（`osascript`） | 已实测 |
+| Linux | 支持（`ps` + `lsof`，含 `unity-linux` 路径模式） | **不支持**：退化为直接调用，后台实例可能因心跳停止而超时 | 未实测 |
+| Windows | **不支持**：`ENGINE_PATTERNS` 无 Windows 编辑器路径，`ps`/`lsof` 也不可用 | 不支持 | 未实现 |
+
+未列出的平台请勿假设可用；如需 Windows 支持，需新增进程发现与激活实现（属 ADR 变更）。
+
+## 反射执行面与代码执行（v0.0.2 起）
+
+| 能力 | 作用 | 默认 |
+| --- | --- | --- |
+| `unity.reflect.invoke` | 成员访问：多候选名、绑定标志、命中回传（`resolvedMember`）、近似名提示 | 关闭 |
+| `unity.api.batch` | 批量调用 + 共享 Undo 组 + 失败回滚 + `onError` 补偿 | 关闭 |
+| `unity.code.execute` | 进程内编译执行 C#，等价 MCP `execute_code`（显式 `return` 取回值） | **开启** |
+
+`Library/DSHBridge/instance.json` 是公开发现协议（自描述心跳、`sourceHash`、`capabilities`、`grantedCapabilities`），
+CLI 可直接读取定位实例：
+
+```bash
+node scripts/bridge-cli.mjs discover --roots ~/Tuanjie3D --json
+node scripts/bridge-cli.mjs call <projectPath> unity.code.execute '{"code":"return 1+1;"}'
+```
+
+详见 `docs/DETAIL.md`。

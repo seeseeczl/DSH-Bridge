@@ -1,16 +1,30 @@
 // 桥编排：把「适配器发现」与「传输/授权/审计」粘合起来，工具层只依赖此模块。
 import { assertUniqueCapabilities, validateAdapter, AdapterError } from '../adapters/contract.mjs'
-import { authorizeCapability, createAudit, PolicyError, summarize } from '../safety/policy.mjs'
-import { probeHeartbeat } from '../transport/mailbox.mjs'
+import { authorizeCapability, createAudit, DEFAULT_DANGEROUS, PolicyError, summarize } from '../safety/policy.mjs'
+import { discoverInstances } from './discovery.mjs'
 import { preinstallProjects } from './preinstall.mjs'
 import { refreshInstance } from './lifecycle.mjs'
 
+/** 同工程多编辑器导致通道所有者与发现进程不一致时，拒绝下发指令（AA-OPT-005）。 */
+function assertUnambiguous(instanceId, instance) {
+  if (!instance?.pidMismatch) return
+  throw new PolicyError(
+    'instance_ambiguous',
+    `实例 ${instanceId} 的通道属于 pid ${instance.channelOwnerPid}，但发现的进程是 pid ${instance.pid}；`
+      + '同一工程有多个编辑器在运行。请关闭多余实例后重试，避免指令落到错误的编辑器。',
+    { instanceId, pid: instance.pid, channelOwnerPid: instance.channelOwnerPid },
+  )
+}
+
 export class Bridge {
-  constructor({ adapters = [], auditPath, allowDangerous = [], dangerous, staleMs = 15000, now = () => Date.now() } = {}) {
+  constructor({ adapters = [], auditPath, allowDangerous = [], dangerous, denied = [], staleMs, now = () => Date.now() } = {}) {
     this.adapters = new Map()
     this.audit = auditPath === null ? { record: async () => {} } : createAudit(auditPath)
     this.allowDangerous = allowDangerous
     this.dangerous = dangerous
+    // 配置化硬拒绝：比 allowDangerous 更强的否定，用来表达「本项目根本不允许」。
+    this.denied = denied
+    // 不设默认值：让 probeHeartbeat 优先采用心跳自述的 staleAfterMs（显式值 > 自述 > 15000）。
     this.staleMs = staleMs
     this.now = now
     this.instances = new Map()
@@ -37,70 +51,9 @@ export class Bridge {
    * 结果整体替换缓存，已消失的实例不会残留。
    */
   async targets() {
-    const next = new Map()
-    const results = []
-    for (const adapter of this.adapters.values()) {
-      let candidates = []
-      try {
-        candidates = await adapter.detect()
-      } catch (error) {
-        results.push({
-          adapterId: adapter.id,
-          instanceId: null,
-          status: 'error',
-          error: { code: 'adapter_detect_failed', message: error?.message ?? String(error) },
-        })
-        continue
-      }
-      for (const candidate of candidates) {
-        const heartbeat = await probeHeartbeat(candidate.projectPath, { staleMs: this.staleMs })
-          .catch(() => ({ status: 'unknown', instance: null, age: null }))
-        const probe = heartbeat.instance
-        const merged = {
-          adapterId: adapter.id,
-          instanceId: candidate.instanceId,
-          displayName: adapter.displayName,
-          projectPath: candidate.projectPath,
-          projectName: candidate.projectName ?? null,
-          pid: candidate.pid ?? probe?.pid ?? null,
-          engine: candidate.engine ?? probe?.engine ?? null,
-          engineVersion: candidate.engineVersion ?? probe?.unityVersion ?? null,
-          // idle = 进程在但心跳停（编辑器在后台），仍可控制，调用前会唤醒。
-          status: !probe ? 'unprobed'
-            : heartbeat.status === 'stale' ? 'stale'
-              : heartbeat.status === 'ready' ? 'ready'
-                : 'idle',
-          probeVersion: probe?.probeVersion ?? null,
-          expectedProbeVersion: adapter.probeVersion ?? null,
-          probeOutdated: Boolean(probe && adapter.probeVersion && probe.probeVersion !== adapter.probeVersion),
-          bootId: probe?.bootId ?? null,
-          nonce: probe?.nonce ?? null,
-          lastSeenAt: probe?.lastSeenAt ?? null,
-          heartbeatAgeMs: Number.isFinite(heartbeat.age) ? heartbeat.age : null,
-          pidAlive: Boolean(heartbeat.pidAlive),
-          scene: probe?.scene ?? null,
-          isPlaying: probe?.isPlaying ?? null,
-          capabilities: probe?.capabilities ?? [],
-          duplicates: [],
-        }
-        const existing = next.get(merged.instanceId)
-        if (existing) {
-          // 同工程多实例：保留并显式标记冲突，不静默丢弃。
-          existing.duplicates.push({ pid: merged.pid, status: merged.status })
-          continue
-        }
-        next.set(merged.instanceId, merged)
-        results.push(merged)
-      }
-    }
-    this.instances = next
-    for (const instance of next.values()) {
-      const adapter = this.adapters.get(instance.adapterId)
-      if (typeof adapter?.backlog === 'function' && instance.status === 'ready') {
-        instance.channelBacklog = await adapter.backlog(instance).catch(() => null)
-      }
-    }
-    return results.sort((a, b) => String(a.instanceId).localeCompare(String(b.instanceId)))
+    const { instances, results } = await discoverInstances(this)
+    this.instances = instances
+    return results
   }
 
   async requireInstance(instanceId) {
@@ -118,6 +71,12 @@ export class Bridge {
     return adapter
   }
 
+  /** 只读工具也要留痕：否则"谁在什么时候读了什么"不可审计（AA-OBS-002）。 */
+  async observe(event, payload = {}) {
+    await this.audit.record({ event, ...payload })
+    return payload
+  }
+
   async install(instanceId, options = {}) {
     const { dryRun = false } = options
     const instance = await this.requireInstance(instanceId)
@@ -125,7 +84,8 @@ export class Bridge {
     const started = this.now()
     let result
     try {
-      result = await adapter.install(instance, { ...options, dryRun })
+      // 授权快照随安装写入探针源码：反射执行面能否用，取决于这一次安装时的配置。
+      result = await adapter.install(instance, { ...options, dryRun, allowDangerous: this.allowDangerous, denied: this.denied })
     } catch (error) {
       await this.audit.record({
         event: 'install', instanceId, ok: false, code: error?.code ?? 'install_failed',
@@ -147,7 +107,16 @@ export class Bridge {
   async uninstall(instanceId) {
     const instance = await this.requireInstance(instanceId)
     const adapter = this.adapterFor(instance)
-    const result = await adapter.uninstall(instance)
+    let result
+    try {
+      result = await adapter.uninstall(instance)
+    } catch (error) {
+      await this.audit.record({
+        event: 'uninstall', instanceId, ok: false, code: error?.code ?? 'uninstall_failed',
+        message: error?.message ?? String(error),
+      })
+      throw error
+    }
     await this.audit.record({ event: 'uninstall', instanceId, ok: true, removed: result?.removed ?? [] })
     this.instances.delete(instanceId)
     return result
@@ -156,9 +125,17 @@ export class Bridge {
   /** 能力调用：授权 → 状态刷新 → 能力核对 → 路由 → 审计。 */
   async call(instanceId, capability, args = {}, { timeoutMs = 30000, signal, autoWake = true } = {}) {
     let instance = await this.requireInstance(instanceId)
+    // AA-OPT-005：通道所有者与发现的进程不一致时，指令会进入"另一个编辑器"。
+    // 这比超时更危险（用户以为在操作 A，实际改的是 B），所以在任何刷新/唤醒之前直接拒绝。
+    assertUnambiguous(instanceId, instance)
     instance = await refreshInstance(this, instance)
+    assertUnambiguous(instanceId, instance)
     const adapter = this.adapterFor(instance)
 
+    if (this.denied.includes(capability)) {
+      await this.audit.record({ event: 'call', instanceId, capability, ok: false, code: 'capability_denied', args: summarize(args) })
+      throw new PolicyError('capability_denied', `能力 ${capability} 被插件配置 bridge.denied 显式禁止，任何授权都无法开启`, { capability })
+    }
     const allowed = authorizeCapability(capability, { allowDangerous: this.allowDangerous, dangerous: this.dangerous })
     if (!allowed.ok) {
       await this.audit.record({ event: 'call', instanceId, capability, ok: false, code: allowed.code, args: summarize(args) })
@@ -235,7 +212,8 @@ export class Bridge {
         out.push({
           capability: cap,
           adapterId: adapter.id,
-          dangerous: (this.dangerous ?? ['unity.reflect.invoke']).includes(cap),
+          // 与 authorizeCapability 使用同一份清单，避免「self 里判危险、上表里报安全」。
+          dangerous: (this.dangerous ?? DEFAULT_DANGEROUS).includes(cap),
         })
       }
     }

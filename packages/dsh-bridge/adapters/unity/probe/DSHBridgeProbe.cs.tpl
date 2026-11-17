@@ -4,6 +4,7 @@
 // </auto-generated>
 #if UNITY_EDITOR
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -22,10 +23,50 @@ namespace DSHBridge
     public static class DSHBridgeProbe
     {
         public const string ProbeVersion = "__PROBE_VERSION__";
+        // 源码内容哈希：版本号只能表达「第几版」，同一版本改了源码时无法区分。
+        // 把它写进心跳，DSH 才能真正确认「跑的是我刚写进去的那份代码」。
+        public const string SourceHash = "__SOURCE_HASH__";
         const string RootRelative = "Library/DSHBridge";
         const double ScanInterval = 0.1;
         const double HeartbeatInterval = 2.0;
         const int LogCapacity = 400;
+
+        // ===== 安全边界（AA-OPT-001/002/003）=====
+        // 与 DSH 侧 DEFAULT_DANGEROUS 保持一致：这些能力不写入宿主目录、不提供常驻反射面，
+        // 因此即使请求绕过 DSH 直接写进 inbox，探针也会拒绝。真正的用户授权在 DSH 侧。
+        // 可授权的反射执行面：需要授权快照（源码注入）里出现该能力名才放行。
+        static readonly string[] _reflectCapabilities = new string[] {
+            "unity.reflect.invoke", "unity.api.invoke", "unity.api.members", "unity.api.batch"
+        };
+        // 永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
+        static readonly string[] _blockedCapabilities = new string[] {
+            "unity.menu.execute"
+        };
+        // 授权快照：安装探针时由 DSH 侧把 allowDangerous 的内容渲染进源码（见 probe.template.mjs）。
+        // 之所以写进源码而不是读配置文件，是为了让「授权」必须经过一次显式安装/重装，
+        // 运行期无法通过写 Library 下的文件自行提权。
+        static readonly string[] _grantedCapabilities = new string[] { __ALLOW_DANGEROUS__ };
+        // 配置化硬拒绝：即使用户把该能力列入 allowDangerous，也永不放行。
+        // 用于表达「本项目根本不允许某能力」，而不仅是「默认需要授权」。
+        static readonly string[] _deniedCapabilities = new string[] { __DENY_CAPABILITIES__ };
+        // argv 授权是整机级旁路（编排环境启动时加 -dshBridgeAuthorize），优先级低于按能力快照。
+        static bool? _reflectEnabled;
+        static readonly HashSet<string> _deniedMembers = new HashSet<string>(StringComparer.Ordinal) {
+            "ExecuteMenuItem", "Exit", "Quit", "OpenProject", "SaveScene", "NewScene"
+        };
+        static readonly HashSet<string> _deniedTypes = new HashSet<string>(StringComparer.Ordinal) {
+            "UnityEditor.EditorApplication", "UnityEditor.AssetDatabase", "UnityEditor.Compilation.CompilationPipeline",
+            "UnityEditorInternal.InternalEditorUtility", "System.Diagnostics.Process", "System.Diagnostics.ProcessStartInfo",
+            "System.AppDomain", "System.Reflection.Assembly"
+        };
+        // 允许 unity.asset.read / unity.asset.create 直接读写的源码与文本扩展名。
+        static readonly HashSet<string> _textableExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            ".cs", ".shader", ".cginc", ".hlsl", ".hlslinc", ".txt", ".json", ".md", ".xml", ".yml", ".yaml",
+            ".csv", ".asset", ".mat", ".prefab", ".unity", ".uss", ".uxml", ".shadergraph", ".asmdef", ".asmref"
+        };
+        const string AuthorizeArg = "-dshBridgeAuthorize";
+        const int SearchTimeBudgetMs = 5000;
+        const int SearchFileBudget = 4000;
 
         static string _projectRoot;
         static string _rootDir;
@@ -33,6 +74,7 @@ namespace DSHBridge
         static string _outboxDir;
         static string _eventsDir;
         static string _doneDir;
+        static string _progressDir;
         static string _instanceId;
         static string _bootId;
         static string _nonce;
@@ -56,7 +98,9 @@ namespace DSHBridge
             "unity.component.set", "unity.component.get", "unity.prefab.create", "unity.prefab.instantiate",
             "unity.prefab.open", "unity.prefab.save", "unity.prefab.close", "unity.material.get",
             "unity.material.set", "unity.asset.rename", "unity.asset.move", "unity.asset.delete",
-            "unity.asset.duplicate"
+            "unity.asset.duplicate",
+            // 通用反射执行面扩展：批量事务与进程内代码执行（等价 MCP execute_code）。
+            "unity.api.batch", "unity.code.execute"
         };
 
         static DSHBridgeProbe()
@@ -75,6 +119,7 @@ namespace DSHBridge
             _startTicks = self.StartTime.ToUniversalTime().Ticks;
             _startedAt = self.StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
 
+            if (!_reflectEnabled.HasValue) _reflectEnabled = AuthorizedByArgv();
             LoadOrCreateIdentity();
 
             _instanceId = "unity:" + Sha1Short(_projectRoot);
@@ -82,10 +127,18 @@ namespace DSHBridge
             _outboxDir = Path.Combine(_rootDir, _bootId, "outbox");
             _eventsDir = Path.Combine(_rootDir, _bootId, "events");
             _doneDir = Path.Combine(_rootDir, _bootId, "done");
+            _progressDir = Path.Combine(_rootDir, _bootId, "in-progress");
             Directory.CreateDirectory(_inboxDir);
             Directory.CreateDirectory(_outboxDir);
             Directory.CreateDirectory(_eventsDir);
             Directory.CreateDirectory(_doneDir);
+            Directory.CreateDirectory(_progressDir);
+
+            // AA-OPT-010：清理本地历史运行留下的通道目录，避免 Library 随重启线性膨胀。
+            SweepStaleBootDirs();
+
+            // 先补写「上次被打断」的响应，再开始心跳，避免调用方在窗口期内看不到结论。
+            RecoverInterruptedRequests();
 
             WriteHeartbeat();
 
@@ -126,6 +179,34 @@ namespace DSHBridge
             _eventSeq = 0;
         }
 
+        /// <summary>
+        /// AA-OPT-010：保留最近 2 个通道目录（当前 + 上一个），其余删除。
+        /// 只处理本进程以外的目录；删除失败（被占用）时忽略，下次启动再试。
+        /// </summary>
+        static void SweepStaleBootDirs()
+        {
+            try
+            {
+                if (!Directory.Exists(_rootDir)) return;
+                var dirs = new List<string>();
+                foreach (var dir in Directory.GetDirectories(_rootDir))
+                {
+                    var name = Path.GetFileName(dir);
+                    if (name == _bootId) continue;
+                    if (name.Length != 16) continue;
+                    dirs.Add(dir);
+                }
+                if (dirs.Count <= 1) return;
+                dirs.Sort(delegate (string a, string b) { return Directory.GetLastWriteTimeUtc(b).CompareTo(Directory.GetLastWriteTimeUtc(a)); });
+                for (var i = 1; i < dirs.Count; i++)
+                {
+                    try { Directory.Delete(dirs[i], true); }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
         static void Tick()
         {
             try
@@ -136,11 +217,97 @@ namespace DSHBridge
                     _nextHeartbeat = now + HeartbeatInterval;
                     WriteHeartbeat();
                 }
+                if (now >= _nextOutboxSweep)
+                {
+                    _nextOutboxSweep = now + OutboxSweepInterval;
+                    SweepStaleOutbox();
+                }
                 if (_scanning || now < _nextScan) return;
                 _nextScan = now + ScanInterval;
                 Poll();
             }
             catch (Exception e) { UnityEngine.Debug.LogWarning("[DSHBridge] tick: " + e.Message); }
+        }
+
+        /// <summary>一次扫描内最多丢弃多少个无效文件（防止单个坏批次长时间占用主线程）。</summary>
+        const int MaxDiscardsPerScan = 8;
+
+        /// <summary>
+        /// outbox 响应的保留时长。超过这个时长还没被调用方取走，说明该调用早已放弃
+        /// （超时返回），留着只会无限累积、并把通道变成一个越来越大的伪造/误配对来源。
+        ///
+        /// 只清 outbox，**不动 done/**：done 是审计与排障痕迹，删掉就无法回答「上次到底做了什么」。
+        /// </summary>
+        const double OutboxRetentionMs = 10 * 60 * 1000;
+
+        /// <summary>清理节奏：每 60 秒最多扫一次，避免每帧做目录遍历。</summary>
+        const double OutboxSweepInterval = 60;
+
+        static double _nextOutboxSweep;
+
+        /// <summary>HandleFile 的处理结果：决定 Poll 是否继续看下一个文件。</summary>
+        enum HandleOutcome
+        {
+            /// <summary>已消费一个属于本实例的有效请求（可能被执行，也可能被拒绝），本次扫描到此为止。</summary>
+            Consumed,
+            /// <summary>无效文件（坏 JSON / 缺 id / 不属于本实例），已归档，可继续看下一个。</summary>
+            Discarded,
+            /// <summary>文件已不在（被其它进程取走或读取失败），本次扫描到此为止。</summary>
+            Absent,
+        }
+
+        /// <summary>
+        /// 回收 outbox 里超龄的响应文件（含无人消费的 `*.rejected.json`）。
+        ///
+        /// 与调用方侧的清扫（ASECLI AA-OPT-023）互补：调用方只能清它自己关心的前缀，
+        /// 进程崩溃/被强杀后就不会再有下一次清扫，只有探针自己能保证通道不会无限膨胀。
+        /// </summary>
+        static void SweepStaleOutbox()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_outboxDir) || !Directory.Exists(_outboxDir)) return;
+                var nowMs = NowMs();
+                var removed = 0;
+                foreach (var file in Directory.GetFiles(_outboxDir, "*.json"))
+                {
+                    try
+                    {
+                        var age = nowMs - File.GetLastWriteTimeUtc(file).ToUniversalTime().Subtract(
+                            new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                        if (age <= OutboxRetentionMs) continue;
+                        File.Delete(file);
+                        removed += 1;
+                    }
+                    catch (Exception) { }
+                }
+                if (removed > 0) AddDiagnostic("outbox-swept:" + removed);
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 请求内容的摘要（原始文件字节的 SHA-256 前 16 个十六进制字符）。
+        ///
+        /// 用途：调用方校验「这条响应确实对应我写进去的那份请求」，防止同 id 的迟到响应
+        /// 或残留响应被误当成本次结果。
+        ///
+        /// **能力边界**：它防的是「误配对」，不是「伪造」。能写 inbox 的进程同样能读 inbox，
+        /// 也就能算出同样的 hash。文件邮箱协议本身无法提供身份认证——见 DETAIL 的信任边界一节。
+        /// </summary>
+        static string RequestHashOfBytes(byte[] raw)
+        {
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var bytes = sha.ComputeHash(raw ?? new byte[0]);
+                    var builder = new StringBuilder();
+                    for (var i = 0; i < 8; i++) builder.Append(bytes[i].ToString("x2"));
+                    return builder.ToString();
+                }
+            }
+            catch (Exception) { return null; }
         }
 
         static void Poll()
@@ -157,34 +324,152 @@ namespace DSHBridge
             _scanning = true;
             try
             {
-                // 每帧只处理一个请求，避免阻塞编辑器主线程过久。
-                HandleFile(files[0]);
+                // 约束不变：一次扫描**只执行一个**有效请求，避免阻塞主线程过久。
+                // 但无效文件（半写 JSON、别的实例的残留）允许在本次扫描内连续丢弃——
+                // 否则 inbox 里残留 N 个坏文件时，每个正常请求都要多等 N 个扫描周期。
+                var discarded = 0;
+                for (var i = 0; i < files.Length; i++)
+                {
+                    if (discarded >= MaxDiscardsPerScan) break;
+                    var outcome = HandleFile(files[i]);
+                    if (outcome == HandleOutcome.Absent) break;
+                    if (outcome == HandleOutcome.Consumed) break;
+                    discarded += 1;
+                }
             }
             finally { _scanning = false; }
         }
 
-        static void HandleFile(string path)
+        /// <summary>
+        /// 回收上一次会话遗留的 in-progress 请求：这些请求在 Execute 期间被域重载或进程退出打断，
+        /// 调用方超时后无从判断「到底执行了没有」。这里补写一条 executionState="unknown" 的响应，
+        /// 让「不确定」变成一个**可机器读取**的结论，而不是靠人读日志。
+        /// </summary>
+        static void RecoverInterruptedRequests()
         {
-            string text;
-            try { text = File.ReadAllText(path, Encoding.UTF8); }
-            catch { return; }
-
-            // 先搬移再执行：即使执行崩溃也不会重复执行同一请求。
-            var donePath = Path.Combine(_doneDir, Path.GetFileName(path));
             try
             {
-                if (File.Exists(donePath)) File.Delete(donePath);
-                File.Move(path, donePath);
-            }
-            catch { return; }
+                if (string.IsNullOrEmpty(_progressDir) || !Directory.Exists(_progressDir)) return;
+                foreach (var file in Directory.GetFiles(_progressDir, "*.json"))
+                {
+                    var id = Path.GetFileNameWithoutExtension(file);
+                    if (string.IsNullOrEmpty(id)) continue;
 
-            Dictionary<string, object> req;
+                    string text = null;
+                    try { text = File.ReadAllText(file, Encoding.UTF8); } catch { }
+                    Dictionary<string, object> req = null;
+                    try { req = text == null ? null : MiniJson.Parse(text) as Dictionary<string, object>; }
+                    catch { }
+
+                    if (req != null)
+                    {
+                        var resp = new Dictionary<string, object>();
+                        resp["v"] = 1L;
+                        resp["id"] = id;
+                        resp["instanceId"] = _instanceId;
+                        resp["bootId"] = _bootId;
+                        // 用请求自带的 nonce：调用方按四元组配对，写错就取不到这条响应。
+                        resp["nonce"] = GetString(req, "nonce") ?? _nonce;
+                        resp["probeVersion"] = ProbeVersion;
+                        resp["ok"] = false;
+                        resp["executionState"] = "unknown";
+                        resp["error"] = Error(
+                            "interrupted",
+                            "上一次执行被域重载或进程退出打断，无法确定是否已产生副作用；请先确认目标状态再决定是否重试",
+                            null);
+                        // 不能覆盖已有的真实响应：若上次 WriteAtomic 成功而归档失败，
+                        // in-progress 会残留，此时补写 unknown 会抹掉已经拿到的结果。
+                        var existingOutbox = Path.Combine(_outboxDir, id + ".json");
+                        if (!File.Exists(existingOutbox))
+                        {
+                            try { WriteAtomic(existingOutbox, MiniJson.Serialize(resp)); } catch { }
+                        }
+                    }
+                    Finish(file, Path.Combine(_doneDir, Path.GetFileName(file)));
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 请求生命周期（AA-OPT-004）：inbox → in-progress → done。
+        /// 原始请求在执行期间保留在 in-progress/，因此「执行中已超时」可被 DSH 观测到（in_flight），
+        /// 而不是被误判成「什么都没发生」。
+        ///
+        /// 响应里的 executionState 让调用方机器判断「能不能安全重试」：
+        ///   not-started = 校验/授权/过期等失败，未进入执行，可安全重试
+        ///   executed    = 已进入 Execute() 并返回（无论成功失败），副作用可能已发生
+        ///   unknown     = 执行中被域重载/进程退出打断（由下次启动的孤儿回收补写）
+        /// </summary>
+        /// <summary>
+        /// 请求 id 会参与 outbox 文件名拼接（`Path.Combine(_outboxDir, id + ".json")`），
+        /// 因此必须是单段安全文件名。否则 `id = "../instance"` 这类请求可以覆盖
+        /// `Library/DSHBridge/instance.json` 等任意位置的文件（WriteAtomic 还会创建父目录）。
+        /// </summary>
+        static bool IsSafeRequestId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 128) return false;
+            for (var i = 0; i < id.Length; i++)
+            {
+                var ch = id[i];
+                var allowed = (ch >= 'a' && ch <= 'z')
+                    || (ch >= 'A' && ch <= 'Z')
+                    || (ch >= '0' && ch <= '9')
+                    || ch == '-' || ch == '_' || ch == '.';
+                if (!allowed) return false;
+            }
+            // 禁止 ".."：单点（如 "v1.0"）合法，双点是路径穿越。
+            return id.IndexOf("..", StringComparison.Ordinal) < 0;
+        }
+
+        static HandleOutcome HandleFile(string path)
+        {
+            string text;
+            byte[] rawBytes;
+            try
+            {
+                // 保留原始字节：requestHash 声明的是「请求文件原始字节」的摘要。
+                // 若用 ReadAllText 再重新编码，带 BOM 的文件会算出不同的值。
+                rawBytes = File.ReadAllBytes(path);
+                text = new UTF8Encoding(false).GetString(rawBytes);
+                if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+            }
+            catch { return HandleOutcome.Absent; }
+
+            var fileName = Path.GetFileName(path);
+            var progressPath = Path.Combine(_progressDir, fileName);
+            var donePath = Path.Combine(_doneDir, fileName);
+            try
+            {
+                if (File.Exists(progressPath)) File.Delete(progressPath);
+                File.Move(path, progressPath);
+            }
+            catch { return HandleOutcome.Absent; }
+
+            Dictionary<string, object> req = null;
             try { req = MiniJson.Parse(text) as Dictionary<string, object>; }
-            catch { return; }
-            if (req == null) return;
+            catch { }
+            if (req == null)
+            {
+                // 半写/损坏的 JSON：直接归档，让队列继续推进。
+                Finish(progressPath, donePath);
+                return HandleOutcome.Discarded;
+            }
 
             var id = GetString(req, "id");
-            if (string.IsNullOrEmpty(id)) return;
+            if (string.IsNullOrEmpty(id))
+            {
+                Finish(progressPath, donePath);
+                return HandleOutcome.Discarded;
+            }
+            if (!IsSafeRequestId(id))
+            {
+                // 不能进 outbox：id 不可信意味着响应文件名也不可信。
+                // 只归档（用真实文件名，安全）并留诊断，让调用方超时而不是接受一个越界写入。
+                AddDiagnostic("unsafe-request-id");
+                Finish(progressPath, donePath);
+                return HandleOutcome.Discarded;
+            }
 
             // 四元组校验：拒绝不属于本实例会话的请求。
             var resp = new Dictionary<string, object>();
@@ -194,6 +479,9 @@ namespace DSHBridge
             resp["bootId"] = _bootId;
             resp["nonce"] = _nonce;
             resp["probeVersion"] = ProbeVersion;
+            resp["executionState"] = "not-started";
+            // 归属证据：摘要基于**调用方写入的原始字节**，双方算的是同一串，不需要 JSON 规范化。
+            resp["requestHash"] = RequestHashOfBytes(rawBytes);
 
             var incomingInstance = GetString(req, "instanceId");
             var incomingBoot = GetString(req, "bootId");
@@ -202,8 +490,8 @@ namespace DSHBridge
             {
                 resp["ok"] = false;
                 resp["error"] = Error("pairing_mismatch", "请求不属于本实例会话", null);
-                WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp));
-                return;
+                PublishResponse(id, resp, progressPath, donePath);
+                return HandleOutcome.Consumed;
             }
 
             // 过期校验：DSH 已放弃的请求绝不能产生副作用（例如延迟切进 Play Mode）。
@@ -215,8 +503,20 @@ namespace DSHBridge
                 resp["ok"] = false;
                 resp["error"] = Error("expired", "请求已超过 deadline，出于安全未执行", null);
                 resp["elapsedMs"] = 0L;
-                WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp));
-                return;
+                PublishResponse(id, resp, progressPath, donePath);
+                return HandleOutcome.Consumed;
+            }
+
+            // 重复 id：同一 id 再次投递时不能静默覆盖已有响应/归档，也不能让人误以为执行了两次。
+            var outboxPath = Path.Combine(_outboxDir, id + ".json");
+            var archivedPath = Path.Combine(_doneDir, id + ".json");
+            if (File.Exists(outboxPath) || File.Exists(archivedPath))
+            {
+                resp["ok"] = false;
+                resp["error"] = Error("duplicate_id", "请求 id 已处理过；请为每次调用使用新的 id", null);
+                resp["elapsedMs"] = 0L;
+                PublishResponse(id, resp, progressPath, donePath);
+                return HandleOutcome.Consumed;
             }
 
             var cap = GetString(req, "cap");
@@ -226,18 +526,137 @@ namespace DSHBridge
             var sw = Stopwatch.StartNew();
             try
             {
+                // 安全闸门（AA-OPT-001）：危险执行面只在 DSH 侧显式授权（且源码已注入快照）时放行。
+                // 闸门在 Execute 之前：被拒绝的请求尚未进入执行，调用方可安全重试。
+                EnsureCapabilityAllowed(cap);
+                // 走到这里说明即将执行：从此点起副作用「可能已发生」，即使 Execute 抛异常也不再是 not-started。
+                resp["executionState"] = "executed";
                 resp["ok"] = true;
                 resp["data"] = Execute(cap, args);
             }
             catch (Exception e)
             {
                 resp["ok"] = false;
-                resp["error"] = Error(CodeOf(e), e.Message, e.GetType().Name);
+                resp["error"] = Error(CodeOf(e), e.Message, DetailOf(e));
+                RecordRejection(id, cap, CodeOf(e), e.Message);
             }
             sw.Stop();
             resp["elapsedMs"] = sw.ElapsedMilliseconds;
 
-            WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp));
+            PublishResponse(id, resp, progressPath, donePath);
+            return HandleOutcome.Consumed;
+        }
+
+        static void PublishResponse(string id, Dictionary<string, object> resp, string progressPath, string donePath)
+        {
+            try { WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp)); }
+            catch { }
+            Finish(progressPath, donePath);
+        }
+
+        /// <summary>
+        /// 归档已完成请求。目标已存在时改用 `.dupN` 后缀，**绝不删除历史归档**
+        /// （旧实现会先删同名 done 文件，重复 id 时会抹掉上一次的痕迹）。
+        /// </summary>
+        static void Finish(string progressPath, string donePath)
+        {
+            try
+            {
+                if (!File.Exists(progressPath)) return;
+                File.Move(progressPath, UniqueArchivePath(donePath));
+            }
+            catch { }
+        }
+
+        static string UniqueArchivePath(string donePath)
+        {
+            if (!File.Exists(donePath)) return donePath;
+            var directory = Path.GetDirectoryName(donePath);
+            var stem = Path.GetFileNameWithoutExtension(donePath);
+            for (var i = 2; i <= 9999; i++)
+            {
+                var candidate = Path.Combine(
+                    directory,
+                    stem + ".dup" + i.ToString(CultureInfo.InvariantCulture) + ".json");
+                if (!File.Exists(candidate)) return candidate;
+            }
+            return donePath;
+        }
+
+        /// <summary>危险能力在探针侧默认关闭；只有授权快照或 argv 授权出现时才放行。</summary>
+        static void EnsureCapabilityAllowed(string cap)
+        {
+            if (string.IsNullOrEmpty(cap)) throw new KnownError("invalid_argument", "缺少 cap");
+            for (var i = 0; i < _deniedCapabilities.Length; i++)
+            {
+                if (_deniedCapabilities[i] != cap) continue;
+                throw new KnownError("capability_denied", "能力 " + cap + " 被插件配置显式禁止（bridge.denied），任何授权都无法开启");
+            }
+            for (var i = 0; i < _blockedCapabilities.Length; i++)
+            {
+                if (_blockedCapabilities[i] != cap) continue;
+                throw new KnownError("capability_denied", "能力 " + cap + " 在探针侧永久关闭（菜单执行等同任意编辑器操作）");
+            }
+            for (var i = 0; i < _reflectCapabilities.Length; i++)
+            {
+                if (_reflectCapabilities[i] != cap) continue;
+                if (Granted(cap)) return;
+                throw new KnownError(
+                    "capability_denied",
+                    "能力 " + cap + " 未授权；请在插件配置 bridge.allowDangerous 中加入该能力并重装探针（源码快照随之更新）");
+            }
+        }
+
+        /// <summary>按能力判定授权：argv 整机旁路，或安装时注入的源码快照。</summary>
+        static bool Granted(string cap)
+        {
+            if (ReflectAuthorized()) return true;
+            for (var i = 0; i < _grantedCapabilities.Length; i++)
+            {
+                if (_grantedCapabilities[i] == cap) return true;
+            }
+            return false;
+        }
+
+        static bool ReflectAuthorized()
+        {
+            return _reflectEnabled.HasValue ? _reflectEnabled.Value : AuthorizedByArgv();
+        }
+
+        /// <summary>诊断用：本次安装在源码快照里实际授予了哪些能力。</summary>
+        public static string[] GrantedCapabilitiesForTest()
+        {
+            return (string[])_grantedCapabilities.Clone();
+        }
+
+        /// <summary>越权尝试要留下事件，否则注入攻击在事件流里完全不可见（AA-OBS-001）。</summary>
+        static void RecordRejection(string id, string cap, string code, string message)
+        {
+            if (code != "capability_denied" && code != "path_escape" && code != "member_not_public"
+                && code != "member_denied" && code != "type_denied" && code != "editor_busy") return;
+            var payload = new Dictionary<string, object>
+            {
+                { "requestId", id ?? "" },
+                { "capability", cap ?? "" },
+                { "code", code },
+                { "message", message != null && message.Length > 300 ? message.Substring(0, 300) : (message ?? "") },
+            };
+            PushEvent("request_rejected", payload);
+            // 同时投递到 outbox，让 DSH 侧能在调用返回时就看到拒绝原因（AA-OBS-001）。
+            try
+            {
+                var notice = new Dictionary<string, object>();
+                notice["v"] = 1L;
+                notice["id"] = (id ?? "") + ".rejected";
+                notice["instanceId"] = _instanceId;
+                notice["bootId"] = _bootId;
+                notice["nonce"] = _nonce;
+                notice["probeVersion"] = ProbeVersion;
+                notice["ok"] = false;
+                notice["rejected"] = payload;
+                WriteAtomic(Path.Combine(_outboxDir, (id ?? "unknown") + ".rejected.json"), MiniJson.Serialize(notice));
+            }
+            catch { }
         }
 
         static Dictionary<string, object> Error(string code, string message, string detail)
@@ -245,6 +664,8 @@ namespace DSHBridge
             var e = new Dictionary<string, object>();
             e["code"] = code;
             e["message"] = message ?? "";
+            // 部分错误码需要携带机器可读细节（例如编译错误的逐条诊断、近似成员名），
+            // 这些内容既不适合塞进 message，也不应丢弃。
             e["detail"] = detail ?? "";
             return e;
         }
@@ -259,10 +680,104 @@ namespace DSHBridge
             return "probe_error";
         }
 
+        /// <summary>错误细节：KnownError 可携带结构化细节，其它异常退回异常类型名。</summary>
+        static string DetailOf(Exception e)
+        {
+            var known = e as KnownError;
+            if (known != null) return string.IsNullOrEmpty(known.Detail) ? e.GetType().Name : known.Detail;
+            if (e is TargetInvocationException && e.InnerException != null) return DetailOf(e.InnerException);
+            return e.GetType().Name;
+        }
+
         class KnownError : Exception
         {
             public readonly string Code;
-            public KnownError(string code, string message) : base(message) { Code = code; }
+            public readonly string Detail;
+            public KnownError(string code, string message) : base(message) { Code = code; Detail = null; }
+            public KnownError(string code, string message, string detail) : base(message) { Code = code; Detail = detail; }
+        }
+
+        /// <summary>argv 里出现 -dshBridgeAuthorize 时，反射执行面才解锁（对应插件配置 allowDangerous）。</summary>
+        static bool AuthorizedByArgv()
+        {
+            try
+            {
+                var args = Environment.GetCommandLineArgs();
+                for (var i = 0; i < args.Length; i++)
+                {
+                    if (args[i] == AuthorizeArg) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>探针在本地关闭/需授权的能力清单，供诊断与测试断言。</summary>
+        public static string[] DangerousCapabilitiesForTest()
+        {
+            var list = new List<string>(_blockedCapabilities);
+            list.AddRange(_reflectCapabilities);
+            return list.ToArray();
+        }
+
+        // ===== 路径边界（AA-OPT-002 / AA-OPT-003）=====
+        // 所有真实文件系统访问都必须经过这里：绝对路径与 ../ 逃逸一律拒绝。
+        // Project 根用 FullName 参与比较，避免 /tmp 与 /private/tmp 之类的符号链接造成误判。
+        static string ResolveProjectPath(string raw, string what)
+        {
+            if (string.IsNullOrEmpty(raw)) throw new KnownError("invalid_argument", "缺少 " + what);
+            if (raw.IndexOf('\0') >= 0) throw new KnownError("path_escape", what + " 含非法字符");
+            string full;
+            try { full = Path.GetFullPath(Path.IsPathRooted(raw) ? raw : Path.Combine(_projectRoot, raw)); }
+            catch (Exception e) { throw new KnownError("path_escape", what + " 无法解析: " + e.Message); }
+            if (IsInsideProject(full)) return full;
+            throw new KnownError("path_escape", what + " 落在工程之外，已拒绝：" + raw);
+        }
+
+        static bool IsInsideProject(string full)
+        {
+            var root = _projectRoot;
+            if (string.IsNullOrEmpty(root)) return false;
+            if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                root = root + Path.DirectorySeparatorChar;
+            return full.StartsWith(root, StringComparison.Ordinal);
+        }
+
+        /// <summary>路径是否落在引擎安装目录（Contents）内：显式引用允许引用引擎自带的程序集。</summary>
+        static bool IsInsideEngineContents(string full)
+        {
+            string contents;
+            try { contents = EditorApplication.applicationContentsPath; }
+            catch (Exception) { return false; }
+            if (string.IsNullOrEmpty(contents) || string.IsNullOrEmpty(full)) return false;
+            var root = contents;
+            if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                root = root + Path.DirectorySeparatorChar;
+            return full.StartsWith(root, StringComparison.Ordinal);
+        }
+
+        /// <summary>把工程内绝对路径还原成 Unity 用的相对路径（正斜杠）。</summary>
+        static string ToProjectRelative(string full)
+        {
+            var root = _projectRoot;
+            if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                root = root + Path.DirectorySeparatorChar;
+            var rel = full.StartsWith(root, StringComparison.Ordinal) ? full.Substring(root.Length) : full;
+            return rel.Replace('\\', '/');
+        }
+
+        /// <summary>AssetDatabase 系列 API 只接受工程内相对路径；越界在进入 Unity 之前就拒绝。</summary>
+        static string ResolveAssetPath(string raw, string what)
+        {
+            var full = ResolveProjectPath(raw, what);
+            return ToProjectRelative(full);
+        }
+
+        static void EnsureTextable(string full, string what)
+        {
+            var ext = Path.GetExtension(full) ?? string.Empty;
+            if (!_textableExtensions.Contains(ext))
+                throw new KnownError("invalid_argument", what + " 只允许文本类资产扩展名（" + ext + " 不受理）");
         }
 
         static object Execute(string cap, Dictionary<string, object> args)
@@ -300,6 +815,8 @@ namespace DSHBridge
             if (cap == "unity.object.find") return ObjectFind(args);
             if (cap == "unity.api.invoke") return ApiInvoke(args);
             if (cap == "unity.api.members") return ApiMembers(args);
+            if (cap == "unity.api.batch") return ApiBatch(args);
+            if (cap == "unity.code.execute") return CodeExecute(args);
             if (cap == "unity.search.content") return SearchContent(args);
             if (cap == "unity.asset.read") return AssetRead(args);
             if (cap == "unity.asset.create") return AssetCreate(args);
@@ -315,7 +832,8 @@ namespace DSHBridge
         // ===== 通用执行面：对象发现 / 任意 API 调用 / 检索 / 资产与导入设置 =====
 
         static readonly Dictionary<string, object> _handles = new Dictionary<string, object>();
-        static readonly List<string> _handleOrder = new List<string>();
+        // 队列而非 List：淘汰时 Dequeue 是 O(1)，List.RemoveAt(0) 需要移动全部元素。
+        static readonly Queue<string> _handleOrder = new Queue<string>();
         static long _handleSeq = 0;
         const int HandleLimit = 4000;
 
@@ -324,11 +842,10 @@ namespace DSHBridge
             if (obj == null) return null;
             var key = "h" + (++_handleSeq).ToString(CultureInfo.InvariantCulture);
             _handles[key] = obj;
-            _handleOrder.Add(key);
+            _handleOrder.Enqueue(key);
             while (_handleOrder.Count > HandleLimit)
             {
-                var oldest = _handleOrder[0];
-                _handleOrder.RemoveAt(0);
+                var oldest = _handleOrder.Dequeue();
                 _handles.Remove(oldest);
             }
             return key;
@@ -481,8 +998,10 @@ namespace DSHBridge
                 if (staticType == null) throw new KnownError("type_not_found", "找不到类型: " + typeName);
                 return null;
             }
-            if (Selection.activeObject != null) return Selection.activeObject;
-            throw new KnownError("invalid_argument", "需要 handle / path / asset / type 之一");
+            // 注意：Unity 对象可能 != null 却已销毁（伪 null），必须用隐式 bool 判断；
+            // 且这里不能返回 null target + null type，否则下游 target.GetType() 必抛 NRE（AA-CODE-001）。
+            if (Selection.activeObject) return Selection.activeObject;
+            throw new KnownError("invalid_argument", "需要 handle / path / asset / type 之一（或先选中一个对象）");
         }
 
         static object[] ConvertArgs(ParameterInfo[] parameters, List<object> raw)
@@ -517,8 +1036,10 @@ namespace DSHBridge
             var rawArgs = args.ContainsKey("args") ? args["args"] as List<object> : new List<object>();
             if (rawArgs == null) rawArgs = new List<object>();
 
-            var type = staticType ?? target.GetType();
-            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy
+            var type = ResolveBoundType(target, staticType);
+            // AA-OPT-001：只允许公开成员，且不得触碰硬拒绝清单里的成员。
+            EnsureMemberAllowed(type, member, staticType != null);
+            var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy
                 | (staticType != null ? BindingFlags.Static : BindingFlags.Instance);
 
             object result = null;
@@ -549,6 +1070,7 @@ namespace DSHBridge
                 var method = PickMethod(type, member, rawArgs.Count, flags);
                 if (method != null)
                 {
+                    EnsureMethodCallable(method);
                     result = method.Invoke(staticType != null ? null : target, ConvertArgs(method.GetParameters(), rawArgs));
                     usedKind = "method";
                 }
@@ -567,14 +1089,62 @@ namespace DSHBridge
             return d;
         }
 
+        /// <summary>
+        /// AA-CODE-001：ResolveTarget 可能返回 (null, null)（例如选择为空）。
+        /// 这里显式守卫，避免 `staticType ?? target.GetType()` 抛 NullReferenceException。
+        /// </summary>
+        static Type ResolveBoundType(object target, Type staticType)
+        {
+            if (staticType != null) return staticType;
+            if (target == null) throw new KnownError("invalid_argument", "没有可操作的目标对象；请给出 type / handle / path / asset");
+            return target.GetType();
+        }
+
+        static void EnsureTypeAllowed(Type type)
+        {
+            if (type == null) throw new KnownError("type_not_found", "类型为空");
+            var name = type.FullName ?? type.Name;
+            if (_deniedTypes.Contains(name) || _deniedTypes.Contains(type.Name))
+                throw new KnownError("type_denied", "类型 " + name + " 在硬拒绝清单内（启动/资产库/进程控制类 API）");
+        }
+
+        static void EnsureMemberAllowed(Type type, string member, bool isStatic)
+        {
+            EnsureTypeAllowed(type);
+            if (_deniedMembers.Contains(member))
+                throw new KnownError("member_denied", "成员 " + member + " 在硬拒绝清单内");
+            var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy
+                | (isStatic ? BindingFlags.Static : BindingFlags.Instance);
+            var prop = type.GetProperty(member, flags);
+            var field = type.GetField(member, flags);
+            var method = prop != null || field != null ? null : type.GetMethods(flags).FirstOrDefault(m => m.Name == member);
+            if (prop == null && field == null && method == null)
+            {
+                // 可能存在，但非公开：给出明确的拒绝原因而不是 member_not_found。
+                var anyFlags = flags | BindingFlags.NonPublic;
+                if (type.GetProperty(member, anyFlags) != null || type.GetField(member, anyFlags) != null
+                    || type.GetMethods(anyFlags).Any(m => m.Name == member))
+                    throw new KnownError("member_not_public", "成员 " + type.Name + "." + member + " 不是公开成员，已拒绝");
+                throw new KnownError("member_not_found", "找不到成员: " + type.Name + "." + member);
+            }
+        }
+
+        static void EnsureMethodCallable(MethodInfo method)
+        {
+            if (method.IsAbstract) throw new KnownError("member_not_public", "方法是抽象定义，不可调用: " + method.Name);
+            if (method.IsGenericMethodDefinition) throw new KnownError("member_not_public", "泛型方法需要显式类型参数，已拒绝: " + method.Name);
+        }
+
         static Dictionary<string, object> ApiMembers(Dictionary<string, object> args)
         {
             Type staticType;
             var target = ResolveTarget(args, out staticType);
-            var type = staticType ?? target.GetType();
+            var type = ResolveBoundType(target, staticType);
+            EnsureTypeAllowed(type);
             var filter = GetString(args, "filter");
             var limit = (int)Math.Max(1, Math.Min(300, ToLong(args, "limit", 80)));
-            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy | BindingFlags.Instance | BindingFlags.Static;
+            // 只列公开成员：非公开成员不可调用，列出来只会误导调用方。
+            var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy | BindingFlags.Instance | BindingFlags.Static;
             var rows = new List<object>();
             foreach (var m in type.GetMethods(flags))
             {
@@ -604,13 +1174,24 @@ namespace DSHBridge
             var query = GetString(args, "query");
             if (string.IsNullOrEmpty(query)) throw new KnownError("invalid_argument", "缺少 query");
             var folders = GetStringList(args, "folders");
+            // AA-OPT-002：folders 只能指向工程内资产目录。
+            for (var i = 0; i < folders.Count; i++) folders[i] = ResolveAssetPath(folders[i], "folders");
             var exts = GetStringList(args, "extensions");
             var limit = (int)Math.Max(1, Math.Min(200, ToLong(args, "limit", 40)));
+            var budgetMs = Math.Max(100L, Math.Min(60000L, ToLong(args, "budgetMs", SearchTimeBudgetMs)));
+            var clock = Stopwatch.StartNew();
             var guids = AssetDatabase.FindAssets("", folders.Count > 0 ? folders.ToArray() : null);
             var hits = new List<object>();
             var scanned = 0;
+            var truncated = false;
             foreach (var guid in guids)
             {
+                // AA-LIMIT-001：没有预算的全库扫描会把编辑器主线程长时间占死，进而触发调用超时与重试风暴。
+                if (clock.ElapsedMilliseconds > budgetMs || scanned >= SearchFileBudget)
+                {
+                    truncated = true;
+                    break;
+                }
                 var path = AssetDatabase.GUIDToAssetPath(guid);
                 if (string.IsNullOrEmpty(path)) continue;
                 if (exts.Count > 0 && !exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
@@ -619,7 +1200,7 @@ namespace DSHBridge
                     || path.EndsWith(".hlsl") || path.EndsWith(".cginc"))) continue;
                 scanned++;
                 string[] lines;
-                try { lines = System.IO.File.ReadAllLines(path); }
+                try { lines = System.IO.File.ReadAllLines(ResolveProjectPath(path, "asset")); }
                 catch { continue; }
                 for (var i = 0; i < lines.Length; i++)
                 {
@@ -633,9 +1214,13 @@ namespace DSHBridge
                 }
                 if (hits.Count >= limit) break;
             }
+            clock.Stop();
             var result = new Dictionary<string, object>();
             result["scanned"] = (long)scanned;
             result["hits"] = hits;
+            result["budgetMs"] = budgetMs;
+            result["elapsedMs"] = clock.ElapsedMilliseconds;
+            result["truncated"] = truncated;
             return result;
         }
 
@@ -643,14 +1228,17 @@ namespace DSHBridge
         {
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            // AA-OPT-002：此前这里直接把 path 交给 File.ReadAllLines，等于"工程进程权限内的任意文件读取"。
+            var full = ResolveProjectPath(path, "path");
+            EnsureTextable(full, "path");
             var maxLines = (int)Math.Max(1, Math.Min(2000, ToLong(args, "lines", 400)));
             var offset = (int)Math.Max(0, ToLong(args, "offset", 0));
             string[] lines;
-            try { lines = System.IO.File.ReadAllLines(path); }
+            try { lines = System.IO.File.ReadAllLines(full); }
             catch (Exception e) { throw new KnownError("read_failed", "读取失败: " + e.Message); }
             var slice = lines.Skip(offset).Take(maxLines).ToArray();
             var d = new Dictionary<string, object>();
-            d["assetPath"] = path;
+            d["assetPath"] = ToProjectRelative(full);
             d["totalLines"] = (long)lines.Length;
             d["offset"] = (long)offset;
             d["text"] = string.Join("\n", slice);
@@ -662,35 +1250,38 @@ namespace DSHBridge
             var kind = GetString(args, "kind") ?? "folder";
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            // AA-OPT-003：path 此前直接被 Path.Combine(工程根, path) 拼成写盘目标，../ 与绝对路径都能逃逸。
+            var assetPath = ResolveAssetPath(path, "path");
             var content = GetString(args, "content");
             var created = false;
 
             if (kind == "folder")
             {
-                if (!AssetDatabase.IsValidFolder(path))
+                if (!AssetDatabase.IsValidFolder(assetPath))
                 {
-                    var parent = System.IO.Path.GetDirectoryName(path).Replace('\\', '/');
-                    var leaf = System.IO.Path.GetFileName(path);
+                    var parent = System.IO.Path.GetDirectoryName(assetPath).Replace('\\', '/');
+                    var leaf = System.IO.Path.GetFileName(assetPath);
+                    if (string.IsNullOrEmpty(parent)) throw new KnownError("invalid_argument", "无法创建工程根目录下的文件夹");
                     AssetDatabase.CreateFolder(parent, leaf);
                 }
                 created = true;
             }
             else if (kind == "script")
             {
-                var name = System.IO.Path.GetFileNameWithoutExtension(path);
+                var name = System.IO.Path.GetFileNameWithoutExtension(assetPath);
                 if (content == null) content = DefaultScript(name);
-                WriteTextAsset(path, content);
+                WriteTextAsset(assetPath, content);
                 created = true;
             }
             else if (kind == "shader")
             {
-                if (content == null) content = DefaultShader(System.IO.Path.GetFileNameWithoutExtension(path));
-                WriteTextAsset(path, content);
+                if (content == null) content = DefaultShader(System.IO.Path.GetFileNameWithoutExtension(assetPath));
+                WriteTextAsset(assetPath, content);
                 created = true;
             }
             else if (kind == "text")
             {
-                WriteTextAsset(path, content ?? "");
+                WriteTextAsset(assetPath, content ?? "");
                 created = true;
             }
             else if (kind == "material")
@@ -699,7 +1290,7 @@ namespace DSHBridge
                 var shader = Shader.Find(shaderName);
                 if (shader == null) throw new KnownError("shader_not_found", "找不到 Shader: " + shaderName);
                 var mat = new Material(shader);
-                AssetDatabase.CreateAsset(mat, path);
+                AssetDatabase.CreateAsset(mat, assetPath);
                 created = true;
             }
             else throw new KnownError("unsupported_kind", "不支持的 kind: " + kind);
@@ -707,14 +1298,16 @@ namespace DSHBridge
             AssetDatabase.Refresh();
             var d = new Dictionary<string, object>();
             d["created"] = created;
-            d["assetPath"] = path;
+            d["assetPath"] = assetPath;
             d["kind"] = kind;
             return d;
         }
 
-        static void WriteTextAsset(string path, string content)
+        static void WriteTextAsset(string assetPath, string content)
         {
-            var full = System.IO.Path.Combine(_projectRoot, path);
+            // 二次确认：即使上层漏判，这里也会再次拦下越界写入。
+            var full = ResolveProjectPath(assetPath, "path");
+            EnsureTextable(full, "path");
             var dir = System.IO.Path.GetDirectoryName(full);
             if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
             System.IO.File.WriteAllText(full, content, new UTF8Encoding(false));
@@ -734,6 +1327,7 @@ namespace DSHBridge
         {
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            path = ResolveAssetPath(path, "path");
             var importer = AssetImporter.GetAtPath(path);
             if (importer == null) throw new KnownError("importer_not_found", "该资产没有导入器或路径无效: " + path);
             var d = new Dictionary<string, object>();
@@ -1319,7 +1913,11 @@ namespace DSHBridge
         {
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            path = ResolveAssetPath(path, "path");
             var target = GetString(args, "target");
+            // rename 的 target 只是新名称；move/duplicate 的 target 是工程内目录或路径。
+            if (!string.IsNullOrEmpty(target) && (op == "move" || op == "duplicate"))
+                target = ResolveAssetPath(target, "target");
             string result = null;
             if (op == "rename")
             {
@@ -1433,6 +2031,9 @@ namespace DSHBridge
 
         static Dictionary<string, object> MenuExecute(Dictionary<string, object> args)
         {
+            // 双保险：即使 EnsureCapabilityAllowed 被改坏，这里也不会执行任意菜单项。
+            throw new KnownError("capability_denied", "unity.menu.execute 在探针侧永久关闭");
+#pragma warning disable CS0162
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var ok = EditorApplication.ExecuteMenuItem(path);
@@ -1440,6 +2041,7 @@ namespace DSHBridge
             var d = new Dictionary<string, object>();
             d["executed"] = path;
             return d;
+#pragma warning restore CS0162
         }
 
         static Dictionary<string, object> PlaymodeSet(Dictionary<string, object> args)
@@ -1458,6 +2060,11 @@ namespace DSHBridge
 
         static Dictionary<string, object> AssetRefresh(Dictionary<string, object> args)
         {
+            // AA-LIMIT-001：主线程已被编译/导入占据时，再排队一次 Refresh 只会把调用推入超时。
+            var compiling = EditorApplication.isCompiling;
+            var updating = EditorApplication.isUpdating;
+            if (compiling || updating)
+                throw new KnownError("editor_busy", "编辑器正在编译或导入，请稍后重试（isCompiling=" + compiling + ", isUpdating=" + updating + "）");
             var sw = Stopwatch.StartNew();
             var force = ToBool(args, "force");
             if (force) AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
@@ -1469,36 +2076,1576 @@ namespace DSHBridge
             return d;
         }
 
+        // ===== 能力 1：成员反射（多候选名 + 绑定标志 + 命中回传）=====
+        //
+        // 设计要点（对应 ASECLI 的 Member(obj, "A", "B", "C") 语义）：
+        //   - 候选名按顺序尝试，命中即停，并把「实际命中的名字」回传（resolvedMember）。
+        //     ASE 升级后同一语义的字段常改名，调用方必须知道命中的是哪一个，才能做后续配对校验。
+        //   - property 优先于 field，再退到 method——与 ASE 侧 helper 的查找顺序保持一致。
+        //   - 私有成员可读：使用完整 BindingFlags，绝不因 NonPublic 抛 FieldAccessException。
+        //   - 全部未命中时给出近似成员名，避免升级后只能靠猜。
+
+        static bool IsMemberReflectRequest(Dictionary<string, object> args)
+        {
+            return args.ContainsKey("member") || args.ContainsKey("candidates");
+        }
+
         static Dictionary<string, object> ReflectInvoke(Dictionary<string, object> args)
+        {
+            // 旧语义（type + method 的静态方法调用）保留，避免破坏既有调用方。
+            if (IsMemberReflectRequest(args)) return ReflectMember(args);
+            return ReflectStaticMethod(args);
+        }
+
+        /// <summary>旧语义：按类型名调用一个静态方法。仅为向后兼容保留。</summary>
+        static Dictionary<string, object> ReflectStaticMethod(Dictionary<string, object> args)
         {
             var typeName = GetString(args, "type");
             var methodName = GetString(args, "method");
             if (string.IsNullOrEmpty(typeName) || string.IsNullOrEmpty(methodName))
                 throw new KnownError("invalid_argument", "缺少 type 或 method");
-
             var type = FindType(typeName);
             if (type == null) throw new KnownError("type_not_found", "找不到类型: " + typeName);
-
-            var rawArgs = args.ContainsKey("args") ? args["args"] as List<object> : new List<object>();
-            if (rawArgs == null) rawArgs = new List<object>();
-
+            var rawArgs = AsObjectList(args, "args");
+            EnsureTypeAllowed(type);
+            if (_deniedMembers.Contains(methodName))
+                throw new KnownError("member_denied", "成员 " + methodName + " 在硬拒绝清单内");
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy;
             var method = type.GetMethods(flags).FirstOrDefault(m => m.Name == methodName && m.GetParameters().Length == rawArgs.Count)
                          ?? type.GetMethods(flags).FirstOrDefault(m => m.Name == methodName);
             if (method == null) throw new KnownError("method_not_found", "找不到方法: " + typeName + "." + methodName);
-
-            var parameters = method.GetParameters();
-            var converted = new object[parameters.Length];
-            for (var i = 0; i < parameters.Length; i++)
-                converted[i] = i < rawArgs.Count ? Coerce(rawArgs[i], parameters[i].ParameterType) : DefaultOf(parameters[i].ParameterType);
-
+            var converted = ConvertArgs(method.GetParameters(), rawArgs);
+            var state = new DescribeState();
             var result = method.Invoke(null, converted);
             var d = new Dictionary<string, object>();
             d["type"] = typeName;
             d["method"] = methodName;
             d["returnType"] = method.ReturnType.Name;
-            d["result"] = Describe(result);
+            d["resolvedMember"] = methodName;
+            d["declaringType"] = type.FullName ?? type.Name;
+            d["kind"] = "method";
+            d["result"] = DescribeEx(result, state, methodName);
+            d["resultTruncated"] = state.Truncated;
+            if (state.Truncated) d["truncation"] = state.Describe();
             return d;
+        }
+
+        /// <summary>新语义：读取/写入一个成员，支持多候选名。</summary>
+        static Dictionary<string, object> ReflectMember(Dictionary<string, object> args)
+        {
+            Type staticType;
+            var target = ResolveReflectTarget(args, out staticType);
+            var type = ResolveBoundType(target, staticType);
+            EnsureTypeAllowed(type);
+
+            var names = CandidateNames(args);
+            if (names.Count == 0) throw new KnownError("invalid_argument", "需要 member 或 candidates");
+            var flags = ParseBindingFlags(args);
+            var kindHint = GetString(args, "kind") ?? "auto";
+            var rawArgs = AsObjectList(args, "args");
+            var argTypes = GetStringList(args, "argTypes");
+            var hasValue = args.ContainsKey("value");
+            var state = new DescribeState();
+            var tried = new List<string>();
+
+            foreach (var name in names)
+            {
+                if (_deniedMembers.Contains(name)) { tried.Add(name + " (denied)"); continue; }
+                var hit = FindMember(type, name, flags, kindHint, rawArgs.Count, argTypes);
+                if (hit == null) { tried.Add(name); continue; }
+                var value = ReadOrInvoke(hit, target, staticType != null, hasValue, hasValue ? args["value"] : null, rawArgs, state);
+                var d = new Dictionary<string, object>();
+                d["resolvedMember"] = hit.Name;
+                d["declaringType"] = (hit.DeclaringType ?? type).FullName ?? type.Name;
+                d["kind"] = hit.Kind;
+                d["result"] = value;
+                d["resultTruncated"] = state.Truncated;
+                if (state.Truncated) d["truncation"] = state.Describe();
+                return d;
+            }
+
+            var suggestions = SuggestMemberNames(type, names[0], flags);
+            throw new KnownError(
+                "member_not_found",
+                "找不到成员 " + type.Name + "." + names[0] + "（已尝试：" + string.Join(", ", tried.ToArray()) + "）",
+                suggestions.Count == 0
+                    ? "该类型没有相近的成员名；请用 unity.api.members 查看完整成员表"
+                    : "相近成员：" + string.Join(", ", suggestions.ToArray()));
+        }
+
+        /// <summary>target 支持嵌套 {type|handle}，也兼容旧扁平写法。</summary>
+        static object ResolveReflectTarget(Dictionary<string, object> args, out Type staticType)
+        {
+            staticType = null;
+            object nested;
+            var spec = args;
+            if (args.TryGetValue("target", out nested))
+            {
+                var dict = nested as Dictionary<string, object>;
+                if (dict == null) throw new KnownError("invalid_argument", "target 必须是对象，形如 {\"type\":\"...\"} 或 {\"handle\":\"h1\"}");
+                spec = dict;
+            }
+            return ResolveTarget(spec, out staticType);
+        }
+
+        static List<string> CandidateNames(Dictionary<string, object> args)
+        {
+            var names = new List<string>();
+            var primary = GetString(args, "member");
+            if (!string.IsNullOrEmpty(primary)) names.Add(primary);
+            foreach (var item in AsObjectList(args, "candidates"))
+            {
+                var name = item as string;
+                if (!string.IsNullOrEmpty(name) && !names.Contains(name)) names.Add(name);
+            }
+            return names;
+        }
+
+        static BindingFlags ParseBindingFlags(Dictionary<string, object> args)
+        {
+            var raw = GetString(args, "bindingFlags");
+            if (string.IsNullOrEmpty(raw))
+            {
+                // 默认与 ASE 侧 helper 的 All 组合一致：公有+非公有、实例+静态、含继承层次。
+                return BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance
+                     | BindingFlags.Static | BindingFlags.FlattenHierarchy;
+            }
+            BindingFlags flags = 0;
+            var tokens = raw.Split(new char[] { '|', ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var token in tokens)
+            {
+                var text = token.Trim();
+                var matched = false;
+                foreach (BindingFlags candidate in Enum.GetValues(typeof(BindingFlags)))
+                {
+                    if (!string.Equals(candidate.ToString(), text, StringComparison.OrdinalIgnoreCase)) continue;
+                    flags |= candidate;
+                    matched = true;
+                    break;
+                }
+                if (!matched) throw new KnownError("invalid_argument", "无法识别的 bindingFlags 项：" + text);
+            }
+            if (flags == 0) throw new KnownError("invalid_argument", "bindingFlags 不能为空");
+            return flags;
+        }
+
+        sealed class MemberHit
+        {
+            public string Name;
+            public Type DeclaringType;
+            public string Kind;
+            public PropertyInfo Property;
+            public FieldInfo Field;
+            public MethodInfo Method;
+        }
+
+        static MemberHit FindMember(Type type, string name, BindingFlags flags, string kindHint, int argc, List<string> argTypes)
+        {
+            var wantProperty = kindHint == "auto" || kindHint == "property";
+            var wantField = kindHint == "auto" || kindHint == "field";
+            var wantMethod = kindHint == "auto" || kindHint == "method";
+
+            // 必须显式沿基类链查找：BindingFlags.FlattenHierarchy 只对 public/protected static 生效，
+            // 拿不到基类的**私有**实例字段（ASE 的 m_mzguiAttribs 之类恰恰都在基类上）。
+            // 顺序与 ASE 侧 helper 一致：每个类型先 property 后 field，逐层向上。
+            for (var current = type; current != null; current = current.BaseType)
+            {
+                if (wantProperty)
+                {
+                    var prop = SafeGetProperty(current, name, flags);
+                    if (prop != null)
+                        return new MemberHit { Name = prop.Name, DeclaringType = prop.DeclaringType ?? current, Kind = "property", Property = prop };
+                }
+                if (wantField)
+                {
+                    var field = current.GetField(name, flags);
+                    if (field != null)
+                        return new MemberHit { Name = field.Name, DeclaringType = field.DeclaringType ?? current, Kind = "field", Field = field };
+                }
+            }
+            if (wantMethod)
+            {
+                var method = PickMethodByArgTypes(type, name, flags, argc, argTypes);
+                if (method != null)
+                    return new MemberHit { Name = method.Name, DeclaringType = method.DeclaringType ?? type, Kind = "method", Method = method };
+            }
+            return null;
+        }
+
+        /// <summary>同名属性可能有多个重载（索引器），GetProperty 会抛 AmbiguousMatchException。</summary>
+        static PropertyInfo SafeGetProperty(Type type, string name, BindingFlags flags)
+        {
+            try
+            {
+                return type.GetProperty(name, flags);
+            }
+            catch (AmbiguousMatchException)
+            {
+                return type.GetProperties(flags)
+                    .Where(p => p.Name == name && p.GetIndexParameters().Length == 0)
+                    .FirstOrDefault();
+            }
+        }
+
+        static MethodInfo PickMethodByArgTypes(Type type, string name, BindingFlags flags, int argc, List<string> argTypes)
+        {
+            var candidates = new List<MethodInfo>();
+            foreach (var method in type.GetMethods(flags))
+            {
+                if (method.Name != name) continue;
+                candidates.Add(method);
+            }
+            if (candidates.Count == 0) return null;
+
+            // 1) argTypes 显式消歧：参数类型逐位匹配（接受 FullName 或 Name）。
+            if (argTypes.Count > 0)
+            {
+                foreach (var method in candidates)
+                {
+                    var parameters = method.GetParameters();
+                    if (parameters.Length < argTypes.Count) continue;
+                    var ok = true;
+                    for (var i = 0; i < argTypes.Count; i++)
+                    {
+                        var want = argTypes[i];
+                        var actual = parameters[i].ParameterType;
+                        if (actual.FullName != want && actual.Name != want) { ok = false; break; }
+                    }
+                    if (ok) return method;
+                }
+            }
+            // 2) 参数个数精确匹配。
+            foreach (var method in candidates)
+            {
+                if (method.GetParameters().Length == argc) return method;
+            }
+            // 3) 允许尾部有默认值的重载。
+            foreach (var method in candidates)
+            {
+                var parameters = method.GetParameters();
+                if (parameters.Length <= argc) continue;
+                var tailDefaults = true;
+                for (var i = argc; i < parameters.Length; i++)
+                {
+                    if (!parameters[i].HasDefaultValue) { tailDefaults = false; break; }
+                }
+                if (tailDefaults) return method;
+            }
+            return candidates[0];
+        }
+
+        static object ReadOrInvoke(MemberHit hit, object target, bool isStatic, bool hasValue, object writeValue, List<object> rawArgs, DescribeState state)
+        {
+            var instance = isStatic ? null : target;
+            if (hit.Kind == "property")
+            {
+                if (hasValue)
+                {
+                    if (!hit.Property.CanWrite) throw new KnownError("readonly_member", "属性不可写: " + hit.Name);
+                    hit.Property.SetValue(instance, CoerceValue(writeValue, hit.Property.PropertyType), null);
+                }
+                if (!hit.Property.CanRead) throw new KnownError("readonly_member", "属性不可读: " + hit.Name);
+                return DescribeEx(hit.Property.GetValue(instance, null), state, hit.Name);
+            }
+            if (hit.Kind == "field")
+            {
+                if (hasValue) hit.Field.SetValue(instance, CoerceValue(writeValue, hit.Field.FieldType));
+                return DescribeEx(hit.Field.GetValue(instance), state, hit.Name);
+            }
+            EnsureMethodCallable(hit.Method);
+            var converted = ConvertArgs(hit.Method.GetParameters(), rawArgs);
+            return DescribeEx(hit.Method.Invoke(instance, converted), state, hit.Name);
+        }
+
+        /// <summary>未命中时给出近似成员名：前缀匹配优先，其次子串匹配。</summary>
+        static List<string> SuggestMemberNames(Type type, string name, BindingFlags flags)
+        {
+            var prefix = new List<string>();
+            var contains = new List<string>();
+            if (string.IsNullOrEmpty(name)) return prefix;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                var allMembers = new List<MemberInfo>();
+                // 私有基类成员必须逐层收集（同 FindMember 的理由）。
+                for (var current = type; current != null; current = current.BaseType)
+                {
+                    foreach (var member in current.GetMembers(flags)) allMembers.Add(member);
+                }
+                foreach (var member in allMembers)
+                {
+                    var memberName = member.Name;
+                    if (string.IsNullOrEmpty(memberName) || memberName.StartsWith("get_", StringComparison.Ordinal)
+                        || memberName.StartsWith("set_", StringComparison.Ordinal)) continue;
+                    if (!seen.Add(memberName)) continue;
+                    if (memberName.StartsWith(name, StringComparison.OrdinalIgnoreCase)) prefix.Add(memberName);
+                    else if (memberName.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) contains.Add(memberName);
+                }
+            }
+            catch { }
+            prefix.Sort(StringComparer.Ordinal);
+            contains.Sort(StringComparer.Ordinal);
+            var outList = new List<string>();
+            for (var i = 0; i < prefix.Count && outList.Count < 8; i++) outList.Add(prefix[i]);
+            for (var i = 0; i < contains.Count && outList.Count < 8; i++) outList.Add(contains[i]);
+            return outList;
+        }
+
+        // ===== 能力 3：结构化返回（递归 JSON 化 + 显式截断）=====
+
+        sealed class DescribeState
+        {
+            public const int MaxDepth = 6;
+            public const int MaxItems = 500;
+            public const int MaxNodes = 20000;
+            public int Nodes;
+            public bool Truncated;
+            public string Reason;
+            public string Path;
+
+            public void Mark(string reason, string path)
+            {
+                if (Truncated) return;
+                Truncated = true;
+                Reason = reason;
+                Path = path;
+            }
+
+            public Dictionary<string, object> Describe()
+            {
+                var d = new Dictionary<string, object>();
+                d["reason"] = Reason ?? "unknown";
+                d["path"] = Path ?? "";
+                d["nodes"] = (long)Nodes;
+                d["maxDepth"] = (long)MaxDepth;
+                d["maxItems"] = (long)MaxItems;
+                d["maxNodes"] = (long)MaxNodes;
+                return d;
+            }
+        }
+
+        /// <summary>引用相等比较器：用于检测对象图环，避免 ToString/Equals 重写带来的误判。</summary>
+        sealed class ReferenceComparer : IEqualityComparer<object>
+        {
+            public static readonly ReferenceComparer Instance = new ReferenceComparer();
+            public new bool Equals(object a, object b) { return ReferenceEquals(a, b); }
+            public int GetHashCode(object obj) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj); }
+        }
+
+        static object DescribeEx(object value, DescribeState state, string path)
+        {
+            return DescribeEx(value, state, path, 0, new HashSet<object>(ReferenceComparer.Instance));
+        }
+
+        static object DescribeEx(object value, DescribeState state, string path, int depth, HashSet<object> stack)
+        {
+            if (state.Nodes >= DescribeState.MaxNodes) { state.Mark("nodes", path); return "<nodes budget exhausted>"; }
+            state.Nodes += 1;
+            if (value == null) return null;
+            var text = value as string;
+            if (text != null) return text;
+            if (value is bool || value is int || value is long || value is float || value is double || value is decimal) return value;
+            if (value is Enum) return value.ToString();
+            // 这些值类型是「标量」而不是对象引用：返回文本，避免调用方拿到无意义的句柄。
+            if (value is IntPtr || value is UIntPtr) return value.ToString();
+            if (value is DateTime) return ((DateTime)value).ToString("o", CultureInfo.InvariantCulture);
+            if (value is TimeSpan) return value.ToString();
+            if (value is Guid) return value.ToString();
+
+            var unityObject = value as UnityEngine.Object;
+            if (unityObject != null) return DescribeRef(unityObject);
+
+            var isReference = !value.GetType().IsValueType;
+            if (depth >= DescribeState.MaxDepth)
+            {
+                state.Mark("depth", path);
+                return "<" + value.GetType().Name + " depth-limited>";
+            }
+            if (isReference && !stack.Add(value))
+            {
+                state.Mark("cycle", path);
+                return "<cycle>";
+            }
+            try
+            {
+                var dictionary = value as IDictionary;
+                if (dictionary != null)
+                {
+                    // 先把条目收集起来：JSON 对象键必须是字符串，而字典键可能是 int/string/自定义类型。
+                    // 若两个不同键编码成同一字符串（例如 1 与 "1"），直接写字典会**静默覆盖**、
+                    // 丢掉其中一个值。这里检测到冲突就整体降级为数组并标记，绝不静默丢数据。
+                    var entries = new List<DictionaryEntry>();
+                    var index = 0;
+                    foreach (DictionaryEntry entry in dictionary)
+                    {
+                        if (index >= DescribeState.MaxItems) { state.Mark("items", path); break; }
+                        entries.Add(entry);
+                        index += 1;
+                    }
+
+                    var encodedKeys = new List<string>(entries.Count);
+                    var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+                    var keyCollision = false;
+                    for (var i = 0; i < entries.Count; i++)
+                    {
+                        var key = entries[i].Key == null
+                            ? string.Empty
+                            : (System.Convert.ToString(entries[i].Key, CultureInfo.InvariantCulture) ?? string.Empty);
+                        if (!seenKeys.Add(key)) { keyCollision = true; break; }
+                        encodedKeys.Add(key);
+                    }
+
+                    if (keyCollision)
+                    {
+                        state.Mark("key-collision", path);
+                        var degraded = new List<object>();
+                        for (var i = 0; i < entries.Count; i++)
+                        {
+                            var row = new Dictionary<string, object>();
+                            row["key"] = DescribeEx(entries[i].Key, state, path + "[key]" + i.ToString(CultureInfo.InvariantCulture), depth + 1, stack);
+                            row["keyType"] = entries[i].Key == null ? null : entries[i].Key.GetType().Name;
+                            row["value"] = DescribeEx(entries[i].Value, state, path + "[value]" + i.ToString(CultureInfo.InvariantCulture), depth + 1, stack);
+                            degraded.Add(row);
+                        }
+                        return degraded;
+                    }
+
+                    var outDict = new Dictionary<string, object>();
+                    for (var i = 0; i < entries.Count; i++)
+                    {
+                        outDict[encodedKeys[i]] = DescribeEx(entries[i].Value, state, path + "." + encodedKeys[i], depth + 1, stack);
+                    }
+                    return outDict;
+                }
+                var sequence = value as IEnumerable;
+                if (sequence != null)
+                {
+                    var outList = new List<object>();
+                    var index = 0;
+                    foreach (var item in sequence)
+                    {
+                        if (index >= DescribeState.MaxItems) { state.Mark("items", path); break; }
+                        outList.Add(DescribeEx(item, state, path + "[" + index.ToString(CultureInfo.InvariantCulture) + "]", depth + 1, stack));
+                        index += 1;
+                    }
+                    return outList;
+                }
+            }
+            finally
+            {
+                if (isReference) stack.Remove(value);
+            }
+            // 未知复杂对象：不做属性枚举（会把整张对象图拖进响应），但必须回传可复用的句柄，
+            // 否则「拿到对象 → 再对它调用方法」这条最常用的反射链会在第一步断掉。
+            var handleRef = new Dictionary<string, object>();
+            handleRef["$handle"] = PutHandle(value);
+            handleRef["$type"] = value.GetType().FullName ?? value.GetType().Name;
+            handleRef["toString"] = value.ToString();
+            return handleRef;
+        }
+
+        // ===== 能力 2：批量调用 + 共享 Undo 事务边界 =====
+
+        static Dictionary<string, object> ApiBatch(Dictionary<string, object> args)
+        {
+            var calls = AsObjectList(args, "calls");
+            if (calls.Count == 0) throw new KnownError("invalid_argument", "calls 不能为空");
+            var stopOnError = ToBoolOr(args, "stopOnError", true);
+            var rollbackOnError = ToBoolOr(args, "rollbackOnError", true);
+            var groupName = GetString(args, "undoGroupName") ?? "DSH Batch";
+            var compensations = AsObjectList(args, "onError");
+
+            var state = new DescribeState();
+            var results = new List<object>();
+            var undoGroupOpened = false;
+            var undoGroup = -1;
+            try
+            {
+                Undo.IncrementCurrentGroup();
+                undoGroup = Undo.GetCurrentGroup();
+                Undo.SetCurrentGroupName(groupName);
+                undoGroupOpened = true;
+            }
+            catch (Exception)
+            {
+                // Undo 不可用（例如在批处理模式/无 GUI）时仍执行调用，但如实报告组未打开。
+                undoGroupOpened = false;
+            }
+
+            long failedAt = -1;
+            Dictionary<string, object> failure = null;
+            var failures = new List<object>();
+            var rolledBack = false;
+            var compensationResults = new List<object>();
+
+            for (var i = 0; i < calls.Count; i++)
+            {
+                var call = calls[i] as Dictionary<string, object>;
+                var row = new Dictionary<string, object>();
+                row["index"] = (long)i;
+                if (call == null)
+                {
+                    var argError = Error("invalid_argument", "calls[" + i.ToString(CultureInfo.InvariantCulture) + "] 不是对象", "");
+                    row["ok"] = false;
+                    row["error"] = argError;
+                    results.Add(row);
+                    if (failedAt < 0) { failedAt = i; failure = row; }
+                    failures.Add(new Dictionary<string, object> {
+                        { "index", (long)i },
+                        { "code", "invalid_argument" },
+                        { "message", "调用项不是对象" },
+                    });
+                    break;
+                }
+                try
+                {
+                    // 单个 call 有两种形态：反射成员访问，或一段 C# 代码。
+                    // 后者让 batch 能覆盖「建 staging 资产 → 操作 → 失败 → 补偿清理」这类事务，
+                    // 与 ASECLI 的 execute_code 事务语义对齐。
+                    var one = call.ContainsKey("code") ? CodeExecute(call) : ReflectInvoke(call);
+                    row["ok"] = true;
+                    foreach (var pair in one) row[pair.Key] = pair.Value;
+                    results.Add(row);
+                }
+                catch (Exception e)
+                {
+                    var code = CodeOf(e);
+                    row["ok"] = false;
+                    row["resolvedMember"] = GetString(call, "member");
+                    row["error"] = Error(code, MessageOf(e), DetailOf(e));
+                    results.Add(row);
+                    // failedAt 固定为**首个**失败；全部失败放进 failures[]，
+                    // 否则 stopOnError=false 场景下调用方只看到最后一个失败，会漏做补偿。
+                    if (failedAt < 0) { failedAt = i; failure = row; }
+                    failures.Add(new Dictionary<string, object> {
+                        { "index", (long)i },
+                        { "code", code },
+                        { "message", MessageOf(e) },
+                    });
+                    if (stopOnError) break;
+                }
+            }
+
+            if (failedAt >= 0 && rollbackOnError)
+            {
+                // 先跑补偿：多数资产侧回滚（删 staging、还原导入设置）不在 Undo 栈上，
+                // 只靠 Undo 会留下孤儿资产。补偿失败也继续，避免半途中止。
+                for (var i = 0; i < compensations.Count; i++)
+                {
+                    var comp = compensations[i] as Dictionary<string, object>;
+                    var row = new Dictionary<string, object>();
+                    row["index"] = (long)i;
+                    if (comp == null)
+                    {
+                        row["ok"] = false;
+                        row["error"] = Error("invalid_argument", "onError[" + i.ToString(CultureInfo.InvariantCulture) + "] 不是对象", "");
+                        compensationResults.Add(row);
+                        continue;
+                    }
+                    try
+                    {
+                        row["ok"] = true;
+                        row["result"] = comp.ContainsKey("code")
+                            ? CodeExecute(comp)["result"]
+                            : ReflectInvoke(comp)["result"];
+                    }
+                    catch (Exception e)
+                    {
+                        row["ok"] = false;
+                        row["error"] = Error(CodeOf(e), MessageOf(e), DetailOf(e));
+                    }
+                    compensationResults.Add(row);
+                }
+                if (undoGroupOpened)
+                {
+                    try
+                    {
+                        Undo.RevertAllDownToGroup(undoGroup);
+                        rolledBack = true;
+                    }
+                    catch (Exception) { rolledBack = false; }
+                }
+            }
+
+            var response = new Dictionary<string, object>();
+            response["results"] = results;
+            response["failedAt"] = failedAt >= 0 ? (object)failedAt : null;
+            response["rolledBack"] = rolledBack;
+            response["undoGroupOpened"] = undoGroupOpened;
+            response["undoGroup"] = undoGroup >= 0 ? (object)(long)undoGroup : null;
+            response["stopOnError"] = stopOnError;
+            response["rollbackOnError"] = rollbackOnError;
+            if (failure != null) response["error"] = failure["error"];
+            if (failures.Count > 0) response["failures"] = failures;
+            if (compensationResults.Count > 0) response["compensations"] = compensationResults;
+            response["resultTruncated"] = state.Truncated;
+            if (state.Truncated) response["truncation"] = state.Describe();
+            return response;
+        }
+
+        static string MessageOf(Exception e)
+        {
+            if (e is TargetInvocationException && e.InnerException != null) return MessageOf(e.InnerException);
+            return e.Message ?? string.Empty;
+        }
+
+        // ===== 能力 5：进程内 C# 执行（等价 MCP execute_code）=====
+        //
+        // 为什么必须有它：ASE 的编辑脚本是含循环、条件与 try/catch 回滚的完整程序，
+        // 用「逐成员反射序列」无法等价表达——Undo 组边界与 AssetDatabase 刷新时序都会变。
+        //
+        // 实现路径：引擎安装目录自带 Mono 版 Roslyn（MonoBleedingEdge/lib/mono/4.5）。
+        // 这里反射加载它，用 Script.Compile() 同步编译、CreateDelegate() 在主线程同步执行。
+        // 刻意不用 RunAsync().Wait()：编辑器主线程挂着 UnitySynchronizationContext，
+        // 等待 async 续体会自死锁（已在本机 Mono 上用同版本 Roslyn 验证过同步路径）。
+
+        const string ScriptingNamespace = "Microsoft.CodeAnalysis.Scripting";
+        const string CSharpScriptingNamespace = "Microsoft.CodeAnalysis.CSharp.Scripting";
+
+        static bool _scriptingReady;
+        static readonly object _scriptingLock = new object();
+        static Type _tScriptOptions;
+        static Type _tCSharpScript;
+        static Type _tScript;
+        static object _scriptOptions;
+        static string _scriptingDirectory;
+        // 诊断列表必须**有界且每次调用重置**：否则每次 code.execute 都追加一条，
+        // 长时间运行会无界增长，并把真正有用的缺失项挤出错误 detail 的截断窗口。
+        const int MaxScriptingDiagnostics = 64;
+        static readonly List<string> _scriptingDiagnostics = new List<string>();
+
+        static void AddDiagnostic(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            if (_scriptingDiagnostics.Count >= MaxScriptingDiagnostics) _scriptingDiagnostics.RemoveAt(0);
+            _scriptingDiagnostics.Add(text);
+        }
+
+        static void EnsureScripting()
+        {
+            lock (_scriptingLock)
+            {
+                if (_scriptingReady) return;
+
+                var dir = RoslynDirectory();
+                var assemblies = new string[] {
+                    "Microsoft.CodeAnalysis.dll",
+                    "Microsoft.CodeAnalysis.CSharp.dll",
+                    "Microsoft.CodeAnalysis.Scripting.dll",
+                    "Microsoft.CodeAnalysis.CSharp.Scripting.dll"
+                };
+                foreach (var existing in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var existingName = existing.GetName().Name ?? string.Empty;
+                    if (existingName.IndexOf("CodeAnalysis", StringComparison.Ordinal) < 0) continue;
+                    string existingLocation;
+                    try { existingLocation = existing.Location; } catch { existingLocation = "(none)"; }
+                    AddDiagnostic("preloaded:" + existingName + "@" + existing.GetName().Version + "@" + existingLocation);
+                }
+
+                // 先补齐 Roslyn 3.7 的运行时依赖。缺这几份时 Compile 会以 NotImplementedException 之类的
+                // 形式失败（表面看不出是缺依赖），因为工程里往往已有别的 Microsoft.CodeAnalysis 副本，
+                // Mono 会把它们视作同版本而复用，依赖解析就落到我们没提供的那条路上。
+                var dependencyAssemblies = new string[] {
+                    "System.Memory.dll",
+                    "System.Collections.Immutable.dll",
+                    "System.Reflection.Metadata.dll",
+                    "System.Runtime.CompilerServices.Unsafe.dll",
+                    "System.Numerics.Vectors.dll"
+                };
+                foreach (var name in dependencyAssemblies)
+                {
+                    var dependencyPath = Path.Combine(dir, name);
+                    if (!File.Exists(dependencyPath)) continue;
+                    try { System.Reflection.Assembly.LoadFrom(dependencyPath); }
+                    catch (Exception e) { AddDiagnostic("dep-fail:" + name + ":" + e.GetType().Name); }
+                }
+
+                var loadedAssemblies = new Dictionary<string, System.Reflection.Assembly>(StringComparer.OrdinalIgnoreCase);
+                foreach (var name in assemblies)
+                {
+                    var path = Path.Combine(dir, name);
+                    if (!File.Exists(path))
+                        throw new KnownError("code_execute_unavailable", "引擎自带的 Roslyn 缺少文件: " + path);
+                    try
+                    {
+                        loadedAssemblies[name] = System.Reflection.Assembly.LoadFrom(path);
+                    }
+                    catch (Exception e)
+                    {
+                        throw new KnownError(
+                            "code_execute_unavailable",
+                            "无法加载 Roslyn 程序集 " + name + ": " + e.Message,
+                            e.GetType().Name + " | " + string.Join(" ;; ", _scriptingDiagnostics.ToArray()));
+                    }
+                }
+
+                // 必须从**自己加载的** Assembly 上取类型。用 Type.GetType(名, 程序集名) 会按简单名解析，
+                // 编辑器进程里若已经有另一版本的 Microsoft.CodeAnalysis（Unity 自己会用），
+                // 就会拿到那一份，随后 Compile 走到与预期不同的实现上（表现为 NotImplementedException）。
+                var asmScripting = loadedAssemblies["Microsoft.CodeAnalysis.Scripting.dll"];
+                var asmCSharpScripting = loadedAssemblies["Microsoft.CodeAnalysis.CSharp.Scripting.dll"];
+                _tScriptOptions = asmScripting.GetType(ScriptingNamespace + ".ScriptOptions", false);
+                _tScript = asmScripting.GetType(ScriptingNamespace + ".Script", false);
+                _tCSharpScript = asmCSharpScripting.GetType(CSharpScriptingNamespace + ".CSharpScript", false);
+                if (_tScriptOptions == null || _tCSharpScript == null || _tScript == null)
+                {
+                    throw new KnownError(
+                        "code_execute_unavailable",
+                        "Roslyn 程序集已加载但找不到 ScriptOptions/CSharpScript/Script 类型（版本不匹配？）",
+                        string.Join(" ;; ", _scriptingDiagnostics.ToArray()));
+                }
+                AddDiagnostic("bound:" + _tScriptOptions.Assembly.GetName().Name + "@" + _tScriptOptions.Assembly.GetName().Version);
+
+                _scriptOptions = BuildScriptOptions(null);
+                _scriptingDirectory = dir;
+                _scriptingReady = true;
+            }
+        }
+
+        /// <summary>在引擎安装目录里定位 Mono 版 Roslyn。</summary>
+        static string RoslynDirectory()
+        {
+            var contents = EditorApplication.applicationContentsPath;
+            if (string.IsNullOrEmpty(contents))
+                throw new KnownError("code_execute_unavailable", "取不到编辑器安装内容目录（applicationContentsPath 为空）");
+            var direct = Path.Combine(contents, "MonoBleedingEdge", "lib", "mono", "4.5");
+            if (File.Exists(Path.Combine(direct, "Microsoft.CodeAnalysis.CSharp.Scripting.dll"))) return direct;
+            // 兼容不同 profile 目录名（4.7.1-api 等）。
+            var monoRoot = Path.Combine(contents, "MonoBleedingEdge", "lib", "mono");
+            if (Directory.Exists(monoRoot))
+            {
+                foreach (var candidate in Directory.GetDirectories(monoRoot))
+                {
+                    if (File.Exists(Path.Combine(candidate, "Microsoft.CodeAnalysis.CSharp.Scripting.dll"))) return candidate;
+                }
+            }
+            throw new KnownError(
+                "code_execute_unavailable",
+                "引擎安装目录内找不到 Mono 版 Roslyn（期望 " + direct + "）；该引擎版本可能未随附编译器");
+        }
+
+        /// <summary>
+        /// 构建脚本选项。explicitReferences 非空时**完全覆盖**默认引用集——
+        /// 这是排障手段：怀疑某个程序集让 Roslyn 元数据解析走到 Mono 未实现的 API 时，
+        /// 可以用最小引用集二分定位，而不必反复改探针。
+        /// </summary>
+        /// <summary>收集引用路径：显式覆盖 > Unity 编译管线 > 已加载程序集兜底。</summary>
+        static List<string> CollectReferencePaths(List<string> explicitReferences)
+        {
+            var paths = new List<string>();
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (explicitReferences != null)
+            {
+                foreach (var item in explicitReferences)
+                {
+                    var trimmed = (item ?? string.Empty).Trim();
+                    if (trimmed.Length == 0) continue;
+                    if (!File.Exists(trimmed)) continue;
+                    // 与 asset.read/create 的策略保持一致：只接受「工程内」或「引擎安装目录」的引用，
+                    // 否则等于开放任意本地文件的读取/元数据解析通道（实测过 /etc/hosts 被接受）。
+                    var full = Path.GetFullPath(trimmed);
+                    if (!IsInsideProject(full) && !IsInsideEngineContents(full))
+                        throw new KnownError(
+                            "path_escape",
+                            "references 只允许工程内或引擎安装目录下的程序集，已拒绝：" + trimmed);
+                    if (seenPaths.Add(full)) paths.Add(full);
+                }
+                return paths;
+            }
+
+            // Unity 编译管线给出的引用集就是「Unity 自己编译这些脚本时用的那一套」：
+            // compiledAssemblyReferences 是预编译引用（UnityEngine/UnityEditor/netstandard 等），
+            // outputPath 是工程内的程序集（Assembly-CSharp(-Editor)、ASE 等 asmdef 产物）。
+            try
+            {
+                var editorAssemblies = CompilationPipeline.GetAssemblies(AssembliesType.Editor);
+                if (editorAssemblies != null)
+                {
+                    foreach (var editorAssembly in editorAssemblies)
+                    {
+                        if (editorAssembly == null) continue;
+                        if (editorAssembly.compiledAssemblyReferences != null)
+                        {
+                            foreach (var reference in editorAssembly.compiledAssemblyReferences)
+                            {
+                                if (string.IsNullOrEmpty(reference) || !File.Exists(reference)) continue;
+                                if (seenPaths.Add(reference)) paths.Add(reference);
+                            }
+                        }
+                        var outputPath = editorAssembly.outputPath;
+                        if (!string.IsNullOrEmpty(outputPath) && File.Exists(outputPath))
+                        {
+                            if (seenPaths.Add(outputPath)) paths.Add(outputPath);
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { AddDiagnostic("compilation-pipeline-failed:" + e.GetType().Name); }
+
+            // 兜底：编译管线不可用（例如首次域重载尚未就绪）时退回已加载程序集。
+            if (paths.Count == 0)
+            {
+                foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (assembly.IsDynamic) continue;
+                    string location;
+                    try { location = assembly.Location; } catch { continue; }
+                    if (string.IsNullOrEmpty(location) || !File.Exists(location)) continue;
+                    if (seenPaths.Add(location)) paths.Add(location);
+                }
+            }
+            return paths;
+        }
+
+        static object BuildScriptOptions(List<string> explicitReferences)
+        {
+            var options = _tScriptOptions.GetProperty("Default", BindingFlags.Public | BindingFlags.Static).GetValue(null, null);
+            var paths = CollectReferencePaths(explicitReferences);
+
+            var withReferencesByPath = FindMethod(_tScriptOptions, "WithReferences", delegate (ParameterInfo[] ps)
+            {
+                if (ps.Length != 1) return false;
+                var t = ps[0].ParameterType;
+                return t.IsGenericType && t.GetGenericArguments()[0] == typeof(string);
+            });
+            if (withReferencesByPath != null)
+            {
+                options = withReferencesByPath.Invoke(options, new object[] { paths.ToArray() });
+            }
+            else
+            {
+                var withReferencesByAssembly = FindMethod(_tScriptOptions, "WithReferences", delegate (ParameterInfo[] ps)
+                {
+                    if (ps.Length != 1) return false;
+                    var t = ps[0].ParameterType;
+                    return t.IsGenericType && t.GetGenericArguments()[0] == typeof(System.Reflection.Assembly);
+                });
+                if (withReferencesByAssembly == null)
+                    throw new KnownError("code_execute_unavailable", "Roslyn 的 ScriptOptions 缺少可用的 WithReferences 重载");
+                var loaded = new List<System.Reflection.Assembly>();
+                foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (assembly.IsDynamic) continue;
+                    string location;
+                    try { location = assembly.Location; } catch { continue; }
+                    if (string.IsNullOrEmpty(location)) continue;
+                    loaded.Add(assembly);
+                }
+                options = withReferencesByAssembly.Invoke(options, new object[] { loaded.ToArray() });
+            }
+
+            var withImports = FindMethod(_tScriptOptions, "WithImports", delegate (ParameterInfo[] ps)
+            {
+                if (ps.Length != 1) return false;
+                var t = ps[0].ParameterType;
+                return t.IsGenericType && t.GetGenericArguments()[0] == typeof(string);
+            });
+            if (withImports != null)
+            {
+                var imports = new string[] {
+                    "System", "System.IO", "System.Text", "System.Linq", "System.Collections",
+                    "System.Collections.Generic", "System.Globalization",
+                    "UnityEngine", "UnityEditor"
+                };
+                options = withImports.Invoke(options, new object[] { imports });
+            }
+            return options;
+        }
+
+        /// <summary>
+        /// 按参数形状挑重载，避免依赖 Roslyn 具体版本的参数顺序。
+        /// 必须跳过开放泛型方法定义：CSharpScript.Create 有一个泛型重载 Create&lt;T&gt;，
+        /// 用反射 Invoke 它会抛「Late bound operations cannot be performed ... ContainsGenericParameters」。
+        /// </summary>
+        static MethodInfo FindMethod(Type type, string name, Func<ParameterInfo[], bool> predicate)
+        {
+            foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance))
+            {
+                if (method.Name != name) continue;
+                if (method.IsGenericMethodDefinition || method.ContainsGenericParameters) continue;
+                if (predicate(method.GetParameters())) return method;
+            }
+            return null;
+        }
+
+        // ===== 后端 B：Mono 自带编译器（Microsoft.CSharp / Mono.CSharp）=====
+        //
+        // 为什么需要第二后端：Roslyn 的内核依赖 System.Memory / System.Runtime.CompilerServices.Unsafe
+        // 的 Span 路径。Unity 编辑器进程里这些程序集往往已被引擎或其他插件先加载了不同实现，
+        // Mono 会按「同版本复用」绑定到那一份，于是 Compile 阶段出现 NotImplementedException
+        // （命令行 mono 下无法复现，只有编辑器进程内才会）。Mono 自带编译器是纯托管 IL 生成，
+        // 不走 Span/Unsafe，因此在这类环境里更稳；代价是语言特性较旧（C# 7.x）。
+
+        static Type _tCodeProvider;
+        static Type _tCompilerParameters;
+        static Type _tCompilerResults;
+
+        static void EnsureMonoCompiler()
+        {
+            if (_tCodeProvider != null && _tCompilerParameters != null && _tCompilerResults != null) return;
+
+            _tCompilerParameters = Type.GetType("System.CodeDom.Compiler.CompilerParameters, System");
+            _tCompilerResults = Type.GetType("System.CodeDom.Compiler.CompilerResults, System");
+
+            if (_tCodeProvider == null)
+            {
+                // .NET Framework 把 CSharpCodeProvider 放在 System.dll（不是 Microsoft.CSharp.dll，
+                // 后者只提供 dynamic 的 RuntimeBinder）。所以先按 System 解析，再遍历兜底。
+                _tCodeProvider = Type.GetType("Microsoft.CSharp.CSharpCodeProvider, System");
+            }
+            if (_tCodeProvider == null)
+            {
+                foreach (var candidateAssembly in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        var candidate = candidateAssembly.GetType("Microsoft.CSharp.CSharpCodeProvider", false);
+                        if (candidate == null) continue;
+                        _tCodeProvider = candidate;
+                        AddDiagnostic("mcs-provider-from:" + candidateAssembly.GetName().Name);
+                        break;
+                    }
+                    catch (Exception) { }
+                }
+            }
+            if (_tCodeProvider == null)
+            {
+                AddDiagnostic(
+                    "mcs-types:provider=missing,params=" + (_tCompilerParameters == null ? "missing" : "ok")
+                    + ",results=" + (_tCompilerResults == null ? "missing" : "ok"));
+                throw new KnownError(
+                    "code_execute_unavailable",
+                    "Mono 自带编译器不可用（找不到 Microsoft.CSharp.CSharpCodeProvider）",
+                    string.Join(" ;; ", _scriptingDiagnostics.ToArray()));
+            }
+            if (_tCompilerParameters == null || _tCompilerResults == null)
+            {
+                AddDiagnostic(
+                    "mcs-types:provider=ok,params=" + (_tCompilerParameters == null ? "missing" : "ok")
+                    + ",results=" + (_tCompilerResults == null ? "missing" : "ok"));
+                throw new KnownError(
+                    "code_execute_unavailable",
+                    "System.CodeDom.Compiler 类型缺失",
+                    string.Join(" ;; ", _scriptingDiagnostics.ToArray()));
+            }
+        }
+
+        /// <summary>
+        /// 把「顶层语句」包进一个方法。ASECLI 的片段都是语句序列，这样包装后语义等价：
+        /// 变量作用域、throws、try/catch 都不变；末尾补 return null 以覆盖「没有返回值」的情形。
+        /// </summary>
+        static string WrapAsScriptMethod(string code)
+        {
+            var builder = new StringBuilder();
+            builder.Append("using System;\n");
+            builder.Append("using System.IO;\n");
+            builder.Append("using System.Text;\n");
+            builder.Append("using System.Linq;\n");
+            builder.Append("using System.Collections;\n");
+            builder.Append("using System.Collections.Generic;\n");
+            builder.Append("using System.Globalization;\n");
+            builder.Append("using UnityEngine;\n");
+            builder.Append("using UnityEditor;\n");
+            builder.Append("public static class __DshScript\n{\n");
+            builder.Append("    public static object Execute()\n    {\n");
+            builder.Append(code);
+            builder.Append("\n; return null;\n    }\n}\n");
+            return builder.ToString();
+        }
+
+        static readonly Dictionary<string, string> _assemblyNameCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>按程序集简单名判重（mcs 对同名程序集会报 CS1704）。判重结果缓存，避免每次重读元数据。</summary>
+        static string AssemblySimpleName(string path)
+        {
+            string cached;
+            if (_assemblyNameCache.TryGetValue(path, out cached)) return cached;
+            string name = null;
+            try { name = System.Reflection.AssemblyName.GetAssemblyName(path).Name; }
+            catch (Exception) { name = null; }
+            _assemblyNameCache[path] = name;
+            return name;
+        }
+
+        /// <summary>
+        /// 为 Mono 自带编译器构造**自洽**的引用集。
+        ///
+        /// 不能直接复用 Unity 编译管线的引用集：它包含 NetStandard/ref 与 compat shims，
+        /// 与 mscorlib 各自定义同一批 System 类型，mcs 会报 CS0433（Roslyn 能按优先级择一，mcs 不行）。
+        /// 这里改用「.NET 4.7.1 profile + Facades + Unity Managed + 工程程序集」这一套，
+        /// 既提供 Unity 类型，又不会重复定义 System。
+        /// </summary>
+        static List<string> _cachedMonoReferences;
+        static string _cachedMonoReferenceKey;
+
+        /// <summary>目录廉价指纹：文件名集合 + 数量 + 最新写入时间 + 总字节。用于判断引用集是否需要重建。</summary>
+        static void AppendDirSignature(StringBuilder builder, string dir)
+        {
+            builder.Append(dir).Append('=');
+            try
+            {
+                if (!Directory.Exists(dir)) { builder.Append("missing;"); return; }
+                var files = Directory.GetFiles(dir, "*.dll");
+                Array.Sort(files, StringComparer.Ordinal);
+                long maxTicks = 0;
+                long totalBytes = 0;
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var info = new FileInfo(file);
+                        if (info.LastWriteTimeUtc.Ticks > maxTicks) maxTicks = info.LastWriteTimeUtc.Ticks;
+                        totalBytes += info.Length;
+                    }
+                    catch (Exception) { }
+                }
+                builder.Append(files.Length).Append(',').Append(maxTicks).Append(',').Append(totalBytes);
+            }
+            catch (Exception) { builder.Append("error"); }
+            builder.Append(';');
+        }
+
+        static List<string> CollectReferencesForMonoCompiler(out bool cached, out long buildMs)
+        {
+            var clock = Stopwatch.StartNew();
+            var dir = RoslynDirectory();
+            var monoRoot = Path.GetDirectoryName(dir);
+            var profile = Path.Combine(monoRoot, "4.7.1-api");
+            if (!Directory.Exists(profile)) profile = dir;
+            var contents = EditorApplication.applicationContentsPath;
+            var scriptAssemblies = Path.Combine(_projectRoot, "Library", "ScriptAssemblies");
+
+            // 引用集重建要扫 5 个目录 + 数百次元数据查找，占单次调用相当比例的主线程时间。
+            // 以目录指纹为失效键缓存整表；域重载会重置静态字段，因此不会跨会话串味。
+            var signature = new StringBuilder();
+            AppendDirSignature(signature, profile);
+            AppendDirSignature(signature, Path.Combine(profile, "Facades"));
+            if (!string.IsNullOrEmpty(contents)) AppendDirSignature(signature, Path.Combine(contents, "Managed", "UnityEngine"));
+            AppendDirSignature(signature, scriptAssemblies);
+            var key = signature.ToString();
+
+            if (_cachedMonoReferences != null && string.Equals(_cachedMonoReferenceKey, key, StringComparison.Ordinal))
+            {
+                clock.Stop();
+                cached = true;
+                buildMs = clock.ElapsedMilliseconds;
+                AddDiagnostic("mcs-refs-cached:" + _cachedMonoReferences.Count);
+                return _cachedMonoReferences;
+            }
+
+            cached = false;
+            var result = CollectReferencesForMonoCompilerSlow(dir, profile, contents, scriptAssemblies);
+            _cachedMonoReferences = result;
+            _cachedMonoReferenceKey = key;
+            clock.Stop();
+            buildMs = clock.ElapsedMilliseconds;
+            AddDiagnostic("mcs-refs:" + result.Count + ":buildMs=" + buildMs.ToString(CultureInfo.InvariantCulture));
+            return result;
+        }
+
+        static List<string> CollectReferencesForMonoCompilerSlow(string dir, string profile, string contents, string scriptAssemblies)
+        {
+            var paths = new List<string>();
+            var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddPath(string path)
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+                // 按「程序集简单名」去重：同名两份会让 mcs 报 CS1704。
+                var name = AssemblySimpleName(path);
+                if (string.IsNullOrEmpty(name)) return;
+                if (!seenNames.Add(name)) return;
+                paths.Add(path);
+            }
+
+            foreach (var file in Directory.GetFiles(profile, "*.dll")) AddPath(file);
+            var facades = Path.Combine(profile, "Facades");
+            if (Directory.Exists(facades))
+            {
+                foreach (var file in Directory.GetFiles(facades, "*.dll")) AddPath(file);
+            }
+
+            if (!string.IsNullOrEmpty(contents))
+            {
+                var unityEngine = Path.Combine(contents, "Managed", "UnityEngine");
+                if (Directory.Exists(unityEngine))
+                {
+                    foreach (var file in Directory.GetFiles(unityEngine, "*.dll")) AddPath(file);
+                }
+                var managed = Path.Combine(contents, "Managed");
+                if (Directory.Exists(managed))
+                {
+                    foreach (var file in Directory.GetFiles(managed, "UnityEditor*.dll")) AddPath(file);
+                }
+            }
+
+            // 工程程序集：Assembly-CSharp(-Editor) 与 ASE 等 asmdef 产物都在这里。
+            if (Directory.Exists(scriptAssemblies))
+            {
+                foreach (var file in Directory.GetFiles(scriptAssemblies, "*.dll")) AddPath(file);
+            }
+
+            // 已加载但不在上述目录里的程序集（例如包管理器装入内存的）再补一遍。
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (assembly.IsDynamic) continue;
+                string location;
+                try { location = assembly.Location; } catch { continue; }
+                AddPath(location);
+            }
+
+            return paths;
+        }
+
+        // 慢调用阈值：超过就在事件流里留一条记录。主线程同步执行无法中断，
+        // 因此「让它可观测」是唯一能落地的边界——至少事后能定位是哪次调用卡了编辑器。
+        const long SlowCodeExecuteMs = 5000;
+
+        static string ShortCodeHash(string text)
+        {
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(text ?? string.Empty));
+                    var builder = new StringBuilder();
+                    for (var i = 0; i < 8; i++) builder.Append(bytes[i].ToString("x2"));
+                    return builder.ToString();
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        static void ReportSlowCodeExecute(string code, long elapsedMs, string backend)
+        {
+            if (elapsedMs < SlowCodeExecuteMs) return;
+            try
+            {
+                var payload = new Dictionary<string, object>();
+                payload["elapsedMs"] = elapsedMs;
+                payload["thresholdMs"] = SlowCodeExecuteMs;
+                payload["backend"] = backend ?? "unknown";
+                payload["codeBytes"] = (long)Encoding.UTF8.GetByteCount(code ?? string.Empty);
+                // 只留哈希前缀，不把用户代码正文写进事件（可能含敏感内容）。
+                payload["codeSha256Prefix"] = ShortCodeHash(code);
+                PushEvent("code_execute_slow", payload);
+            }
+            catch (Exception) { }
+        }
+
+        static Dictionary<string, object> CodeExecuteViaMonoCompiler(
+            string code, Dictionary<string, object> args, List<string> extraReferences)
+        {
+            EnsureMonoCompiler();
+            var dir = RoslynDirectory();
+            var clock = Stopwatch.StartNew();
+            var source = WrapAsScriptMethod(code);
+            bool referencesCached;
+            long referencesBuildMs;
+            var references = CollectReferencesForMonoCompiler(out referencesCached, out referencesBuildMs);
+            // 显式 references 在 mcs 后端是「追加」而不是「替换」：自洽集是编译能否成功的前提，
+            // 直接替换会缺 mscorlib/netstandard 而全盘失败。追加同样让调用方拿到想要的类型。
+            if (extraReferences != null && extraReferences.Count > 0)
+            {
+                references = new List<string>(references);
+                var known = new HashSet<string>(references, StringComparer.OrdinalIgnoreCase);
+                foreach (var extra in extraReferences)
+                {
+                    if (known.Add(extra)) references.Add(extra);
+                }
+            }
+
+            var parameters = Activator.CreateInstance(_tCompilerParameters);
+            SetProperty(parameters, "GenerateInMemory", true);
+            SetProperty(parameters, "GenerateExecutable", false);
+            SetProperty(parameters, "TreatWarningsAsErrors", false);
+
+            // Unity 的引用集里 netstandard 是 **ref 程序集**（自己定义 System.* 桩），
+            // 与 mscorlib 共存会让 mcs 报 CS0433「类型定义多次」。改用 MonoBleedingEdge 的
+            // Facades/netstandard.dll：它只做类型转发，与 mscorlib 共存不冲突。
+            var facadesNetStandard = Path.Combine(
+                Path.GetDirectoryName(dir),
+                "4.7.1-api",
+                "Facades",
+                "netstandard.dll");
+            var hasFacadesNetStandard = File.Exists(facadesNetStandard);
+            var effectiveReferences = new List<string>();
+            var seenEffective = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var reference in references)
+            {
+                var normalized = reference.Replace('\\', '/');
+                // NetStandard/compat 下的 shims 与 mscorlib 各自定义同一批 System 类型，
+                // mcs 会因此报 CS0433（Roslyn 能按优先级择一，老编译器不行）。全部剔除。
+                if (normalized.IndexOf("/NetStandard/compat/", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                var fileName = Path.GetFileName(reference);
+                if (hasFacadesNetStandard
+                    && string.Equals(fileName, "netstandard.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (seenEffective.Add(facadesNetStandard)) effectiveReferences.Add(facadesNetStandard);
+                    continue;
+                }
+                if (seenEffective.Add(reference)) effectiveReferences.Add(reference);
+            }
+            // -nostdlib：引用集里已显式提供完整 profile（含 mscorlib），
+            // 否则 mcs 会再自动引用一份 mscorlib，导致同一批 System 类型被定义两次（CS0433）。
+            SetProperty(parameters, "CompilerOptions", "-nowarn:1685 -nowarn:1701 -nowarn:1702 -nostdlib");
+            var referenced = GetProperty(parameters, "ReferencedAssemblies");
+            var addReference = referenced == null ? null : FindMethod(referenced.GetType(), "Add", delegate (ParameterInfo[] ps) { return ps.Length == 1 && ps[0].ParameterType == typeof(string); });
+            if (addReference != null)
+            {
+                foreach (var reference in effectiveReferences)
+                {
+                    try { addReference.Invoke(referenced, new object[] { reference }); } catch (Exception) { }
+                }
+            }
+
+            var provider = Activator.CreateInstance(_tCodeProvider);
+            var compile = FindMethod(_tCodeProvider, "CompileAssemblyFromSource", delegate (ParameterInfo[] ps)
+            {
+                if (ps.Length != 2) return false;
+                // 声明是 CompileAssemblyFromSource(CompilerParameters, params string[]) —— 第二参数是 string[]。
+                return ps[0].ParameterType.Name == "CompilerParameters" && ps[1].ParameterType == typeof(string[]);
+            });
+            if (compile == null)
+            {
+                var signatures = new List<string>();
+                foreach (var candidate in _tCodeProvider.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if (candidate.Name.IndexOf("CompileAssembly", StringComparison.Ordinal) < 0) continue;
+                    var parameterNames = new List<string>();
+                    foreach (var parameter in candidate.GetParameters()) parameterNames.Add(parameter.ParameterType.Name);
+                    signatures.Add(candidate.Name + "(" + string.Join(",", parameterNames.ToArray()) + ")");
+                }
+                throw new KnownError(
+                    "code_execute_unavailable",
+                    "CSharpCodeProvider.CompileAssemblyFromSource 不可用",
+                    "provider=" + (_tCodeProvider == null ? "null" : _tCodeProvider.FullName)
+                    + " signatures=" + string.Join(" | ", signatures.ToArray()));
+            }
+
+            var results = compile.Invoke(provider, new object[] { parameters, new string[] { source } });
+            var errors = GetProperty(results, "Errors");
+            var diagnostics = new List<object>();
+            var hasErrors = false;
+            var warningCount = 0;
+            var errorCollection = errors as IEnumerable;
+            if (errorCollection != null)
+            {
+                foreach (var item in errorCollection)
+                {
+                    if (item == null) continue;
+                    var row = new Dictionary<string, object>();
+                    row["id"] = System.Convert.ToString(GetProperty(item, "ErrorNumber"), CultureInfo.InvariantCulture);
+                    row["message"] = System.Convert.ToString(GetProperty(item, "ErrorText"), CultureInfo.InvariantCulture) ?? string.Empty;
+                    row["line"] = System.Convert.ToInt64(GetProperty(item, "Line") ?? 0L, CultureInfo.InvariantCulture);
+                    row["column"] = System.Convert.ToInt64(GetProperty(item, "Column") ?? 0L, CultureInfo.InvariantCulture);
+                    var warning = GetProperty(item, "IsWarning");
+                    var isWarning = warning is bool && (bool)warning;
+                    if (isWarning) { warningCount += 1; continue; }
+                    row["severity"] = "error";
+                    hasErrors = true;
+                    diagnostics.Add(row);
+                    if (diagnostics.Count >= 100) break;
+                }
+            }
+
+            if (hasErrors)
+            {
+                clock.Stop();
+                throw new KnownError(
+                    "compile_error",
+                    "C# 编译失败：" + diagnostics.Count + " 条错误（警告 " + warningCount + " 条；后端 mono-mcs）",
+                    MiniJson.Serialize(diagnostics));
+            }
+
+            var assembly = GetProperty(results, "CompiledAssembly");
+            if (assembly == null) throw new KnownError("compile_error", "编译没有产出程序集", MiniJson.Serialize(diagnostics));
+            var scriptType = ((Type)null);
+            var compiledType = (assembly as System.Reflection.Assembly).GetType("__DshScript", false);
+            if (compiledType == null) throw new KnownError("compile_error", "编译产物中找不到 __DshScript");
+            scriptType = compiledType;
+            var execute = scriptType.GetMethod("Execute", BindingFlags.Public | BindingFlags.Static);
+            object value;
+            try
+            {
+                value = execute.Invoke(null, null);
+            }
+            catch (TargetInvocationException e)
+            {
+                clock.Stop();
+                var inner = e.InnerException ?? e;
+                throw new KnownError(
+                    "script_error",
+                    inner.GetType().Name + ": " + MessageOf(inner),
+                    Trim(inner.StackTrace ?? string.Empty, 4000));
+            }
+            clock.Stop();
+
+            var state = new DescribeState();
+            var response = new Dictionary<string, object>();
+            response["result"] = DescribeEx(UnwrapTask(value), state, "result");
+            response["resultTruncated"] = state.Truncated;
+            if (state.Truncated) response["truncation"] = state.Describe();
+            response["elapsedMs"] = clock.ElapsedMilliseconds;
+            response["diagnostics"] = diagnostics;
+            ReportSlowCodeExecute(code, clock.ElapsedMilliseconds, "mono-mcs");
+            response["backend"] = "mono-mcs";
+            response["referenceCount"] = effectiveReferences.Count;
+            response["referenceCached"] = referencesCached;
+            response["referenceBuildMs"] = referencesBuildMs;
+            response["warningCount"] = (long)warningCount;
+            return response;
+        }
+
+        static void SetProperty(object target, string name, object value)
+        {
+            if (target == null) return;
+            var property = target.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+            if (property != null && property.CanWrite) property.SetValue(target, value, null);
+        }
+
+        static object GetProperty(object target, string name)
+        {
+            if (target == null) return null;
+            var property = target.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+            return property == null ? null : property.GetValue(target, null);
+        }
+
+        static Dictionary<string, object> CodeExecute(Dictionary<string, object> args)
+        {
+            var code = GetString(args, "code");
+            if (code == null) throw new KnownError("invalid_argument", "缺少 code");
+
+            // 每次调用都从干净诊断开始：否则历史条目会无界累积并淹没本次的真实原因。
+            _scriptingDiagnostics.Clear();
+
+            // references 显式覆盖默认引用集：排障用（二分定位是哪个程序集让编译器走不通）。
+            var explicitReferences = GetStringList(args, "references");
+            var backend = GetString(args, "backend") ?? "auto";
+            var referencePaths = CollectReferencePaths(args.ContainsKey("references") ? explicitReferences : null);
+
+            if (backend == "auto" || backend == "mono-mcs" || backend == "mcs")
+            {
+                try
+                {
+                    return CodeExecuteViaMonoCompiler(code, args, args.ContainsKey("references") ? referencePaths : null);
+                }
+                catch (KnownError monoError)
+                {
+                    // 只有「后端不可用」才回退 Roslyn；用户代码编译失败必须原样抛出。
+                    if (monoError.Code != "code_execute_unavailable" || backend != "auto") throw;
+                    AddDiagnostic("mcs-unavailable:" + monoError.Message);
+                }
+            }
+
+            EnsureScripting();
+
+            // 只要显式给了 references 就按它构建（空数组表示「只保留 ScriptOptions 自带的默认引用」）。
+            var scriptOptions = args.ContainsKey("references")
+                ? BuildScriptOptions(explicitReferences)
+                : _scriptOptions;
+
+            var clock = Stopwatch.StartNew();
+            var diagnostics = new List<object>();
+            var hasErrors = false;
+            var warningCount = 0;
+
+            var create = FindMethod(_tCSharpScript, "Create", delegate (ParameterInfo[] ps)
+            {
+                return ps.Length >= 2 && ps[0].ParameterType == typeof(string);
+            });
+            if (create == null) throw new KnownError("code_execute_unavailable", "Roslyn 的 CSharpScript.Create 不可用");
+
+            object script;
+            try
+            {
+                var createArgs = new object[create.GetParameters().Length];
+                createArgs[0] = code;
+                for (var i = 1; i < createArgs.Length; i++)
+                {
+                    var p = create.GetParameters()[i];
+                    createArgs[i] = i == 1 ? scriptOptions : (p.HasDefaultValue ? p.DefaultValue : DefaultOf(p.ParameterType));
+                }
+                script = create.Invoke(null, createArgs);
+            }
+            catch (Exception e)
+            {
+                throw new KnownError("compile_error", "创建脚本失败: " + MessageOf(e), DetailOf(e));
+            }
+
+            // 同步编译：这一步只做语法/语义分析，可在主线程安全执行。
+            var compile = FindMethod(_tScript, "Compile", delegate (ParameterInfo[] ps)
+            {
+                return ps.Length == 1 && ps[0].ParameterType == typeof(System.Threading.CancellationToken);
+            });
+            if (compile == null) throw new KnownError("code_execute_unavailable", "Roslyn 的 Script.Compile 不可用");
+
+            object rawDiagnostics;
+            try
+            {
+                rawDiagnostics = compile.Invoke(script, new object[] { System.Threading.CancellationToken.None });
+            }
+            catch (Exception e)
+            {
+                throw new KnownError(
+                    "compile_error",
+                    "编译失败: " + MessageOf(e),
+                    Trim(
+                        (e.StackTrace ?? string.Empty) + " | " + DetailOf(e)
+                        + " | diag: " + string.Join(" ;; ", _scriptingDiagnostics.ToArray()),
+                        6000));
+            }
+
+            var diagnosticEnumerable = rawDiagnostics as IEnumerable;
+            if (diagnosticEnumerable != null)
+            {
+                foreach (var item in diagnosticEnumerable)
+                {
+                    if (item == null) continue;
+                    var row = DescribeDiagnostic(item);
+                    diagnostics.Add(row);
+                    if (GetString(row, "severity") == "error") hasErrors = true;
+                    if (diagnostics.Count >= 200) break;
+                }
+            }
+
+            if (hasErrors)
+            {
+                clock.Stop();
+                throw new KnownError(
+                    "compile_error",
+                    "C# 编译失败：" + diagnostics.Count + " 条诊断（详见 detail）",
+                    MiniJson.Serialize(diagnostics));
+            }
+
+            // 同步执行：CreateDelegate 返回 ScriptRunner<object>，Invoke(globals, ct) 是同步的。
+            // 注意它声明在运行期的 Script<T> 上（基类 Script 没有这个方法），必须用 script.GetType() 去找。
+            var createDelegate = FindMethod(script.GetType(), "CreateDelegate", delegate (ParameterInfo[] ps)
+            {
+                return ps.Length == 1 && ps[0].ParameterType == typeof(System.Threading.CancellationToken);
+            });
+            if (createDelegate == null) throw new KnownError("code_execute_unavailable", "Roslyn 的 Script.CreateDelegate 不可用");
+
+            object result;
+            try
+            {
+                var runner = createDelegate.Invoke(script, new object[] { System.Threading.CancellationToken.None });
+                var invoke = FindMethod(runner.GetType(), "Invoke", delegate (ParameterInfo[] ps) { return ps.Length == 2; });
+                if (invoke == null) throw new KnownError("code_execute_unavailable", "ScriptRunner 缺少 Invoke(object, CancellationToken)");
+                result = UnwrapTask(invoke.Invoke(runner, new object[] { null, System.Threading.CancellationToken.None }));
+            }
+            catch (TargetInvocationException e)
+            {
+                clock.Stop();
+                var inner = e.InnerException ?? e;
+                throw new KnownError(
+                    "script_error",
+                    inner.GetType().Name + ": " + MessageOf(inner),
+                    Trim((inner.StackTrace ?? string.Empty), 4000));
+            }
+            clock.Stop();
+
+            var state = new DescribeState();
+            var described = DescribeEx(result, state, "result");
+            var response = new Dictionary<string, object>();
+            response["result"] = described;
+            response["resultTruncated"] = state.Truncated;
+            if (state.Truncated) response["truncation"] = state.Describe();
+            response["elapsedMs"] = clock.ElapsedMilliseconds;
+            response["diagnostics"] = diagnostics;
+            ReportSlowCodeExecute(code, clock.ElapsedMilliseconds, "roslyn");
+            response["roslynDirectory"] = _scriptingDirectory;
+            response["explicitReferences"] = explicitReferences.Count;
+            return response;
+        }
+
+        /// <summary>
+        /// ScriptRunner&lt;T&gt; 的签名是 Task&lt;T&gt;，所以即便脚本体是同步代码，返回值也是 Task。
+        /// 这里只在「已经完成」时读取 Result：主线程上等待未完成的 Task 会与 UnitySynchronizationContext
+        /// 互锁（死锁），所以带 await 的脚本被显式拒绝，而不是挂住编辑器。
+        /// </summary>
+        static object UnwrapTask(object value)
+        {
+            var task = value as System.Threading.Tasks.Task;
+            if (task == null) return value;
+            if (!task.IsCompleted)
+                throw new KnownError(
+                    "script_async_unsupported",
+                    "脚本返回了未完成的 Task（脚本体含 await）。主线程同步执行无法安全等待，请改写为同步脚本");
+            if (task.IsFaulted)
+            {
+                var inner = task.Exception != null ? task.Exception.InnerException : null;
+                if (inner == null) inner = task.Exception;
+                throw new KnownError(
+                    "script_error",
+                    (inner != null ? inner.GetType().Name : "Exception") + ": " + (inner != null ? inner.Message : "脚本执行失败"),
+                    inner != null ? Trim(inner.StackTrace ?? string.Empty, 4000) : null);
+            }
+            if (task.IsCanceled) throw new KnownError("script_cancelled", "脚本被取消");
+            var resultProperty = task.GetType().GetProperty("Result");
+            return resultProperty == null ? null : resultProperty.GetValue(task, null);
+        }
+
+        static string Trim(string value, int max)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            return value.Length <= max ? value : value.Substring(0, max);
+        }
+
+        static Dictionary<string, object> DescribeDiagnostic(object diagnostic)
+        {
+            var row = new Dictionary<string, object>();
+            try
+            {
+                var severity = diagnostic.GetType().GetProperty("Severity").GetValue(diagnostic, null);
+                var severityText = severity == null ? "unknown" : severity.ToString().ToLowerInvariant();
+                row["severity"] = severityText;
+                // 错误码是本地化无关的，Mono 下资源字符串可能取不到，靠它才认得出问题。
+                var idProperty = diagnostic.GetType().GetProperty("Id");
+                row["id"] = idProperty == null ? null : (idProperty.GetValue(diagnostic, null) as string);
+                string message = null;
+                // 先用不变文化取消息：编辑器 Mono 里默认资源会因为缺少附属程序集而返回空串。
+                var getMessageWithProvider = FindMethod(
+                    diagnostic.GetType(),
+                    "GetMessage",
+                    delegate (ParameterInfo[] ps) { return ps.Length == 1 && ps[0].ParameterType == typeof(IFormatProvider); });
+                if (getMessageWithProvider != null)
+                {
+                    try { message = getMessageWithProvider.Invoke(diagnostic, new object[] { CultureInfo.InvariantCulture }) as string; }
+                    catch (Exception) { message = null; }
+                }
+                if (string.IsNullOrEmpty(message))
+                {
+                    var getMessage = FindMethod(diagnostic.GetType(), "GetMessage", delegate (ParameterInfo[] ps) { return ps.Length == 0; });
+                    if (getMessage != null)
+                    {
+                        try { message = getMessage.Invoke(diagnostic, null) as string; } catch (Exception) { message = null; }
+                    }
+                }
+                row["message"] = message ?? string.Empty;
+                var location = diagnostic.GetType().GetProperty("Location").GetValue(diagnostic, null);
+                if (location != null)
+                {
+                    var getLineSpan = location.GetType().GetMethod("GetLineSpan", Type.EmptyTypes);
+                    if (getLineSpan != null)
+                    {
+                        var span = getLineSpan.Invoke(location, null);
+                        var start = span.GetType().GetProperty("StartLinePosition").GetValue(span, null);
+                        var line = start.GetType().GetProperty("Line").GetValue(start, null);
+                        var character = start.GetType().GetProperty("Character").GetValue(start, null);
+                        row["line"] = Convert.ToInt64(line, CultureInfo.InvariantCulture) + 1L;
+                        row["column"] = Convert.ToInt64(character, CultureInfo.InvariantCulture) + 1L;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                row["severity"] = "unknown";
+                row["message"] = MessageOf(e);
+            }
+            return row;
         }
 
         static object DefaultOf(Type t) { return t.IsValueType ? Activator.CreateInstance(t) : null; }
@@ -1514,6 +3661,28 @@ namespace DSHBridge
             if (target == typeof(double)) return System.Convert.ToDouble(value, CultureInfo.InvariantCulture);
             if (target == typeof(bool)) return System.Convert.ToBoolean(value, CultureInfo.InvariantCulture);
             if (target.IsEnum) return Enum.Parse(target, System.Convert.ToString(value, CultureInfo.InvariantCulture), true);
+            // System.Type 参数：允许直接传类型名（FindObjectsOfTypeAll(Type) 这类 API 必需）。
+            if (target == typeof(Type))
+            {
+                var typeName = System.Convert.ToString(value, CultureInfo.InvariantCulture);
+                var resolved = FindType(typeName);
+                if (resolved == null) throw new KnownError("type_not_found", "找不到类型: " + typeName);
+                return resolved;
+            }
+            // 数组参数：逐元素 Coerce，例如 object[] / int[] 形式的入参。
+            if (target.IsArray)
+            {
+                var itemType = target.GetElementType();
+                var rawList = value as IEnumerable;
+                if (rawList != null)
+                {
+                    var items = new List<object>();
+                    foreach (var item in rawList) items.Add(Coerce(item, itemType));
+                    var array = Array.CreateInstance(itemType, items.Count);
+                    for (var i = 0; i < items.Count; i++) array.SetValue(items[i], i);
+                    return array;
+                }
+            }
             return value;
         }
 
@@ -1570,7 +3739,8 @@ namespace DSHBridge
                     if (t != null) break;
                 }
             }
-            _typeCache[name] = t;
+            // AA-OPT-016：只缓存命中。缓存 miss 会让「之后装了包含该类型的包」永远找不到类型。
+            if (t != null) _typeCache[name] = t;
             return t;
         }
 
@@ -1616,12 +3786,30 @@ namespace DSHBridge
                 }
             }
             catch { }
+            // AA-OPT-012：状态未知不能伪装成成功——ok 走三态，stateKnown 提到顶层。
+            var errorCount = CountCompileErrors();
             PushEvent("compilation_finished", new Dictionary<string, object>
             {
-                { "ok", !failed },
+                { "ok", known ? (failed ? (object)false : (object)true) : null },
                 { "failed", failed },
                 { "stateKnown", known },
+                { "errorCount", (long)errorCount },
             });
+        }
+
+        /// <summary>从 Unity 控制台取最近一次编译的错误数；取不到时返回 -1（未知）。</summary>
+        static int CountCompileErrors()
+        {
+            try
+            {
+                var entries = new List<object>();
+                foreach (var entry in _log)
+                {
+                    if (GetString(entry, "level") == "error" || GetString(entry, "level") == "exception") entries.Add(entry);
+                }
+                return entries.Count;
+            }
+            catch { return -1; }
         }
 
         static long NowMs()
@@ -1653,12 +3841,19 @@ namespace DSHBridge
             catch { }
         }
 
+        /// <summary>
+        /// 心跳：Library/DSHBridge/instance.json 是**对外公开的发现协议**（CLI 直接读文件即可定位实例），
+        /// 不是内部实现细节。因此这里的每个字段都承担契约：新增字段只增不改，语义变更走 discoveryVersion。
+        /// </summary>
         static void WriteHeartbeat()
         {
             try
             {
                 var info = new Dictionary<string, object>();
+                // 通道信封版本（请求/响应四元组配对用）。
                 info["v"] = 1L;
+                // 发现协议的版本：消费方据此判断能否解析本文件。
+                info["discoveryVersion"] = 1L;
                 info["instanceId"] = _instanceId;
                 info["bootId"] = _bootId;
                 info["nonce"] = _nonce;
@@ -1668,12 +3863,31 @@ namespace DSHBridge
                 info["unityVersion"] = Application.unityVersion;
                 info["engine"] = "unity";
                 info["probeVersion"] = ProbeVersion;
+                info["sourceHash"] = SourceHash;
                 info["startedAt"] = _startedAt;
                 info["lastSeenAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                // 自描述心跳节奏与陈旧阈值：消费方不需要猜「多久算失联」。
+                info["heartbeatIntervalMs"] = (long)(HeartbeatInterval * 1000);
+                // 3 倍心跳（6s）太紧：Unity 在窗口失去焦点时会大幅降低 EditorApplication.update
+                // 频率，实测切到后台数分钟后心跳就停，于是实例被判 idle/stale——但那只是节流，
+                // 不是探针失效。放宽到 7.5 倍（15s）让短暂切换不再误判；真死仍由 pid 判定兜底。
+                info["staleAfterMs"] = (long)(HeartbeatInterval * 1000 * 7.5);
                 info["scene"] = SceneManager.GetActiveScene().name;
                 info["isPlaying"] = EditorApplication.isPlaying;
                 info["eventSeq"] = _eventSeq;
+                // capabilities = 本实例**实际支持**的能力（不是插件期望清单）；消费方据此降级。
                 info["capabilities"] = _capabilities.Cast<object>().ToList();
+                // grantedCapabilities = 本次安装在源码快照里实际授予的反射执行面。
+                info["grantedCapabilities"] = _grantedCapabilities.Cast<object>().ToList();
+                // 协议级特性（不是能力）：消费方据此判断响应里能否读到 executionState 等字段。
+                info["protocolFeatures"] = new List<object> {
+                    "executionState",
+                    "duplicateId",
+                    "interruptedRecovery",
+                    "requestHash",
+                    "outboxSweep",
+                };
+                info["deniedCapabilities"] = _deniedCapabilities.Cast<object>().ToList();
                 Directory.CreateDirectory(_rootDir);
                 WriteAtomic(Path.Combine(_rootDir, "instance.json"), MiniJson.Serialize(info));
             }
@@ -1721,6 +3935,26 @@ namespace DSHBridge
                 if (s != null) outList.Add(s);
             }
             return outList;
+        }
+
+        /// <summary>取数组参数；缺失或类型不符时返回空列表（调用方按语义再判空）。</summary>
+        static List<object> AsObjectList(Dictionary<string, object> d, string key)
+        {
+            object value;
+            if (d == null || !d.TryGetValue(key, out value)) return new List<object>();
+            var list = value as List<object>;
+            return list ?? new List<object>();
+        }
+
+        static bool ToBoolOr(Dictionary<string, object> d, string key, bool fallback)
+        {
+            object value;
+            if (d == null || !d.TryGetValue(key, out value) || value == null) return fallback;
+            if (value is bool) return (bool)value;
+            var s = value as string;
+            if (s != null) return string.Equals(s, "true", StringComparison.OrdinalIgnoreCase) || s == "1";
+            try { return System.Convert.ToBoolean(value, CultureInfo.InvariantCulture); }
+            catch { return fallback; }
         }
 
         static long ToLong(Dictionary<string, object> d, string key, long fallback = 0)

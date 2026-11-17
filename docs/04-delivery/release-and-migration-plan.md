@@ -24,7 +24,8 @@ evidence: []
 
 1. 插件包升级：`plugin_manager install_bundle`（同一目录覆盖）。
 2. 探针升级：`bridge_install` 检测版本 → 内容 hash 不同 → 写入新文件 → 触发一次编译重载。
-3. 升级失败：保留旧探针文件（写新文件到临时名，成功后替换），失败即回滚。
+3. 升级失败：写入前先比对内容 hash（`changed`），内容相同不重写；写入失败会抛错并保留旧文件，
+   措辞上不承诺"原子替换"——实现是顺序 `writeFile`，不是临时名 + rename。
 
 ## 迁移
 
@@ -35,7 +36,7 @@ evidence: []
 | 场景 | 回滚动作 | 验证 |
 | --- | --- | --- |
 | 插件异常 | `plugin_manager remove_bundle` | 工具从会话消失 |
-| 探针异常 | 删除 `<project>/Assets/DSHBridge/` | 工程 `git status` 干净 |
+| 探针异常 | `bridge_uninstall`，或删除 `<project>/Packages/com.dsh.bridge/` | 工程 `git status` 干净 |
 | 协议不兼容 | 重装匹配版本的插件与探针 | `bridge_targets` 状态回到 `ready` |
 | 通道脏数据 | 删除 `$HOME/.dsh/bridge/` 与 `<project>/Library/DSHBridge/` | 重新发现成功 |
 

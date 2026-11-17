@@ -90,6 +90,18 @@
 - **THEN** 系统拒绝该调用并说明开启方式
 - **AND** 该拒绝被写入审计日志
 
+#### Scenario: 危险能力覆盖等价执行面
+
+- **WHEN** 系统计算危险能力清单
+- **THEN** 清单包含全部可改变宿主状态的执行面（反射、资产破坏性操作、导入设置、强制刷新）
+- **AND** 探针侧永久关闭的能力不进入可授权清单
+
+#### Scenario: 同工程多编辑器
+
+- **WHEN** 发现的进程 pid 与通道实际所有者 pid 不一致
+- **THEN** 系统标记 `pidMismatch` 并拒绝下发指令（`instance_ambiguous`）
+- **AND** `bridge_targets` 暴露 `channelOwnerPid`
+
 #### Scenario: 目录权限
 
 - **WHEN** 系统创建实例通道目录

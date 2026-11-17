@@ -33,6 +33,14 @@ export async function refreshInstance(bridge, instance) {
   await bridge.targets()
   const refreshed = bridge.instances.get(instance.instanceId)
   if (!refreshed) {
+    // 刷新后实例消失，但它可能仍是"歧义"的：保留调用方对双编辑器的明确诊断。
+    if (instance.pidMismatch) {
+      throw new PolicyError('instance_ambiguous', `实例 ${instance.instanceId} 的通道所有者与发现进程不一致，且刷新后已不可用`, {
+        instanceId: instance.instanceId,
+        pid: instance.pid,
+        channelOwnerPid: instance.channelOwnerPid,
+      })
+    }
     throw new PolicyError('instance_not_found', `实例 ${instance.instanceId} 已不在运行；请重新调用 bridge_targets`, {
       previousBootId: instance.bootId,
       currentBootId: current.bootId,

@@ -2,7 +2,7 @@
 id: PROFILE-0001
 type: project-profile
 status: approved
-version: 0.1.0
+version: 0.2.0
 created_at: 2026-11-16T13:56:42+08:00
 owner: lead
 related: [ARCH-REQ-0001, PLAN-0001]
@@ -28,7 +28,8 @@ evidence: [docs/first-principles/2026-11-16-134736-optimization-plan.md]
 | 生产服务、关键旅程、可用性承诺或数据丢失成本 | 不触发 | docs/06-operations/sre-and-incident-response.md | 无长运行服务、无 SLA、无持久数据 | lead | 2026-12-15 |
 | 灰度、Feature Flag、API/Event/数据迁移或不可逆发布 | 触发（探针升级与协议版本） | docs/04-delivery/release-and-migration-plan.md（RELPLAN-0001） | — | lead | 2026-12-15 |
 | 有构建、测试、CI 或发布命令 | 触发 | docs/00-governance/quality-command-adapter.md（QCMD-0001） | — | lead | 2026-12-15 |
-| 任一门禁豁免或临时架构债务 | 不触发 | docs/00-governance/architecture-exception-debt-register.md | 基线期不引入豁免 | lead | 2026-12-15 |
+| 任一门禁豁免或临时架构债务 | 触发（EXC-0001：单文件探针 2275 LOC） | docs/00-governance/architecture-exception-debt-register.md | — | lead | 2027-02-17 |
+| UI 交付面（页面、组件、自定义卡片或窗口） | 不触发 | docs/02-design/design-brief.md（UI-0001）、design-tokens.md（UI-0002） | 插件只贡献图标与 locale 文本，界面由 DSH 宿主渲染 | lead | 2027-02-17 |
 
 ## Profile 专项承诺
 

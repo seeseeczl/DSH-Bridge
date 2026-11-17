@@ -63,3 +63,17 @@ evidence: []
 | 2026-11-16T17:52:00+08:00 | REAL-ENV-005 | P376 重启加载 v6：场景对象/组件/材质/资产/Prefab 全链路实测通过，测试产物已清理 | lead |  | P376 |
 | 2026-11-16T18:00:00+08:00 | REL-0.0.1 | 首个公开版本发布：仓库 seeseeczl/DSH-Bridge + Release v0.0.1；插件版本统一为 0.0.1 | lead | 38c3123 | https://github.com/seeseeczl/DSH-Bridge/releases/tag/v0.0.1 |
 | 2026-11-16T18:05:00+08:00 | ENV-FIX-001 | 修复本机 plugin_manager 的 Invalid URL：profile 中 dsh-cursorx 的 scp 风格 git+ssh 地址改为标准 URL 形式 | lead |  | ~/.dsh/profiles/desktop/package.json |
+| 2026-11-17T09:40:00+08:00 | AUD-2026-1117 | 项目治理审计：14 项发现（S1=3/S2=6/S3=5），产物 docs/05-audits/2026-11-17-094120-* | lead |  | docs/05-audits/ |
+| 2026-11-17T10:10:00+08:00 | AUD-DOC-001 | 回滚手册与发布计划的探针路径改为 Packages/com.dsh.bridge，并纳入 check:docs | lead |  | docs/06-operations/rollback-runbook.md |
+| 2026-11-17T10:12:00+08:00 | AUD-REL-001 | 新增 REL-0001 发布记录，--check-release --strict 通过 | lead |  | docs/04-delivery/REL-0001.md |
+| 2026-11-17T10:20:00+08:00 | AUD-CR-001 | OpenSpec 变更归档为 2026-11-17-add-unity-bridge-adapter；新增 check-openspec-state 门禁 | lead |  | openspec/changes/archive/, scripts/check-openspec-state.mjs |
+| 2026-11-17T10:22:00+08:00 | AUD-DOC-002 | 清理 task-backlog 模板占位，check:docs 增加占位检查 | lead |  | docs/04-delivery/task-backlog.md |
+| 2026-11-17T10:25:00+08:00 | AUD-REQ-001 | 需求表新增 FR-0008 至 FR-0013（通用执行面/语义封装/知识库/预植入/唤醒/可观测），traceability 增 6 行 | lead |  | docs/01-architecture/project-architecture-and-requirements.md |
+| 2026-11-17T10:30:00+08:00 | AUD-BUILD-001 | 新增 CI 门禁 .github/workflows/verify.yml（macos+ubuntu，安装 mono 与 openspec） | lead |  | .github/workflows/verify.yml |
+| 2026-11-17T10:32:00+08:00 | AUD-SUPPLY-001 | 添加 MIT LICENSE，两个 package.json 补 license 字段 | lead |  | LICENSE |
+| 2026-11-17T10:35:00+08:00 | AUD-OPS-001 | doctor 新增 --since 与审计聚合（成功率/错误码/p50/p95）；SRE 文档补 SLI/SLO | lead |  | scripts/bridge-doctor.mjs |
+| 2026-11-17T10:38:00+08:00 | AUD-ARCH-001 | 登记 EXC-0001：单文件探针 2275 LOC 为已批准的架构例外 | lead |  | docs/00-governance/architecture-exception-debt-register.md |
+| 2026-11-17T10:40:00+08:00 | AUD-ARCH-002/AUD-DOC-003 | 设计目录改为无 UI 结论；toolchain 写明 CodeGraph 启用阈值；README 增加平台支持表 | lead |  | docs/02-design/, docs/00-governance/toolchain.md |
+| 2026-11-17T10:42:00+08:00 | AUD-DOC-004 | 任务卡 5 处失效路径改为真实文件；check:docs 增加任务卡路径存在性检查 | lead |  | docs/04-delivery/project-plan-task-charter.md |
+| 2026-11-17T10:45:00+08:00 | AUD-TEST-001 | 新增 tests/unity-probe/toolchain.mjs：csc/mono 缺失时显式失败，仅 SKIP_PROBE=1 可跳过 | lead |  | tests/unity-probe/toolchain.mjs |
+| 2026-11-17T10:50:00+08:00 | QA-0002 | 全量门禁通过：87 项测试、探针编译、文档一致性（24 回归+3 任务卡路径）、OpenSpec 状态、架构 strict、--check-release | lead |  | npm run verify |

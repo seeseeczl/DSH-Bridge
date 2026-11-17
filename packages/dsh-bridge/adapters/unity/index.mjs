@@ -5,6 +5,7 @@ import { PolicyError } from '../../safety/policy.mjs'
 import {
   bootPaths,
   ensureBootDirs,
+  isInProgress,
   purgeRequest,
   readEvents,
   readInstance,
@@ -17,7 +18,7 @@ import { withWake } from './wake.mjs'
 import { backlog, sweepEvents } from '../../transport/maintenance.mjs'
 import { installProbe, probePaths, uninstallProbe } from './installer.mjs'
 
-export const PROBE_VERSION = '6'
+export const PROBE_VERSION = '11'
 
 export const UNITY_CAPABILITIES = Object.freeze([
   'unity.editor.status',
@@ -66,6 +67,11 @@ export const UNITY_CAPABILITIES = Object.freeze([
   'unity.asset.move',
   'unity.asset.delete',
   'unity.asset.duplicate',
+  // 通用反射执行面（可授权）：批量事务与进程内代码执行。
+  // unity.code.execute 等价于 MCP 的 execute_code——ASE 的编辑脚本是含控制流的完整程序，
+  // 只有整段编译执行才能保持 Undo 组与 AssetDatabase 刷新时序一致。
+  'unity.api.batch',
+  'unity.code.execute',
 ])
 
 export function createUnityAdapter({ adapterId = 'unity' } = {}) {
@@ -177,6 +183,23 @@ export function createUnityAdapter({ adapterId = 'unity' } = {}) {
         return data
       } catch (error) {
         if (error?.code === 'timeout') {
+          // AA-OPT-004：先判断请求是否已经开始执行，再决定能否安全撤回。
+          const state = await isInProgress(instance.projectPath, identity.bootId, id).catch(() => ({ inProgress: false }))
+          // 探针版本漂移时旧探针不会写 in-progress（"取走即 done"），因此 in_flight 只在
+          // 报告了 in-progress 时给出；无法判定时保留 timeout 语义，并明确提示"可能已执行"。
+          if (state.inProgress) {
+            throw Object.assign(
+              new Error('请求可能已在目标软件中执行（超时发生在执行期），不要直接重试；请先 bridge_events 或确认目标状态'),
+              {
+                code: 'in_flight',
+                requestId: id,
+                capability,
+                since: state.since,
+                retryable: false,
+                hint: '目标软件已取走该请求并开始执行；请先用 bridge_events 或 unity.editor.status 确认实际状态，再决定是否重试',
+              },
+            )
+          }
           await purgeRequest(instance.projectPath, identity.bootId, id)
         }
         throw error

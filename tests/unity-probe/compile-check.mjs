@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { renderProbe } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
+import { assertProbeToolchain, CSC_COMMAND } from './toolchain.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -21,13 +22,15 @@ function run(command, args) {
 }
 
 export async function checkProbeCompiles() {
+  // 审计 P2.6：工具链缺失时显式失败，不允许"编译没跑但门禁是绿的"。
+  await assertProbeToolchain({ requireMono: false })
   const dir = await mkdtemp(join(tmpdir(), 'dsh-bridge-csc-'))
   const probePath = join(dir, 'DSHBridgeProbe.cs')
   const stubsPath = join(dir, 'unity-stubs.cs')
   const outPath = join(dir, 'probe.dll')
   await writeFile(probePath, renderProbe({ probeVersion: '1' }), 'utf8')
   await writeFile(stubsPath, await readFile(join(here, 'unity-stubs.cs'), 'utf8'), 'utf8')
-  const result = await run('csc', [
+  const result = await run(CSC_COMMAND, [
     '-nologo', '-define:UNITY_EDITOR', '-target:library', '-warn:0',
     `-out:${outPath}`, stubsPath, probePath,
   ])

@@ -1,17 +1,70 @@
 {
   "version": 1,
-  "source_roots": ["src", "app", "lib", "packages"],
-  "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".go", ".java", ".rb", ".cs", ".php", ".vue", ".svelte"],
-  "ignore_dirs": [".git", "node_modules", "vendor", "dist", "build", "coverage", ".next", ".turbo", ".codegraph"],
+  "source_roots": [
+    "src",
+    "app",
+    "lib",
+    "packages"
+  ],
+  "extensions": [
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".go",
+    ".java",
+    ".rb",
+    ".cs",
+    ".php",
+    ".vue",
+    ".svelte"
+  ],
+  "ignore_dirs": [
+    ".git",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "coverage",
+    ".next",
+    ".turbo",
+    ".codegraph"
+  ],
   "thresholds": {
-    "ui": { "warning": 180, "limit": 300 },
-    "service": { "warning": 200, "limit": 300 },
-    "source": { "warning": 250, "limit": 400 },
-    "test": { "warning": 400, "limit": 600 },
-    "config": { "warning": 160, "limit": 200 }
+    "ui": {
+      "warning": 180,
+      "limit": 300
+    },
+    "service": {
+      "warning": 200,
+      "limit": 300
+    },
+    "source": {
+      "warning": 250,
+      "limit": 400
+    },
+    "test": {
+      "warning": 400,
+      "limit": 600
+    },
+    "config": {
+      "warning": 160,
+      "limit": 200
+    }
   },
   "audit": {
     "output_dir": "docs/05-audits",
     "reuse_legacy_history": true
+  },
+  "fitness": {
+    "known_loc_exceptions": {
+      "note": "\u5df2\u6279\u51c6\u7684 LOC \u4f8b\u5916\uff0c\u5b9e\u4f53\u5728 docs/00-governance/architecture-exception-debt-register.md\uff1b\u6b64\u5904\u4ec5\u767b\u8bb0\u8def\u5f84\uff0c\u907f\u514d\u7b2c\u4e8c\u5957\u9608\u503c\u3002",
+      "paths": [
+        "packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl"
+      ]
+    }
   }
 }

@@ -16,18 +16,22 @@ async function listJson(dir) {
  * 事件回收：保留最近 keep 条，并删除超过 maxAgeMs 的文件。
  * 多会话共享事件目录，因此只做「保底窗口」而不是读到就删。
  */
-export async function sweepEvents(projectPath, bootId, { keep = 500, maxAgeMs = 7 * 24 * 3600 * 1000 } = {}) {
+export async function sweepEvents(projectPath, bootId, { keep = 5000, maxAgeMs = 7 * 24 * 3600 * 1000 } = {}) {
   const paths = bootPaths(projectPath, bootId)
   const names = await listJson(paths.events)
   const numbered = names
     .map((name) => ({ name, seq: Number(name.replace(/^evt_/, '').replace(/\.json$/, '')) }))
     .filter((entry) => Number.isFinite(entry.seq))
     .sort((a, b) => a.seq - b.seq)
+  // AA-OPT-015：不再按「保留最近 keep 条」裁剪——多会话共享事件目录时，
+  // 先 sweep 的一方会删掉另一方还没读到的最新事件。这里只在总量超过硬上限或超龄时才删。
   const cutoffSeq = numbered.length > keep ? numbered[numbered.length - keep].seq : 0
   const now = Date.now()
   let removed = 0
   for (const entry of numbered) {
     let expired = false
+    // 只有「超龄」才无条件删除；「超量」仅在 keep 被显式收紧时生效（保留硬上限兜底）。
+    // 语义：保留最近 keep 条（seq 严格小于 cutoff 的才删）。
     if (cutoffSeq > 0 && entry.seq < cutoffSeq) expired = true
     if (!expired && maxAgeMs > 0) {
       try {

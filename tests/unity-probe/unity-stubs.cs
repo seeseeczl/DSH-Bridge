@@ -185,6 +185,11 @@ namespace UnityEditor
         public static void RegisterCreatedObjectUndo(UnityEngine.Object target, string name) { }
         public static void DestroyObjectImmediate(UnityEngine.Object target) { }
         public static void RecordObject(UnityEngine.Object target, string name) { }
+        public static void IncrementCurrentGroup() { }
+        public static int GetCurrentGroup() => 0;
+        public static void SetCurrentGroupName(string name) { }
+        public static void RevertAllDownToGroup(int group) { }
+        public static void CollapseUndoOperations(int group) { }
     }
 
     public static class EditorUtility
@@ -217,6 +222,8 @@ namespace UnityEditor
         public static bool isUpdating => false;
         public static event Action<PlayModeStateChange> playModeStateChanged;
         public static bool ExecuteMenuItem(string menuItemPath) => true;
+        public static string applicationContentsPath =>
+            Environment.GetEnvironmentVariable("DSH_BRIDGE_ENGINE_CONTENTS") ?? string.Empty;
         public static void RaiseUpdate() => update?.Invoke();
         public static void RaisePlayMode(PlayModeStateChange change) => playModeStateChanged?.Invoke(change);
     }
@@ -259,9 +266,32 @@ namespace UnityEditor.SceneManagement
 
 namespace UnityEditor.Compilation
 {
+    /// <summary>
+    /// 真实工程里 UnityEditor.Compilation.Assembly 与 System.Reflection.Assembly 同名。
+    /// 少了这个类型，离线编译就发现不了「裸 Assembly 歧义」——那正是探针在真机上编不过的原因。
+    /// </summary>
+    public class Assembly
+    {
+        public string name;
+        public string outputPath;
+        public string[] compiledAssemblyReferences;
+    }
+
     public static class CompilationPipeline
     {
         public static event Action<object> compilationFinished;
         public static void RaiseFinished(object result) => compilationFinished?.Invoke(result);
+        public static Assembly[] GetAssemblies() => new Assembly[0];
+        public static Assembly[] GetAssemblies(AssembliesType type) => new Assembly[0];
+    }
+
+    [Flags]
+    public enum AssembliesType
+    {
+        None = 0,
+        Editor = 1,
+        EditorAssembly = 2,
+        Player = 4,
+        PlayerAssembly = 8,
     }
 }

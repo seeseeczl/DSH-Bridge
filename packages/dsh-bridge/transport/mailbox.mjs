@@ -23,6 +23,7 @@ export function bootPaths(projectPath, bootId) {
     outbox: join(base, 'outbox'),
     events: join(base, 'events'),
     done: join(base, 'done'),
+    inProgress: join(base, 'in-progress'),
   }
 }
 
@@ -33,7 +34,7 @@ async function ensureDir(dir, { mode = 0o700 } = {}) {
 /** 目录 0700、文件 0600：同机其他用户不可读写。 */
 export async function ensureBootDirs(projectPath, bootId) {
   const paths = bootPaths(projectPath, bootId)
-  for (const dir of [paths.base, paths.inbox, paths.outbox, paths.events, paths.done]) await ensureDir(dir)
+  for (const dir of [paths.base, paths.inbox, paths.outbox, paths.events, paths.done, paths.inProgress]) await ensureDir(dir)
   return paths
 }
 
@@ -120,6 +121,24 @@ export async function takeResponse(identity, requestId, { consume = true } = {})
   return response
 }
 
+/**
+ * 请求是否正在探针侧执行（AA-OPT-004）。
+ *
+ * 探针收到请求后会先把它搬到 in-progress/ 再执行，因此「超时」有两种完全不同的语义：
+ *   - 还在 inbox：探针没开始处理 → 撤回是安全且无损的；
+ *   - 在 in-progress：可能已经产生副作用 → 必须告诉调用方「可能已生效，不要重试」。
+ * 把它们混成同一个 timeout，正是让 Agent 重复执行破坏性操作的根因。
+ */
+export async function isInProgress(projectPath, bootId, requestId) {
+  const paths = bootPaths(projectPath, bootId)
+  try {
+    const info = await stat(join(paths.inProgress, `${requestId}.json`))
+    return { inProgress: true, since: info.mtimeMs }
+  } catch {
+    return { inProgress: false, since: null }
+  }
+}
+
 /** 撤回未被消费的请求（超时后调用），避免探针恢复后执行过期指令。 */
 export async function purgeRequest(projectPath, bootId, requestId) {
   const paths = bootPaths(projectPath, bootId)
@@ -201,14 +220,21 @@ export function isProcessAlive(pid) {
  * 实例状态：进程存活 + 心跳新鲜 = ready；
  * 进程存活但心跳陈旧 = idle（后台，需要唤醒而非报错）；
  * 进程消失 = stale。
+ *
+ * `staleMs` 未显式给出时使用 instance.json 自述的 `staleAfterMs`（发现协议的一部分），
+ * 这样不依赖 DSH 运行时的消费方（CLI）也能按探针声明的节奏判断，而不必硬编码阈值。
  */
-export async function probeHeartbeat(projectPath, { staleMs = 15000 } = {}) {
+export async function probeHeartbeat(projectPath, { staleMs } = {}) {
   const instance = await readInstance(projectPath)
   if (!instance) return { status: 'unprobed', instance: null, age: null, pidAlive: false }
+  const declared = Number(instance.staleAfterMs)
+  const effectiveStaleMs = Number.isFinite(staleMs)
+    ? staleMs
+    : (Number.isFinite(declared) && declared > 0 ? declared : 15000)
   const seen = instance.lastSeenAt ? Date.parse(instance.lastSeenAt) : 0
   const age = Number.isFinite(seen) ? Date.now() - seen : Number.POSITIVE_INFINITY
   const pidAlive = isProcessAlive(Number(instance.pid))
-  if (!pidAlive) return { status: 'stale', instance, age, pidAlive }
-  if (age > staleMs) return { status: 'idle', instance, age, pidAlive }
-  return { status: 'ready', instance, age, pidAlive }
+  if (!pidAlive) return { status: 'stale', instance, age, pidAlive, staleMs: effectiveStaleMs }
+  if (age > effectiveStaleMs) return { status: 'idle', instance, age, pidAlive, staleMs: effectiveStaleMs }
+  return { status: 'ready', instance, age, pidAlive, staleMs: effectiveStaleMs }
 }

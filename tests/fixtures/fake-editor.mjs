@@ -25,11 +25,16 @@ export class FakeEditor {
     onCall,
     pollMs = 20,
     heartbeatMs = 500,
+    // 模拟真实探针的「先搬进 in-progress 再执行」：延迟毫秒数 > 0 时启用。
+    executionDelayMs = 0,
   }) {
     this.projectPath = projectPath
     this.capabilities = capabilities
     this.probeVersion = probeVersion
+    // pid 用于 detect 结果与存活判定；reportedPid 用于 instance.json（默认与 pid 相同）。
+    // 双编辑器测试需要让 instance.json 指向"另一个进程"，因此允许单独覆盖。
     this.pid = pid
+    this.reportedPid = pid
     this.unityVersion = unityVersion
     this.onCall = onCall ?? (async () => ({ ok: true }))
     this.pollMs = pollMs
@@ -43,10 +48,21 @@ export class FakeEditor {
       outbox: join(this.root, this.bootId, 'outbox'),
       events: join(this.root, this.bootId, 'events'),
       done: join(this.root, this.bootId, 'done'),
+      inProgress: join(this.root, this.bootId, 'in-progress'),
     }
+    this.executionDelayMs = executionDelayMs
     this.timers = []
     this.received = []
     this.stopped = false
+  }
+
+  /**
+   * 让 instance.json 报告另一个 pid，用于模拟"通道被另一个编辑器接管"。
+   * 需要该 pid 也"活着"，否则会先被判成 stale（那是另一个正确行为，见 instance_not_found 用例）。
+   */
+  setReportedPid(pid) {
+    this.reportedPid = pid
+    return this
   }
 
   async start() {
@@ -72,7 +88,7 @@ export class FakeEditor {
       instanceId: `unity:${this.projectPath.length}`,
       bootId: this.bootId,
       nonce: this.nonce,
-      pid: this.pid,
+      pid: this.reportedPid,
       projectPath: this.projectPath,
       unityVersion: this.unityVersion,
       engine: 'unity',
@@ -111,7 +127,8 @@ export class FakeEditor {
         continue
       }
       try {
-        await rename(source, join(this.dirs.done, name))
+        // 与探针一致：先搬到 in-progress（表示"已被取走、可能已执行"）。
+        await rename(source, join(this.dirs.inProgress, name))
       } catch {
         continue
       }
@@ -143,7 +160,11 @@ export class FakeEditor {
           response.error = { code: error.code ?? 'probe_error', message: error.message }
         }
       }
+      if (this.executionDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.executionDelayMs))
+      }
       await writeAtomic(join(this.dirs.outbox, `${request.id}.json`), JSON.stringify(response))
+      await rename(join(this.dirs.inProgress, name), join(this.dirs.done, name)).catch(() => {})
     }
   }
 

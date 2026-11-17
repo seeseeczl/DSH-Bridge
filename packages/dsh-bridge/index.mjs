@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { blenderAdapter } from './adapters/blender/index.mjs'
 import { unityAdapter } from './adapters/unity/index.mjs'
 import { Bridge } from './core/bridge.mjs'
+import { DEFAULT_DANGEROUS } from './safety/policy.mjs'
 import { createBridgeTools } from './tools/index.mjs'
 
 export const name = 'dsh-bridge'
@@ -18,10 +19,22 @@ export function resolveConfig(config = {}) {
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean)
+  // 追加「需显式授权」的能力名：把默认开启的高权能力（如 unity.code.execute）收紧回来。
+  const extraDangerous = config.dangerous
+    ?? (env.DSH_BRIDGE_DANGEROUS ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+  // 配置化硬拒绝：列进去的能力即使写进 allowDangerous 也不可用。
+  const denied = config.denied
+    ?? (env.DSH_BRIDGE_DENIED ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
   const preinstallRoots = config.preinstallRoots ?? []
   // 默认关闭：自动往多个工程写文件是重操作，必须显式开启。
   const preinstallAuto = config.preinstallAuto === true
-  return { auditPath, allowDangerous, preinstallRoots, preinstallAuto }
+  return { auditPath, allowDangerous, extraDangerous, denied, preinstallRoots, preinstallAuto }
 }
 
 export async function apply(ctx, config = {}) {
@@ -30,6 +43,10 @@ export async function apply(ctx, config = {}) {
     adapters: [unityAdapter, blenderAdapter],
     auditPath: resolved.auditPath,
     allowDangerous: resolved.allowDangerous,
+    dangerous: resolved.extraDangerous.length > 0
+      ? [...DEFAULT_DANGEROUS, ...resolved.extraDangerous]
+      : undefined,
+    denied: resolved.denied,
   })
 
   const tools = await createBridgeTools({ bridge })

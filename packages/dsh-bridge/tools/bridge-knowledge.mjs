@@ -2,7 +2,7 @@
 import { listTopics, readTopic, removeTopic, saveTopic } from '../core/knowledge.mjs'
 import { INSTANCE_ID } from './schema.mjs'
 
-export function createKnowledgeTools(tool) {
+export function createKnowledgeTools(tool, bridge) {
   const save = tool({
     name: 'bridge_knowledge_save',
     description:
@@ -37,12 +37,16 @@ export function createKnowledgeTools(tool) {
         text: `已保存主题「${value.topic}」→ ${value.path}（${value.bytes} 字节）`,
       }],
     },
-    execute: async (args) => saveTopic(args.instance_id, {
-      topic: args.topic,
-      content: args.content,
-      summary: args.summary,
-      sources: args.sources ?? [],
-    }),
+    execute: async (args) => {
+      const saved = await saveTopic(args.instance_id, {
+        topic: args.topic,
+        content: args.content,
+        summary: args.summary,
+        sources: args.sources ?? [],
+      })
+      await bridge?.observe?.('knowledge_save', { instanceId: args.instance_id, slug: saved.slug, bytes: saved.bytes }).catch(() => {})
+      return saved
+    },
   })
 
   const list = tool({
@@ -64,7 +68,11 @@ export function createKnowledgeTools(tool) {
           : value.topics.map((item) => `- ${item.topic}${item.summary ? `：${item.summary}` : ''} (${item.slug})`).join('\n'),
       }],
     },
-    execute: async (args) => listTopics(args.instance_id),
+    execute: async (args) => {
+      const result = await listTopics(args.instance_id)
+      await bridge?.observe?.('knowledge_list', { instanceId: args.instance_id, count: result.topics?.length ?? 0 }).catch(() => {})
+      return result
+    },
   })
 
   const read = tool({
@@ -87,6 +95,7 @@ export function createKnowledgeTools(tool) {
     },
     execute: async (args) => {
       const found = await readTopic(args.instance_id, args.topic)
+      await bridge?.observe?.('knowledge_read', { instanceId: args.instance_id, topic: args.topic, found: Boolean(found) }).catch(() => {})
       if (!found) {
         throw Object.assign(new Error(`找不到主题：${args.topic}`), { code: 'topic_not_found' })
       }
@@ -109,7 +118,11 @@ export function createKnowledgeTools(tool) {
       },
       render: (_args, value) => [{ type: 'text', text: value.removed ? '已删除。' : '未找到该主题。' }],
     },
-    execute: async (args) => ({ removed: await removeTopic(args.instance_id, args.topic) }),
+    execute: async (args) => {
+      const removed = await removeTopic(args.instance_id, args.topic)
+      await bridge?.observe?.('knowledge_delete', { instanceId: args.instance_id, topic: args.topic, removed }).catch(() => {})
+      return { removed }
+    },
   })
 
   return [save, list, read, remove]

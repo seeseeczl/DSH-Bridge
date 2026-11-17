@@ -167,7 +167,8 @@ test('对端沉默时在 deadline 内失败，不悬挂', async () => {
     const started = Date.now()
     await assert.rejects(
       () => bridge.call(id, 'unity.editor.status', {}, { timeoutMs: 300 }),
-      (error) => error.code === 'timeout',
+      // AA-OPT-004：对端取走请求后超时，语义是「可能已执行」，不能报成普通 timeout。
+      (error) => ['timeout', 'in_flight'].includes(error.code),
     )
     assert.ok(Date.now() - started < 2000, '超时应在 deadline 附近返回')
   } finally {

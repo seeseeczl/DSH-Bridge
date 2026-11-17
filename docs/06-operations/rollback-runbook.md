@@ -23,9 +23,11 @@ evidence: []
 Unity：
 
 1. 关闭或保持在编辑器打开状态均可。
-2. 删除 `<工程>/Assets/DSHBridge/` 整个目录。
-3. 若曾把探针加入版本库，`git rm -r --cached Assets/DSHBridge` 后提交。
-4. 编辑器会编译一次并重载，此后不再有任何 DSH 行为。
+2. 删除 `<工程>/Packages/com.dsh.bridge/` 整个目录（embedded package，探针在 `Editor/DSHBridgeProbe.cs`）。
+3. 编辑器会编译一次并重载，此后不再有任何 DSH 行为。
+4. 探针只通过 `.git/info/exclude` 本地忽略，不在版本库中，无需 `git rm`。若历史上曾被提交，执行 `git rm -r --cached Packages/com.dsh.bridge` 后提交。
+
+> 旧版探针曾位于 `<工程>/Assets/DSHBridge/`；该位置仅由安装器的 `migrateLegacy` 在安装/卸载时自动清理，回滚时无需手动处理。
 
 也可以用工具完成：`bridge_uninstall` + `instance_id`。
 
@@ -43,8 +45,9 @@ Unity：
 ## 5. 验证回滚完成
 
 ```bash
-# 工程内不应再有探针
-ls <工程>/Assets/DSHBridge 2>/dev/null || echo clean
+# 工程内不应再有探针（末行仅为历史位置清理校验）
+ls <工程>/Packages/com.dsh.bridge 2>/dev/null || echo clean
+ls <工程>/Assets/DSHBridge 2>/dev/null || echo clean   # 历史位置，仅迁移前需要
 
 # 不应有桥目录
 ls <工程>/Library/DSHBridge 2>/dev/null || echo clean

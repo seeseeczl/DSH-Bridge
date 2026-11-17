@@ -103,6 +103,16 @@ test('事件回收保留最近窗口', async () => {
   assert.equal((await readdir(events)).length, 5)
 })
 
+test('AA-EVENT-002 默认窗口足够大，不会在读取间隙删掉最新事件', async () => {
+  const dir = await project()
+  for (let i = 1; i <= 60; i += 1) await writeEvent(dir, 'b1', { seq: i, kind: 'k' })
+  // 默认 keep=5000 / maxAgeMs=7d：一次风暴式写入后不应删除任何事件。
+  const removed = await sweepEvents(dir, 'b1')
+  assert.equal(removed, 0)
+  const { events } = bootPaths(dir, 'b1')
+  assert.equal((await readdir(events)).length, 60)
+})
+
 test('通道积压统计', async () => {
   const dir = await project()
   await writeRequest(dir, 'b1', { id: 'r1' })

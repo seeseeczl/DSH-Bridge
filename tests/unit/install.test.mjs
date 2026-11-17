@@ -124,3 +124,12 @@ test('探针路径固定在 Packages 包内', () => {
   assert.match(paths.file, /Packages\/com\.dsh\.bridge\/Editor\/DSHBridgeProbe\.cs$/)
   assert.match(paths.manifest, /Packages\/com\.dsh\.bridge\/package\.json$/)
 })
+
+// AA-DOC-002 / 实测回归：探针已迁到 Packages/com.dsh.bridge，isInstalled 不得再只看旧位置。
+test('isInstalled 识别 package 形态的探针', async () => {
+  const dir = await project('pkg-present')
+  const adapter = createUnityAdapter()
+  assert.equal(await adapter.isInstalled(dir), false, '空工程应视为未安装')
+  await adapter.install(inst(dir), { autoActivate: false, waitForReady: false })
+  assert.equal(await adapter.isInstalled(dir), true, '安装后必须识别为已安装')
+})

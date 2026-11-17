@@ -1,0 +1,122 @@
+✖ AA-SEC-002 探针拒绝读取工程之外的文本文件 (4604.279666ms)
+✖ AA-SEC-003 探针拒绝把资产写到工程之外 (0.559875ms)
+✖ AA-SEC-001 反射执行面必须受危险能力/成员策略约束 (0.1415ms)
+✖ AA-CODE-001 空选择/空参数返回已知错误码而不是 NullReferenceException (0.106125ms)
+✖ AA-LIMIT-001 全库扫描必须带预算且回传截断标记 (0.252458ms)
+✖ AA-OPT-002 asset.read 对工程内相对路径保持可用 (0.101166ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 0
+ℹ fail 6
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4700.93525
+
+✖ failing tests:
+
+test at tests/unity-probe/capability-semantics.test.mjs:34:1
+✖ AA-SEC-002 探针拒绝读取工程之外的文本文件 (4604.279666ms)
+  AssertionError [ERR_ASSERTION]: asset.read 必须拒绝绝对路径，实际返回：{"assetPath":"/etc/passwd","totalLines":142,"offset":0,"text":"##\n# User Database\n# \n# Note that this file is consult
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:36:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/unity-probe/capability-semantics.test.mjs:48:1
+✖ AA-SEC-003 探针拒绝把资产写到工程之外 (0.559875ms)
+  AssertionError [ERR_ASSERTION]: asset.create 必须拒绝绝对路径，实际返回：{"created":true,"assetPath":"/tmp/dsh-bridge-absolute.txt","kind":"text"}
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:50:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/unity-probe/capability-semantics.test.mjs:64:1
+✖ AA-SEC-001 反射执行面必须受危险能力/成员策略约束 (0.1415ms)
+  AssertionError [ERR_ASSERTION]: unity.menu.execute 属于危险执行面，探针应可被策略阻断
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:66:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/unity-probe/capability-semantics.test.mjs:79:1
+✖ AA-CODE-001 空选择/空参数返回已知错误码而不是 NullReferenceException (0.106125ms)
+  AssertionError [ERR_ASSERTION]: api.members 在无目标时必须报 invalid_argument
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:81:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/unity-probe/capability-semantics.test.mjs:93:1
+✖ AA-LIMIT-001 全库扫描必须带预算且回传截断标记 (0.252458ms)
+  AssertionError [ERR_ASSERTION]: search.content 必须暴露时间预算
+  + actual - expected
+  
+  + 'undefined'
+  - 'number'
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:96:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'undefined',
+    expected: 'number',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests/unity-probe/capability-semantics.test.mjs:104:1
+✖ AA-OPT-002 asset.read 对工程内相对路径保持可用 (0.101166ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'KnownError'
+  - 'invalid_argument'
+  
+      at TestContext.<anonymous> (file:///Users/long/GitHub/DSH-Bridge/tests/unity-probe/capability-semantics.test.mjs:106:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'KnownError',
+    expected: 'invalid_argument',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

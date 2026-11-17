@@ -70,19 +70,39 @@ async function migrateLegacy(projectPath) {
 }
 
 /** 等探针心跳出现；编译与域重载由引擎完成，这里只观察结果。 */
-async function waitForProbe(projectPath, { expectedVersion, timeoutMs = 90000, pollMs = 1000 } = {}) {
+async function waitForProbe(projectPath, {
+  expectedVersion,
+  expectedSourceHash,
+  timeoutMs = 90000,
+  pollMs = 1000,
+} = {}) {
   const deadline = Date.now() + timeoutMs
+  let lastSeen = null
   for (;;) {
     const instance = await readInstance(projectPath).catch(() => null)
     if (instance?.probeVersion && instance.lastSeenAt) {
       const age = Date.now() - Date.parse(instance.lastSeenAt)
       const versionOk = !expectedVersion || instance.probeVersion === expectedVersion
-      if (Number.isFinite(age) && age < 10000 && versionOk) {
-        return { ready: true, probeVersion: instance.probeVersion, bootId: instance.bootId }
+      // 版本号相同不代表源码相同：必须比对源码哈希，否则「重装后仍是旧程序集」会被误判为就绪。
+      const hashOk = !expectedSourceHash || instance.sourceHash === expectedSourceHash
+      lastSeen = {
+        probeVersion: instance.probeVersion,
+        sourceHash: instance.sourceHash ?? null,
+        bootId: instance.bootId,
+        heartbeatAgeMs: Number.isFinite(age) ? age : null,
+      }
+      if (Number.isFinite(age) && age < 10000 && versionOk && hashOk) {
+        return { ready: true, ...lastSeen }
       }
     }
     if (Date.now() > deadline) {
-      return { ready: false, reason: 'probe_timeout', hint: '引擎可能未刷新资产或编译失败；可尝试手动聚焦编辑器后重试' }
+      return {
+        ready: false,
+        reason: 'probe_timeout',
+        hint: '引擎可能未刷新资产或编译失败；可尝试手动聚焦编辑器后重试',
+        observed: lastSeen,
+        expected: { probeVersion: expectedVersion ?? null, sourceHash: expectedSourceHash ?? null },
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs))
   }
@@ -94,6 +114,8 @@ export async function installProbe(instance, probeVersion, {
   autoActivate = true,
   waitForReady = true,
   readyTimeoutMs = 90000,
+  allowDangerous = [],
+  denied = [],
 } = {}) {
   const dir = packageDir(instance.projectPath)
   const pkg = manifestFile(instance.projectPath)
@@ -101,7 +123,12 @@ export async function installProbe(instance, probeVersion, {
   await assertNotSymlink(dir)
   await assertNotSymlink(file)
 
-  const probeContent = renderProbe({ probeVersion })
+  // 授权快照渲染进源码：反射执行面能否使用，取决于这一次安装时的配置。
+  const granted = Array.from(new Set(allowDangerous.filter((item) => typeof item === 'string' && item))).sort()
+  const deniedCapabilities = Array.from(new Set(denied.filter((item) => typeof item === 'string' && item))).sort()
+  const probeContent = renderProbe({ probeVersion, allowDangerous: granted, denied: deniedCapabilities })
+  // 从渲染结果里回读哈希：DSH 侧必须用「写进去的那份」去比对心跳，而不是自己再算一次。
+  const sourceHash = /SourceHash = "([0-9a-f]+)"/.exec(probeContent)?.[1] ?? null
   const pkgContent = packageManifest(probeVersion)
   const existingProbe = await readIfExists(file)
   const existingPkg = await readIfExists(pkg)
@@ -131,6 +158,9 @@ export async function installProbe(instance, probeVersion, {
       dryRun: true,
       instanceId: instance.instanceId,
       probeVersion,
+      sourceHash,
+      grantedCapabilities: granted,
+      deniedCapabilities,
       files,
       reloadExpected: changed,
       location: 'packages/embedded',
@@ -154,7 +184,11 @@ export async function installProbe(instance, probeVersion, {
   }
 
   const ready = changed && waitForReady
-    ? await waitForProbe(instance.projectPath, { expectedVersion: probeVersion, timeoutMs: readyTimeoutMs })
+    ? await waitForProbe(instance.projectPath, {
+      expectedVersion: probeVersion,
+      expectedSourceHash: sourceHash,
+      timeoutMs: readyTimeoutMs,
+    })
     : null
 
   return {
@@ -163,6 +197,9 @@ export async function installProbe(instance, probeVersion, {
     files,
     reloadExpected: changed,
     probeVersion,
+    sourceHash,
+    grantedCapabilities: granted,
+    deniedCapabilities,
     location: 'packages/embedded',
     legacy,
     exclude,

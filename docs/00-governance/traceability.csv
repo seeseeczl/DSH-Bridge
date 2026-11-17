@@ -1,10 +1,23 @@
 source_id,source_type,status,architecture_or_design,module_or_contract,task_or_commit,regression_id,last_verification,release_id,owner,notes
 PRJ-0001,project-charter,approved,ARCH-REQ-0001,MOD-0005,TASK-0001..0014,,2026-11-16,,lead,治理基线
-CR-ADD-UNITY-ADAPTER,change-request,approved,ADR-0001,MOD-0003,TASK-0005,REG-INSTALL-001,2026-11-16,,lead,openspec/changes/add-unity-bridge-adapter
-FR-0001,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0004,REG-DISCOVERY-001,2026-11-16,,lead,实例发现
+CR-ADD-UNITY-ADAPTER,change-request,approved,ADR-0001,MOD-0003,TASK-0005,REG-INSTALL-001,2026-11-16,REL-0001,lead,openspec/changes/add-unity-bridge-adapter
+FR-0001,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0004,REG-DISCOVERY-001,2026-11-16,REL-0001,lead,实例发现
 FR-0002,functional,approved,ADR-0001,MOD-0002,TASK-0002,REG-TRANSPORT-001,2026-11-16,,lead,零端口通道（含 NFR-0001 零监听端口）
-FR-0003,functional,approved,ADR-0002,MOD-0003,TASK-0005/TASK-0006,REG-INSTALL-001,2026-11-16,,lead,探针安装与卸载（含 NFR-0005 可卸载）
+FR-0003,functional,approved,ADR-0002,MOD-0003,TASK-0005/TASK-0006,REG-INSTALL-001,2026-11-16,REL-0001,lead,探针安装与卸载（含 NFR-0005 可卸载）
 FR-0004,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0007,REG-CAPABILITY-001,2026-11-16,,lead,能力调用
 FR-0005,functional,approved,ARCH-REQ-0001,MOD-0001,TASK-0003,REG-ISOLATION-001,2026-11-16,,lead,多实例隔离（含 NFR-0003 超时恢复）
 FR-0006,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0010,REG-EVENTS-001,2026-11-16,,lead,事件游标
-FR-0007,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0013,REG-EXTEND-001,2026-11-16,,lead,适配器可扩展
+FR-0007,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0013,REG-EXTEND-001,2026-11-16,REL-0001,lead,适配器可扩展
+BUG-194223-P0,defect,implemented,ARCH-REQ-0001,MOD-0001/MOD-0003,TASK-0015,REG-SEC-002/REG-SEC-003/REG-LIMIT-001,2026-11-16,,lead,第二轮审计 P0：授权模型+路径边界+执行期超时
+BUG-194223-P0,defect,implemented,ARCH-REQ-0001,MOD-0001/MOD-0003,TASK-0016,REG-SEC-001,2026-11-16,,lead,第二轮审计 P0：授权模型+路径边界+执行期超时
+BUG-194223-P0,defect,implemented,ARCH-REQ-0001,MOD-0001/MOD-0003,TASK-0017,REG-SEC-002,2026-11-16,,lead,第二轮审计 P0：授权模型+路径边界+执行期超时
+BUG-194223-P0,defect,implemented,ARCH-REQ-0001,MOD-0001/MOD-0003,TASK-0018,REG-INFLIGHT-001,2026-11-16,,lead,第二轮审计 P0：授权模型+路径边界+执行期超时
+BUG-194223-P1,defect,implemented,ARCH-REQ-0001,MOD-0003,TASK-0019,REG-AMBIGUOUS-001/REG-SEC-003,2026-11-16,,lead,第二轮审计 P1：实例歧义/NRE/假覆盖
+BUG-194223-P2,defect,implemented,ARCH-REQ-0001,MOD-0001,TASK-0021,REG-DOC-001/REG-LIMIT-001,2026-11-16,,lead,第二轮审计 P2：披露、文档对齐、通道回收、预算、编译事件
+BUG-194223-P3,defect,accepted,ARCH-REQ-0001,MOD-0001,TASK-0023,REG-KNOWLEDGE-001/REG-EVENTS-001,2026-11-16,,lead,第二轮审计 P3：事件清扫/类型缓存/知识库路径（AA-PERF-001 与 AA-CODE-003 已在计划 §6 接受风险）
+FR-0008,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0025,REG-SEC-002/REG-SEC-003/REG-LIMIT-001,2026-11-17,,lead,通用执行面（对象/反射/检索/资产/导入/场景/选择）
+FR-0009,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0025,REG-SEC-003,2026-11-17,,lead,语义封装（GameObject/Component/Prefab/Material/资产）
+FR-0010,functional,approved,ARCH-REQ-0001,MOD-0001,TASK-0026,REG-KNOWLEDGE-001,2026-11-17,,lead,主题知识库
+FR-0011,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0026,REG-INSTALL-001,2026-11-17,,lead,工程扫描与预植入
+FR-0012,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0027,REG-RECOVERY-001,2026-11-17,,lead,后台实例唤醒
+FR-0013,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0027,REG-EVENT-001/REG-SEC-003,2026-11-17,,lead,事件与拒绝可观测

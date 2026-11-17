@@ -16,7 +16,7 @@ evidence: []
 
 | EXC ID | 规则/范围 | 原因与替代方案 | 风险/缓解 | 关联 FR/CR/ADR/MOD/REG/REL | Owner | 批准人 | 创建/到期/复审 | 偿还任务与退出验证 | 发布限制 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| EXC-0001 |  |  |  |  |  |  |  |  |  | draft |
+| EXC-0001 | 单文件探针 `packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl`：2275 LOC，超过 source 门限（预警 250 / 上限 400） | ADR-0002 要求探针是可整体删除的单文件（可逆与零依赖优先）；拆成多文件会与 ADR-0002 冲突，需先改 ADR。替代方案：按 Security / Capabilities / Json / Host 四段拆分 | 风险：单文件难以并行修改，任一能力改动需全量语义回归。缓解：6 项能力语义测试 + 源码形态检查；安全边界集中在 `ResolveProjectPath` 与 `EnsureCapabilityAllowed` 两个入口；每次 `npm run verify` 全量编译探针 | ADR-0002, FR-0008, FR-0009, FR-0013, REG-SEC-002, REG-SEC-003 | lead | lead | 2026-11-17 / 2027-02-17 / 每季度 | 偿还条件：单文件超过 3500 LOC 或能力数超过 60 时改写 ADR-0002 并拆分为多文件包。退出验证：LOC 低于 400 且 ADR-0002 被取代 | 不阻止发布；但任何探针改动必须附语义测试通过证据 | active |
 
 ## 发布与审计规则
 
