@@ -128,11 +128,12 @@ namespace DSHBridge
             _eventsDir = Path.Combine(_rootDir, _bootId, "events");
             _doneDir = Path.Combine(_rootDir, _bootId, "done");
             _progressDir = Path.Combine(_rootDir, _bootId, "in-progress");
-            Directory.CreateDirectory(_inboxDir);
-            Directory.CreateDirectory(_outboxDir);
-            Directory.CreateDirectory(_eventsDir);
-            Directory.CreateDirectory(_doneDir);
-            Directory.CreateDirectory(_progressDir);
+            // 目录创建失败必须显式上报：这里曾静默抛出并被静态构造函数的 catch 吞掉，
+            // 结果心跳照常写、指向的目录却不存在，故障对调用方完全不可见（BUG-001）。
+            if (!EnsureBootDirs())
+            {
+                UnityEngine.Debug.LogError("[DSHBridge] 通道目录创建失败，bootId=" + _bootId + "，调用将不可用");
+            }
 
             // AA-OPT-010：清理本地历史运行留下的通道目录，避免 Library 随重启线性膨胀。
             SweepStaleBootDirs();
@@ -151,7 +152,46 @@ namespace DSHBridge
             UnityEngine.Debug.Log("[DSHBridge] probe " + ProbeVersion + " ready, bootId=" + _bootId);
         }
 
+        /// <summary>
+        /// bootId 目录名是否安全：16 位十六进制。
+        ///
+        /// 不能只检查长度：bootId 会被拼进 Path.Combine 当目录名，而 instance.json 是
+        /// 磁盘上可被任意进程改写的文件。长度校验挡不住 `..` 之类的相对段，
+        /// 这里按字符集收窄到 [0-9a-f]，与探针自己生成的 Guid("N") 前缀完全一致。
+        /// </summary>
+        static bool IsValidBootId(string bootId)
+        {
+            if (string.IsNullOrEmpty(bootId) || bootId.Length != 16) return false;
+            for (var i = 0; i < bootId.Length; i++)
+            {
+                var c = bootId[i];
+                var isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                if (!isHex) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 该 bootId 的通道目录是否已经是「齐全」状态。
+        /// 只有 5 个子目录都在，才算可以复用——否则复用会得到一个写不进去的通道。
+        /// </summary>
+        static bool BootDirsComplete(string bootId)
+        {
+            if (!IsValidBootId(bootId)) return false;
+            var baseDir = Path.Combine(_rootDir, bootId);
+            foreach (var sub in new[] { "inbox", "outbox", "events", "done", "in-progress" })
+            {
+                if (!Directory.Exists(Path.Combine(baseDir, sub))) return false;
+            }
+            return true;
+        }
+
         // 身份：域重载复用同一 pid+startTime 的 bootId；编辑器重启则换新。
+        //
+        // 复用必须同时校验通道目录仍然齐全（BUG-001）：instance.json 与磁盘目录是两份
+        // 独立状态，只校验 pid/startTicks/bootId/nonce 会出现「身份对得上、目录却不存在」。
+        // 一旦发生，之后每次域重载都走复用分支，故障被固化，心跳照常刷新，
+        // 调用方却持续报 bridge mailbox missing。目录不齐全时换新 bootId，让心跳重新指向真实目录。
         static void LoadOrCreateIdentity()
         {
             var instanceFile = Path.Combine(_rootDir, "instance.json");
@@ -166,10 +206,16 @@ namespace DSHBridge
                         && GetString(existing, "bootId") != null
                         && GetString(existing, "nonce") != null)
                     {
-                        _bootId = GetString(existing, "bootId");
-                        _nonce = GetString(existing, "nonce");
-                        _eventSeq = ToLong(existing, "eventSeq");
-                        return;
+                        var reused = GetString(existing, "bootId");
+                        if (BootDirsComplete(reused))
+                        {
+                            _bootId = reused;
+                            _nonce = GetString(existing, "nonce");
+                            _eventSeq = ToLong(existing, "eventSeq");
+                            return;
+                        }
+                        UnityEngine.Debug.LogWarning(
+                            "[DSHBridge] bootId " + reused + " 的通道目录不完整，换用新的 bootId（原 instance.json 指向的目录不存在）");
                     }
                 }
             }
@@ -180,7 +226,34 @@ namespace DSHBridge
         }
 
         /// <summary>
-        /// AA-OPT-010：保留最近 2 个通道目录（当前 + 上一个），其余删除。
+        /// 确保当前 bootId 的 5 个通道子目录存在；已存在时是空操作。
+        ///
+        /// 心跳每 2 秒调用一次，成本可忽略，但它把「instance.json 指向的目录必须存在」这个
+        /// 不变量从「只在启动时成立一次」变成「每次心跳都重新保证」。任何原因
+        /// （创建期异常、外部误删、清理竞争）导致目录丢失，都会在 2 秒内自愈，
+        /// 而不是让调用方持续收到 bridge mailbox missing。
+        /// </summary>
+        static bool EnsureBootDirs()
+        {
+            try
+            {
+                Directory.CreateDirectory(_rootDir);
+                Directory.CreateDirectory(_inboxDir);
+                Directory.CreateDirectory(_outboxDir);
+                Directory.CreateDirectory(_eventsDir);
+                Directory.CreateDirectory(_doneDir);
+                Directory.CreateDirectory(_progressDir);
+                return true;
+            }
+            catch (Exception e)
+            {
+                UnityEngine.Debug.LogWarning("[DSHBridge] ensure boot dirs: " + e.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// AA-OPT-010：除当前通道目录外，只保留 mtime 最新的一个历史目录，其余删除。
         /// 只处理本进程以外的目录；删除失败（被占用）时忽略，下次启动再试。
         /// </summary>
         static void SweepStaleBootDirs()
@@ -193,7 +266,7 @@ namespace DSHBridge
                 {
                     var name = Path.GetFileName(dir);
                     if (name == _bootId) continue;
-                    if (name.Length != 16) continue;
+                    if (!IsValidBootId(name)) continue;
                     dirs.Add(dir);
                 }
                 if (dirs.Count <= 1) return;
@@ -3849,6 +3922,9 @@ namespace DSHBridge
         {
             try
             {
+                // 心跳是对外宣布「我的通道在 <bootId>/ 下」的唯一途径，因此发布之前
+                // 先保证该目录真的存在，避免把一份指向空目录的 instance.json 写出去。
+                EnsureBootDirs();
                 var info = new Dictionary<string, object>();
                 // 通道信封版本（请求/响应四元组配对用）。
                 info["v"] = 1L;

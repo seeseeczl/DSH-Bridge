@@ -77,3 +77,5 @@ evidence: []
 | 2026-11-17T10:42:00+08:00 | AUD-DOC-004 | 任务卡 5 处失效路径改为真实文件；check:docs 增加任务卡路径存在性检查 | lead |  | docs/04-delivery/project-plan-task-charter.md |
 | 2026-11-17T10:45:00+08:00 | AUD-TEST-001 | 新增 tests/unity-probe/toolchain.mjs：csc/mono 缺失时显式失败，仅 SKIP_PROBE=1 可跳过 | lead |  | tests/unity-probe/toolchain.mjs |
 | 2026-11-17T10:50:00+08:00 | QA-0002 | 全量门禁通过：87 项测试、探针编译、文档一致性（24 回归+3 任务卡路径）、OpenSpec 状态、架构 strict、--check-release | lead |  | npm run verify |
+| 2026-11-18T14:20:00+08:00 | BUG-0001 | 定位并修复 instance.json 的 bootId 指向不存在通道目录：探针复用前校验目录齐全 + 心跳前自愈；DSH 侧新增 channel_missing 状态 | lead |  | `docs/03-quality/defect-0001-bootid-channel.md`, packages/dsh-bridge/transport/channel.mjs |
+| 2026-11-18T14:25:00+08:00 | REL-0002 | 发布 v0.0.5，探针 PROBE_VERSION 11→12；125 项测试全绿，架构 strict PASS | lead |  | docs/04-delivery/REL-0002.md |

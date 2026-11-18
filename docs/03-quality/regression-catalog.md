@@ -39,3 +39,6 @@ evidence: [docs/adversarial-audits/2026-11-16-144546-audit-report.md, docs/adver
 | REG-AMBIGUOUS-001 | AA-CONC-002, AA-OPT-005, BUG-194223-P1 | 同工程双编辑器 | 暴露 `channelOwnerPid`/`pidMismatch`，调用返回 `instance_ambiguous` | `tests/e2e/in-flight.test.mjs` |
 | REG-KNOWLEDGE-001 | AA-OPT-016, BUG-194223-P3, FR-0010 | 知识库路径 | `../` 与绝对路径被拒绝；审计覆盖知识库与 `bridge_targets` | `tests/unit/authorization.test.mjs` |
 | REG-DOC-001 | AA-TEST-001, AA-OPT-009, AA-TEST-008, BUG-194223-P2 | 治理文档引用真实存在且与实现一致 | 回归路径、插件资源、探针真实路径、危险能力清单全部命中 | `scripts/check-doc-consistency.mjs` |
+| REG-CHANNEL-001 | BUG-0001, FR-0001, FR-0013 | 心跳正常但 bootId 通道目录缺失 | `bridge_targets` 报 `channel_missing` 并列出缺失子目录；调用以 `channel_missing` 快速失败而非超时 | `tests/unit/channel-missing-detection.test.mjs` |
+| REG-CHANNEL-002 | BUG-0001, FR-0003 | 探针身份复用与目录自愈 | 目录不齐全时换新 bootId；心跳发布 `instance.json` 前重建目录；bootId 仅接受 16 位 hex | `tests/unit/probe-identity-invariant.test.mjs` |
+| REG-CHANNEL-003 | BUG-0001, AA-OBS-003 | 通道缺失的端到端可见性 | 目录被删后 `bridge_targets` 由 ready 转 `channel_missing`，调用拒绝并提示重装 | `tests/unit/observability.test.mjs` |

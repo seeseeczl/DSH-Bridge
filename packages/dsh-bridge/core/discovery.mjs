@@ -42,10 +42,16 @@ export async function discoverInstances(bridge) {
         engine: candidate.engine ?? probe?.engine ?? null,
         engineVersion: candidate.engineVersion ?? probe?.unityVersion ?? null,
         // idle = 进程在但心跳停（编辑器在后台），仍可控制，调用前会唤醒。
+        // channel_missing = 心跳正常但 bootId 通道目录不全（BUG-001）：不可调用，且必须显式暴露，
+        // 否则只凭心跳判 ready 会把「通道已坏」伪装成可用。
         status: !probe ? 'unprobed'
           : heartbeat.status === 'stale' ? 'stale'
-            : heartbeat.status === 'ready' ? 'ready'
-              : 'idle',
+            : heartbeat.status === 'channel_missing' ? 'channel_missing'
+              : heartbeat.status === 'ready' ? 'ready'
+                : 'idle',
+        // 通道目录缺失明细：排查 mailbox missing 时直接看这里，不用手工 ls。
+        channelOk: heartbeat.channelOk !== false,
+        channelMissing: heartbeat.channelMissing ?? [],
         probeVersion: probe?.probeVersion ?? null,
         // 源码哈希：判定「跑的是不是刚写进去的那份代码」，比版本号更精确。
         sourceHash: probe?.sourceHash ?? null,

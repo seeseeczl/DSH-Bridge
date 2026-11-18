@@ -21,3 +21,6 @@ FR-0010,functional,approved,ARCH-REQ-0001,MOD-0001,TASK-0026,REG-KNOWLEDGE-001,2
 FR-0011,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0026,REG-INSTALL-001,2026-11-17,,lead,工程扫描与预植入
 FR-0012,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0027,REG-RECOVERY-001,2026-11-17,,lead,后台实例唤醒
 FR-0013,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0027,REG-EVENT-001/REG-SEC-003,2026-11-17,,lead,事件与拒绝可观测
+BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0002,TASK-0028,REG-CHANNEL-001,2026-11-18,REL-0002,lead,instance.json 指向不存在通道目录：新增 inspectBootDirs 与 channel_missing 状态
+BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0001,TASK-0028,REG-CHANNEL-003,2026-11-18,REL-0002,lead,发现链路暴露 channelOk/channelMissing，调用侧细化错误码
+BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0003,TASK-0028,REG-CHANNEL-002,2026-11-18,REL-0002,lead,探针 v12：复用前校验目录齐全 + 心跳前自愈 + bootId 字符集校验

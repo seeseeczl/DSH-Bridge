@@ -100,3 +100,35 @@ test('审计聚合：成功率、错误码、耗时分位与排除规则', async
   assert.equal(parseSince(undefined), 86400000)
   assert.throws(() => parseSince('abc'))
 })
+
+// BUG-001：心跳正常但通道目录缺失时，bridge_targets 必须暴露，调用必须明确拒绝。
+// 现场曾出现 pid 存活、lastSeenAt 每 2 秒刷新、status 显示 ready，
+// 但 bootId 目录不存在，于是调用持续 `bridge mailbox missing`——故障对 DSH 完全透明。
+test('BUG-001 通道目录缺失时 bridge_targets 暴露 channel_missing 并拒绝调用', async () => {
+  const { rm } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { bridge, editor, id } = await setup()
+  try {
+    const [before] = await bridge.targets()
+    assert.equal(before.status, 'ready', '前提：目录齐全时应为 ready')
+    // FakeEditor 只在启动时建目录，心跳不会重建——正好复刻「目录被删/没建出来」的现场。
+    await rm(join(editor.projectPath, 'Library', 'DSHBridge', editor.bootId), { recursive: true, force: true })
+
+    const [after] = await bridge.targets()
+    assert.equal(after.status, 'channel_missing', '目录缺失必须反映在 status 上，不能被 ready 掩盖')
+    assert.equal(after.channelOk, false)
+    assert.ok(Array.isArray(after.channelMissing) && after.channelMissing.length > 0, '必须列出缺失项')
+    assert.ok(after.channelMissing.includes('inbox'))
+
+    await assert.rejects(
+      () => bridge.call(id, 'unity.editor.status', {}, { timeoutMs: 300 }),
+      (error) => {
+        assert.equal(error.code, 'channel_missing', `应以 channel_missing 快速失败，实际 ${error.code}`)
+        assert.match(error.message, /bridge_install/, '错误信息必须给出可操作的恢复方式')
+        return true
+      },
+    )
+  } finally {
+    await editor.stop()
+  }
+})

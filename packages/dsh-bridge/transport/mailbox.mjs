@@ -3,28 +3,15 @@
 // 且绝不消费不属于自己的响应（多调用/多会话共享同一通道目录）。
 import { mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { bootPaths, channelRoot, inspectBootDirs } from './channel.mjs'
+
+// 通道路径定义收敛在 channel.mjs（单一事实源）；这里再导出，保持既有导入路径不变。
+export { bootPaths, channelRoot }
 
 export const PROTOCOL_VERSION = 1
 
-/** 通道根固定在目标工程内：Library 已被 Unity 忽略，天然不进版本库。 */
-export function channelRoot(projectPath) {
-  return join(projectPath, 'Library', 'DSHBridge')
-}
-
 export function instanceFile(projectPath) {
   return join(channelRoot(projectPath), 'instance.json')
-}
-
-export function bootPaths(projectPath, bootId) {
-  const base = join(channelRoot(projectPath), bootId)
-  return {
-    base,
-    inbox: join(base, 'inbox'),
-    outbox: join(base, 'outbox'),
-    events: join(base, 'events'),
-    done: join(base, 'done'),
-    inProgress: join(base, 'in-progress'),
-  }
 }
 
 async function ensureDir(dir, { mode = 0o700 } = {}) {
@@ -220,6 +207,7 @@ export function isProcessAlive(pid) {
  * 实例状态：进程存活 + 心跳新鲜 = ready；
  * 进程存活但心跳陈旧 = idle（后台，需要唤醒而非报错）；
  * 进程消失 = stale。
+ * 心跳新鲜但通道目录不全 = channel_missing（BUG-001）。
  *
  * `staleMs` 未显式给出时使用 instance.json 自述的 `staleAfterMs`（发现协议的一部分），
  * 这样不依赖 DSH 运行时的消费方（CLI）也能按探针声明的节奏判断，而不必硬编码阈值。
@@ -234,7 +222,17 @@ export async function probeHeartbeat(projectPath, { staleMs } = {}) {
   const seen = instance.lastSeenAt ? Date.parse(instance.lastSeenAt) : 0
   const age = Number.isFinite(seen) ? Date.now() - seen : Number.POSITIVE_INFINITY
   const pidAlive = isProcessAlive(Number(instance.pid))
-  if (!pidAlive) return { status: 'stale', instance, age, pidAlive, staleMs: effectiveStaleMs }
-  if (age > effectiveStaleMs) return { status: 'idle', instance, age, pidAlive, staleMs: effectiveStaleMs }
-  return { status: 'ready', instance, age, pidAlive, staleMs: effectiveStaleMs }
+  // 通道目录只在「进程还在」时才有意义：进程已消失时 stale 是更根本的结论，
+  // 不必再为它的目录做一次 stat。心跳陈旧（idle）同样先于目录检查——
+  // 后台节流时目录可能只是还没被自愈心跳重建出来。
+  const channel = pidAlive && age <= effectiveStaleMs
+    ? await inspectBootDirs(projectPath, instance.bootId)
+    : { ok: true, missing: [] }
+  const base = { instance, age, pidAlive, staleMs: effectiveStaleMs, channelOk: channel.ok, channelMissing: channel.missing }
+  if (!pidAlive) return { ...base, status: 'stale' }
+  if (age > effectiveStaleMs) return { ...base, status: 'idle' }
+  // 心跳新鲜、进程在场，但宣布的通道目录不全：这不是「不可用」，而是「已坏」，
+  // 必须与 ready 区分，否则故障会被 ready 掩盖（BUG-001 现场就是这样被隐藏的）。
+  if (!channel.ok) return { ...base, status: 'channel_missing' }
+  return { ...base, status: 'ready' }
 }

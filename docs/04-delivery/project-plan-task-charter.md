@@ -64,6 +64,7 @@ kickoff_completion: complete
 | TASK-0025 | FR-0008, FR-0009, MOD-0003 | 通用执行面与语义封装的能力族登记与验收对账 | FR 基线 | `packages/dsh-bridge/adapters/unity/**`, `tests/unity-probe/**` | `core/**` | lead / 2026-11-17 | 42 项能力均能追溯到 FR-0008/0009；REG-SEC-002/003、REG-LIMIT-001 | 出现无法追溯的能力 | project-plan-task-charter.md | done |
 | TASK-0026 | FR-0010, FR-0011, MOD-0001 | 主题知识库与工程预植入的需求登记与验收对账 | FR 基线 | `packages/dsh-bridge/core/knowledge.mjs`, `core/preinstall.mjs` | `transport/**` | lead / 2026-11-17 | REG-KNOWLEDGE-001、REG-INSTALL-001 | 知识库路径越界 | project-plan-task-charter.md | done |
 | TASK-0027 | FR-0012, FR-0013, MOD-0003 | 后台唤醒与事件/拒绝可观测的需求登记与验收对账 | FR 基线 | `packages/dsh-bridge/adapters/unity/wake.mjs`, `transport/maintenance.mjs` | `packages/dsh-bridge/index.mjs` | lead / 2026-11-17 | REG-RECOVERY-001、REG-EVENT-001、REG-SEC-003 | 唤醒后未恢复前台 | project-plan-task-charter.md | done |
+| TASK-0028 | BUG-0001, MOD-0001/MOD-0002/MOD-0003 | 修复 instance.json 的 bootId 指向不存在通道目录：探针复用前校验目录齐全 + 心跳前自愈；DSH 侧新增 channel_missing 状态与 inspectBootDirs | BUG-0001 | `packages/dsh-bridge/transport/channel.mjs`, `transport/mailbox.mjs`, `core/discovery.mjs`, `core/lifecycle.mjs`, `core/bridge.mjs`, `adapters/unity/probe/DSHBridgeProbe.cs.tpl` | `Assets/**`（禁止在仓库内写工程文件） | — / lead / 2026-11-18 | REG-CHANNEL-001、REG-CHANNEL-002、REG-CHANNEL-003；`npm run verify` 退出码 0 | 目录缺失被误判为 ready | project-plan-task-charter.md | done |
 
 ## 验证、风险与回滚
 

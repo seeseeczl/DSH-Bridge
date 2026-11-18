@@ -158,6 +158,17 @@ export class Bridge {
       throw new PolicyError('capability_unsupported', `实例 ${instanceId} 未声明能力 ${capability}`, { capability })
     }
     if (instance.status !== 'ready' && instance.status !== 'idle') {
+      // BUG-001：心跳正常但通道目录不全时，笼统的「请检查是否在运行」会误导排查方向
+      // ——编辑器明明在跑、bridge_targets 也曾显示 ready。这里给出缺了什么。
+      if (instance.status === 'channel_missing') {
+        const missing = (instance.channelMissing ?? []).join(', ') || 'unknown'
+        throw new PolicyError(
+          'channel_missing',
+          `实例 ${instanceId} 的探针心跳正常，但 bootId ${instance.bootId} 的通道目录缺失（${missing}）；`
+            + '这通常意味着探针创建目录失败或其目录被外部删除。重装探针（bridge_install）即可恢复。',
+          { status: instance.status, bootId: instance.bootId, channelMissing: instance.channelMissing ?? [] },
+        )
+      }
       throw new PolicyError(
         'instance_not_ready',
         `实例 ${instanceId} 状态为 ${instance.status}；请先 bridge_install 安装探针或检查目标软件是否在运行`,

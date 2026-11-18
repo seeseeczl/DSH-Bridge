@@ -18,7 +18,7 @@ import { withWake } from './wake.mjs'
 import { backlog, sweepEvents } from '../../transport/maintenance.mjs'
 import { installProbe, probePaths, uninstallProbe } from './installer.mjs'
 
-export const PROBE_VERSION = '11'
+export const PROBE_VERSION = '12'
 
 export const UNITY_CAPABILITIES = Object.freeze([
   'unity.editor.status',

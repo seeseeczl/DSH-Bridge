@@ -42,3 +42,12 @@ evidence: []
 | AA-OBS-004 | — | 完成 | doctor 增加危险清单文档化、探针路径边界、能力闸门三项断言 | `npm run doctor` 退出码 |
 | AA-OBS-005 | — | 完成（披露） | SEC 文档记录 `done/` 请求正文含参数原文 | REG-DOC-001 |
 | AA-PERF-001 / AA-CODE-003 | — | 接受风险 | 见优化计划 §6 | lead |
+
+## BUG-0001 整改（v0.0.5）
+
+> 来源：`docs/03-quality/defect-0001-bootid-channel.md`
+> 发布：`docs/04-delivery/REL-0002.md`
+
+| 任务 | 关联缺陷 | 状态 | 产物 | 验收（回归） |
+| --- | --- | --- | --- | --- |
+| TASK-0028 | BUG-0001 | 完成 | 探针 v12：`BootDirsComplete` 复用前校验、`EnsureBootDirs` 心跳自愈、`IsValidBootId` 字符集校验；DSH 侧 `transport/channel.mjs` 的 `inspectBootDirs` 与 `channel_missing` 状态 | REG-CHANNEL-001、REG-CHANNEL-002、REG-CHANNEL-003 |

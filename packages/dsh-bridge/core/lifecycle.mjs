@@ -47,6 +47,15 @@ export async function refreshInstance(bridge, instance) {
     })
   }
   if (refreshed.status !== 'ready' && refreshed.status !== 'idle') {
+    // BUG-001：通道目录不全不是「重启中」，重试也不会自愈；必须直接给出可操作结论。
+    if (refreshed.status === 'channel_missing') {
+      const missing = (refreshed.channelMissing ?? []).join(', ') || 'unknown'
+      throw new PolicyError(
+        'channel_missing',
+        `实例 ${instance.instanceId} 的通道目录缺失（${missing}）；请重装探针（bridge_install）恢复`,
+        { status: refreshed.status, bootId: refreshed.bootId, channelMissing: refreshed.channelMissing ?? [] },
+      )
+    }
     throw new PolicyError('instance_restarted', `实例 ${instance.instanceId} 已重启但探针尚未就绪，请稍后重试`, {
       status: refreshed.status,
       bootId: refreshed.bootId,
