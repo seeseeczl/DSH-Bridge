@@ -70,7 +70,8 @@
 - 传输基于文件轮询（约 100ms），单次调用延迟通常在 100–300ms。
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
-- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与 `unity.menu.execute` 默认关闭；开启方式见下节。探针侧已不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先）。
+- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与 `unity.menu.execute` 默认关闭；开启方式见下节。
+- 生产管线已覆盖构建/包管理/烘焙；**测试运行未实现**：TestRunnerApi 需要 asmdef 引用 test-framework，而探针在预定义程序集内无法直接引用（实测编译报 CS0234）。探针侧已不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先）。
 
 ## 安装位置与工作区
 

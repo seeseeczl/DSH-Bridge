@@ -83,6 +83,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
+- 测试运行（TestRunnerApi）暂未提供专用能力：它需要 asmdef 引用 test-framework 程序集，而单文件探针编译在预定义程序集内（实测引用 `UnityEditor.TestTools` 直接编译失败）；需要时可由调用方用 `unity.code.execute` 执行测试调用代码。
 - 传输基于文件轮询（约 80ms），单次调用延迟通常 100–300ms。
 - 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）、`unity.menu.execute`、资产破坏性能力与包增删（`unity.package.add/remove`）默认关闭，需 `allowDangerous` 显式开启（用户决策：能力与自由优先，风险由调用方承担）。
 - 本机信任模型：同用户进程可读取通道身份文件；配对校验防的是跨用户与误投递，不是同用户恶意进程。
