@@ -1,6 +1,6 @@
 // 探针安装/卸载：写 embedded package、维护本地 exclude、触发编译、等待心跳。
 import { createHash } from 'node:crypto'
-import { lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { PolicyError } from '../../safety/policy.mjs'
 import { readInstance } from '../../transport/mailbox.mjs'
@@ -10,7 +10,7 @@ import {
   legacyDir, manifestFile, packageDir, packageManifest, probeFile,
   PACKAGE_RELATIVE_DIR, PROBE_FILE_NAME,
 } from './paths.mjs'
-import { renderProbeFiles } from './probe.template.mjs'
+import { PROBE_TEMPLATE_FILES, renderProbeFiles } from './probe.template.mjs'
 
 const LEGACY_GITIGNORE_ENTRIES = ['/Assets/DSHBridge/', '/Assets/DSHBridge.meta']
 
@@ -108,6 +108,34 @@ async function waitForProbe(projectPath, {
   }
 }
 
+/** 删除模板清单之外的同前缀探针源码；只动 Editor 目录下的 DSHBridgeProbe*.cs 及其 .meta。 */
+async function removeStaleProbeFiles(dir) {
+  const editorDir = join(dir, 'Editor')
+  let names
+  try {
+    names = await readdir(editorDir)
+  } catch {
+    return []
+  }
+  const prefix = editorDir.endsWith('/') ? editorDir : editorDir + '/'
+  const keep = new Set(PROBE_TEMPLATE_FILES.map((item) => item.file))
+  const removed = []
+  for (const name of names) {
+    if (!/^DSHBridgeProbe[^/\\]*\.cs(\.meta)?$/.test(name)) continue
+    const base = name.endsWith('.meta') ? name.slice(0, -'.meta'.length) : name
+    if (keep.has(base)) continue
+    const target = join(editorDir, name)
+    if (!target.startsWith(prefix)) continue
+    try {
+      await rm(target, { force: true })
+      removed.push(name)
+    } catch {
+      // 删除失败不影响安装主流程；下次安装会重试。
+    }
+  }
+  return removed
+}
+
 export async function installProbe(instance, probeVersion, {
   dryRun = false,
   autoExclude = true,
@@ -180,7 +208,16 @@ export async function installProbe(instance, probeVersion, {
   if (changed) {
     await mkdir(join(dir, 'Editor'), { recursive: true })
     if (pkgChanged) await writeFile(pkg, pkgContent, 'utf8')
-    for (const item of changedFiles) await writeFile(item.target, item.content, 'utf8')
+    // 先写非入口文件、最后写入口 DSHBridgeProbe.cs：中途中断时不会出现「新入口 + 旧/缺依赖文件」
+    // 的半更新状态（旧文件仍能编译，下次安装可补齐）。
+    const entrySuffix = `/Editor/${PROBE_FILE_NAME}`
+    const ordered = [
+      ...changedFiles.filter((item) => !item.target.endsWith(entrySuffix)),
+      ...changedFiles.filter((item) => item.target.endsWith(entrySuffix)),
+    ]
+    for (const item of ordered) await writeFile(item.target, item.content, 'utf8')
+    // 清理模板清单之外的同前缀源码（降级/回滚/改名后的残留），避免 CS0101 重复定义。
+    await removeStaleProbeFiles(dir)
   }
 
   const legacy = await migrateLegacy(instance.projectPath)
@@ -219,9 +256,14 @@ export async function installProbe(instance, probeVersion, {
 
 export async function uninstallProbe(instance) {
   const dir = packageDir(instance.projectPath)
-  const file = probeFile(instance.projectPath)
   await assertNotSymlink(dir)
-  const existed = (await readIfExists(file)) !== null
+  let existed = false
+  try {
+    await lstat(dir)
+    existed = true
+  } catch {
+    existed = false
+  }
   if (!existed) return { removed: [], note: '探针不存在，无需卸载' }
   await rm(dir, { recursive: true, force: true })
   const excludeRemoved = await removeLocalExclude(instance.projectPath).catch(() => false)

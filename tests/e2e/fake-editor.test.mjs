@@ -4,6 +4,7 @@ import { mkdtemp, readFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createUnityAdapter, PROBE_VERSION, UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
+import { PROBE_TEMPLATE_FILES } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 import { instanceIdFor } from '../../packages/dsh-bridge/core/identity.mjs'
 import { Bridge } from '../../packages/dsh-bridge/core/bridge.mjs'
 import { FakeEditor } from '../fixtures/fake-editor.mjs'
@@ -93,7 +94,7 @@ test('安装探针：dry_run 不落盘、真实安装写入单文件、重复安
   try {
     const preview = await bridge.install(id, { dryRun: true })
     assert.equal(preview.dryRun, true)
-    assert.equal(preview.files.length, 10)
+    assert.equal(preview.files.length, PROBE_TEMPLATE_FILES.length + 1)
     await assert.rejects(() => stat(preview.files[0].path))
 
     const first = await bridge.install(id, { dryRun: false, autoActivate: false, waitForReady: false })

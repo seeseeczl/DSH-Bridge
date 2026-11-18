@@ -106,19 +106,44 @@ await expectPass('E01', '截图 capture → PNG', 'unity.screenshot.capture', { 
   return { pass: bytes[0] === 0x89 && bytes[1] === 0x50 && d.bytes === bytes.length, actual: { bytes: d.bytes } }
 })
 await expectPass('E02', '截图序列 sequence', 'unity.screenshot.sequence', { target: 'game', count: 3, intervalMs: 50, width: 160, height: 90, dir: 'verify-live-seq' }, (d) => ({ pass: d.count === 3 && d.frames.length === 3 }))
+await expectPass('E05a', 'creation: ready C# 测试文件', 'unity.asset.create', { kind: 'text', path: 'Assets/VerifyLive/live.cs', content: 'public class LiveOk { }\n' }, (d) => ({ pass: d.created === true }))
 await expectPass('E03', 'script.get_sha', 'unity.script.get_sha', { path: 'Assets/VerifyLive/live.txt' }, (d) => ({ pass: /^[0-9a-f]{64}$/.test(d.sha256 ?? '') }))
 await expectPass('E04', 'script.apply_edits', 'unity.script.apply_edits', { path: 'Assets/VerifyLive/live.txt', edits: [{ startLine: 1, startColumn: 1, endLine: 1, endColumn: 5, text: 'PATCH' }] }, (d) => ({ pass: d.applied === 1 }))
-await expectPass('E05', 'script.validate（合法）', 'unity.script.validate', { path: 'Assets/VerifyLive/live.txt' }, (d) => ({ pass: typeof d.valid === 'boolean' }))
+await expectPass('E05', 'script.validate（合法 C#）', 'unity.script.validate', { path: 'Assets/VerifyLive/live.cs' }, (d) => ({ pass: d.valid === true && d.errorCount === 0, actual: { valid: d.valid, errorCount: d.errorCount } }))
 await expectPass('E06', 'graphics.stats', 'unity.graphics.stats', {}, (d) => ({ pass: typeof d.gpu === 'string' && typeof d.renderPipeline === 'string' }))
 await expectPass('E07', 'physics.raycast', 'unity.physics.raycast', { origin: [1, 10, 3], direction: [0, -1, 0], distance: 20 }, (d) => ({ pass: typeof d.hit === 'boolean' }))
 await expectPass('E08', 'ui.canvases', 'unity.ui.canvases', {}, (d) => ({ pass: typeof d.count === 'number' }))
 await expectPass('E09', 'window.list', 'unity.window.list', { limit: 50 }, (d) => ({ pass: d.count > 0 }))
-await expectPass('E10', 'input.send', 'unity.input.send', { window: 'SceneView', events: [{ type: 'key', key: 'Space', action: 'press' }] }, (d) => ({ pass: d.window === 'SceneView' && d.applied.length === 1 }))
+await expectPass('E10', 'input.send', 'unity.input.send', { window: 'SceneView', events: [{ type: 'key', key: 'Space', action: 'press' }] }, (d) => ({ pass: d.window === 'SceneView' && d.applied.length === 1 && typeof d.delivered === 'number' }))
 await expectPass('E11', 'job.list', 'unity.job.list', { limit: 10 }, (d) => ({ pass: Array.isArray(d.jobs) }))
 await expectPass('E12', 'package.list', 'unity.package.list', { limit: 5 }, (d) => ({ pass: d.total > 0 }))
-await expectPass('E13', 'bake.navmesh', 'unity.bake.navmesh', {}, (d) => ({ pass: d.baked === true }))
+await expectPass('E13', 'bake.navmesh（作业化）', 'unity.bake.navmesh', {}, (d) => ({ pass: typeof d.jobId === 'string' && d.jobId.startsWith('job-') }))
 await expectReject('F01', '未知能力被拒绝', 'unity.no.such.capability', {}, 'capability_unsupported')
 await expectReject('F02', '路径逃逸被拒绝', 'unity.asset.read', { path: '/etc/passwd' }, 'path_escape')
+
+// ============ 审计修复回归抽查（AUD-CODE-001 / v0.0.9） ============
+await expectReject('F03', 'PlayMode 测试显式拒绝', 'unity.test.run', { mode: 'playmode' }, 'playmode_unsupported')
+await expectReject('F04', '非法 jobId 拒绝', 'unity.job.status', { jobId: '../instance' }, 'invalid_argument')
+await expectReject('F05', '写探针自身源码被拒（path_denied）', 'unity.asset.create', { kind: 'text', path: 'Packages/com.dsh.bridge/Editor/Hack.cs', content: 'x' }, 'path_denied')
+await expectReject('F06', 'validate 拒绝非 .cs', 'unity.script.validate', { path: 'Assets/VerifyLive/live.txt' }, 'invalid_argument')
+await expectPass('F07', 'NaN 响应仍是合法 JSON', 'unity.code.execute', { code: 'return double.NaN;' }, async (d) => ({ pass: d.result === null }))
+try {
+  await call('unity.asset.create', { kind: 'text', path: 'Assets/VerifyLive/exists.txt', content: 'a' })
+  await expectReject('F08', 'asset.create 覆盖保护', 'unity.asset.create', { kind: 'text', path: 'Assets/VerifyLive/exists.txt', content: 'b' }, 'already_exists')
+} catch (error) {
+  record('F08', 'asset.create 覆盖保护', false, { error: error.message, code: error.code })
+}
+// 通道权限：目录 0700、instance.json 0600（审计 P1-4）
+try {
+  const { stat } = await import('node:fs/promises')
+  const rootInfo = await stat(join(PROJECT, 'Library/DSHBridge'))
+  const fileInfo = await stat(INSTANCE_FILE)
+  const rootMode = rootInfo.mode & 0o777
+  const fileMode = fileInfo.mode & 0o777
+  record('P02', '通道权限 0700/0600', rootMode === 0o700 && fileMode === 0o600, { rootMode: rootMode.toString(8), fileMode: fileMode.toString(8) })
+} catch (error) {
+  record('P02', '通道权限 0700/0600', false, { error: error.message })
+}
 
 // ============ 延迟基准（20 次 editor.status，p50/p95） ============
 try {

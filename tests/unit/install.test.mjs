@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { createUnityAdapter, probePaths } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
+import { PROBE_TEMPLATE_FILES } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 import { instanceIdFor } from '../../packages/dsh-bridge/core/identity.mjs'
 
 const run = promisify(execFile)
@@ -28,7 +29,7 @@ test('dry_run 只给出包内两个文件，不落盘', async () => {
   const preview = await adapter.install(inst(dir), { dryRun: true })
   assert.equal(preview.dryRun, true)
   assert.equal(preview.location, 'packages/embedded')
-  assert.equal(preview.files.length, 10)
+  assert.equal(preview.files.length, PROBE_TEMPLATE_FILES.length + 1)
   assert.match(preview.files[0].relativePath, /Packages\/com\.dsh\.bridge\/package\.json$/)
   assert.match(preview.files[1].relativePath, /Packages\/com\.dsh\.bridge\/Editor\/DSHBridgeProbe\.cs$/)
   await assert.rejects(() => stat(preview.files[0].path))

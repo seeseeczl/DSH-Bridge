@@ -138,3 +138,13 @@ bridge_call {instance_id, capability, args_json}
 ## 8. 性能参考
 
 本机真机基准（团结 2022.3.62t7，文件邮箱轮询）：`editor.status` 连续 20 次 **p50 ≈ 86ms、p95 ≈ 168ms**（范围 84–168ms）。短调用通常 100–300ms；`code.execute`/构建/测试等的耗时取决于被调代码与任务本身。
+
+## 9. v0.0.9 契约变化（AUD-CODE-001 修复）
+
+- **危险能力**：探针侧也要求授权快照（13 项与 DSH 侧一致）；DSH 侧行为不变（默认拒绝，`allowDangerous` 放行）。
+- **截图序列**：`count ≤ 200`、`intervalMs ≤ 5000`、总预算 10s，超限 `invalid_argument`（响应含 `plannedDurationMs`）；PlayMode 的 game 截图走 `ScreenCapture`。
+- **脚本校验**：只接受 `.cs`；响应含 `encoding` / `definesSource` / `truncated`。
+- **脚本编辑**：保留文件 BOM/编码；响应含 `encoding` / `bom` / `newline`。
+- **资产创建**：已存在文件需 `overwrite:true`，否则 `already_exists`；响应含 `created` / `overwritten`；写入 `Packages/com.dsh.bridge/**` 报 `path_denied`。
+- **场景**：路径必须工程内 + `.unity`；Single 模式遇未保存场景报 `scene_dirty`（`discardChanges:true` 显式丢弃）；失败抛 `not_found` / `io_error`。
+- **作业**：构建失败落 `failed`；PlayMode 测试报 `playmode_unsupported`；test 作业 30 分钟超时；非法 `jobId` 报 `invalid_argument`；`bake.navmesh` 返回 `jobId`。

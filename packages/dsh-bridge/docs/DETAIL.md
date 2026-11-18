@@ -435,3 +435,25 @@ var win = AmplifyShaderEditor.UIUtils.CurrentWindow;
 if (win != null) { win.Close(); UnityEngine.Object.DestroyImmediate(win); AmplifyShaderEditor.UIUtils.CurrentWindow = null; }
 return true;
 ```
+
+## 审计修复（v0.0.9）
+
+### 协议与文件安全
+
+- `MiniJson.Parse`：深度 ≤ 64、节点 ≤ 20 万、输入 ≤ 1 MiB；畸形/截断/尾逗号抛 `FormatException`；instance.json / inbox / 作业文件读取前按大小上限判损坏并归档。
+- 通道目录 `0700`、通道文件 `0600`（libc chmod，失败降级）；事件序号 Init 取 `max(instance, events 目录)` 且 `PushEvent` 加锁自增；`WriteAtomic` 用 tmp + `File.Replace`。
+- NaN/±Infinity 序列化为 `null`；新增错误码 `invalid_encoding` / `render_failed` / `write_failed` / `path_denied` / `already_exists` / `scene_dirty` / `job_corrupted` / `reference_not_found` / `io_error` / `unity_error` / `capability_disabled`。
+
+### 授权与危险能力
+
+- 探针侧 `_reflectCapabilities` 与 DSH `DEFAULT_DANGEROUS` 同为 13 项：asset.refresh/delete/move/rename/duplicate、importer.set、menu.execute、package.add/remove 以及 4 个反射能力。
+- 反射面拒绝元编程类型（Type/MethodInfo/FieldInfo/Assembly/Activator/Delegate 等）与返回句柄；batch 内嵌 code 需 `code.execute` 未被 `bridge.denied` 禁用。
+
+### 作业
+
+- 构建按 `BuildResult` 分流（Succeeded→done / Failed→failed / Cancelled→cancelled）；PlayMode 测试返回 `playmode_unsupported`；test 作业 30 分钟超时 + `IErrorCallbacks` + 可取消；`job.cancel` 校验终态并持久化 `cancelling`；package 作业恢复时按已注册包对账；navmesh 作业化；作业记录保留最近 500 条。
+
+### 截图与脚本编辑
+
+- `target=game` 在 PlayMode 优先 `ScreenCapture.CaptureScreenshotAsTexture`，回退相机渲染并返回 `fallback`/`fallbackReason`；尺寸上限 `min(8192, maxTextureSize)`；文件名唯一；artifacts 保留最近 200。
+- `apply_edits` 保留 BOM/编码、归一换行、非法编码报 `invalid_encoding`；`validate` 仅接受 `.cs`、defines 来自编译管线、`valid` 用 `Errors.HasErrors`、诊断截断带 `truncated`/`totalDiagnostics`。

@@ -92,7 +92,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 
 ## 安全边界
 
-传输层：通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转），审计覆盖全部 6 个工具。
+传输层：通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转），审计覆盖全部 10 个工具。
 
 执行层（探针内，见 `DETAIL.md`）：
 
@@ -150,3 +150,13 @@ node scripts/bridge-cli.mjs call <projectPath> unity.code.execute '{"code":"retu
 ```
 
 详见 `docs/DETAIL.md`。
+
+## 审计修复（v0.0.9 / 探针 26）
+
+针对 AUD-CODE-001（`docs/05-audits/2026-11-19-001-code-review.md`）的修复：
+
+- **P0**：MiniJson 解析加深度（64）/ 节点（20 万）/ 输入（1 MiB）上限，畸形 JSON 统一抛 `FormatException`，不再可能触发不可捕获的栈溢出。
+- **安全**：探针侧危险能力闸门扩展到与 `DEFAULT_DANGEROUS` 一致的 13 项（绕过 DSH 直写 inbox 也会被拒）；反射面拒绝元编程类型与返回值句柄（阻断 `Type → GetMethod → Invoke` 链）；默认开启的写能力拒绝写 `Packages/com.dsh.bridge/**`；scene/build/jobId 全部走路径校验；通道目录/文件显式 `0700`/`0600`。
+- **健壮性**：NaN/Infinity 序列化为 `null`；outbox 写失败保留 in-flight 语义；事件序号跨域取 max 且加锁；`bridge.denied` 对 `code.execute` 在 batch 内嵌 code 时同样生效。
+- **作业**：PlayMode 测试显式拒绝（域重载无法保留回调）；构建失败/取消正确落 `failed`/`cancelled`；`bake.lighting` 检查启动归属；test 作业增加超时/错误回调/取消；package 作业恢复时对账；作业记录保留上限。
+- **能力契约**：`unity.script.validate` 仅接受 `.cs`；`unity.screenshot.sequence` 限 count≤200 / intervalMs≤5000 / 总预算 10s 并返回 `plannedDurationMs`；`unity.asset.create` 覆盖已存在文件需 `overwrite:true`；`unity.scene.open` 单场景前检查未保存改动（`discardChanges:true` 显式丢弃）。

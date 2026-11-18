@@ -13,11 +13,12 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { apply } from '../packages/dsh-bridge/index.mjs'
+import { PROBE_VERSION } from '../packages/dsh-bridge/adapters/unity/index.mjs'
 
 const PROJECT = resolve(process.argv[2] ?? '/Users/long/Documents/Tuanjie/DSHBridgeVerify')
 const INSTANCE_FILE = join(PROJECT, 'Library/DSHBridge/instance.json')
 const JSON_OUT = process.argv.includes('--json')
-const ALLOW_DANGEROUS = ['unity.reflect.invoke', 'unity.api.invoke', 'unity.api.members', 'unity.api.batch', 'unity.menu.execute']
+const ALLOW_DANGEROUS = ['unity.reflect.invoke', 'unity.api.invoke', 'unity.api.members', 'unity.api.batch', 'unity.menu.execute', 'unity.asset.delete']
 
 const rows = []
 function record(id, name, ok, detail) {
@@ -69,7 +70,7 @@ async function runTool(name, args = {}) {
 
 // ---------- 0) 探针就绪 ----------
 const raw = JSON.parse(await readFile(INSTANCE_FILE, 'utf8'))
-record('T00', '探针就绪（直读 instance.json）', raw.probeVersion === '25' && raw.capabilities?.length === 77, {
+record('T00', '探针就绪（直读 instance.json）', raw.probeVersion === PROBE_VERSION && raw.capabilities?.length === 77, {
   probe: raw.probeVersion, caps: raw.capabilities?.length, sourceHash: raw.sourceHash,
 })
 
@@ -135,14 +136,14 @@ try {
   const created = await runTool('bridge_call', {
     instance_id: instanceId,
     capability: 'unity.asset.create',
-    args_json: JSON.stringify({ kind: 'text', path: 'Assets/ToolSurface/live.txt', content: 'TOOL_TOKEN' }),
+    args_json: JSON.stringify({ kind: 'text', path: 'Assets/ToolSurface/live.txt', content: 'TOOL_TOKEN', overwrite: true }),
   })
   const sha = await runTool('bridge_call', {
     instance_id: instanceId,
     capability: 'unity.script.get_sha',
     args_json: JSON.stringify({ path: 'Assets/ToolSurface/live.txt' }),
   })
-  record('T07', 'bridge_call 脚本编辑链路（create→get_sha）', created.value.data?.created === true && /^[0-9a-f]{64}$/.test(sha.value.data?.sha256 ?? ''), {
+  record('T07', 'bridge_call 脚本编辑链路（create→get_sha）', (created.value.data?.created === true || created.value.data?.overwritten === true) && /^[0-9a-f]{64}$/.test(sha.value.data?.sha256 ?? ''), {
     created: created.value.data?.created, sha256: sha.value.data?.sha256?.slice(0, 12),
   })
   await runTool('bridge_call', { instance_id: instanceId, capability: 'unity.asset.delete', args_json: JSON.stringify({ path: 'Assets/ToolSurface' }) }).catch(() => null)
