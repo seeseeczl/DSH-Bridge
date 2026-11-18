@@ -13,7 +13,7 @@
 - **多实例隔离**：每个实例有独立 ID 与独立通道目录，请求与响应按四元组配对，不会串台。
 - **可逆**：卸载只删除 DSH 创建的那一个探针目录。
 
-## 四个工具
+## 工具
 
 | 工具 | 作用 |
 | --- | --- |
@@ -22,6 +22,9 @@
 | `bridge_call` | 对指定实例调用一个能力 |
 | `bridge_events` | 按游标读取编译完成、Play Mode、错误日志等事件 |
 | `bridge_uninstall` | 删除探针，恢复干净工程 |
+| `bridge_preinstall` | 扫描本机工程目录，把探针预植入未运行的工程（默认只预览） |
+| `bridge_knowledge_save/list/read/delete` | 按实例保存主题知识文档（实现位置、关键脚本、使用方法） |
+| `bridge_docs` | **不依赖实例**：检索本机引擎安装里的官方 ScriptReference（搜索符号、读取签名/描述/示例，`source: "local-docs"`） |
 
 ## Unity 能力（首期）
 
@@ -58,6 +61,24 @@
 | `unity.api.batch` | 批量调用 + 共享 Undo 组 + 失败回滚/补偿 + `failures[]`（**默认关闭**） |
 | `unity.code.execute` | 进程内编译执行 C#，等价 MCP `execute_code`（**默认开启**） |
 
+## v0.0.10 能力补齐（39 项，对标 MCP for Unity / Codely）
+
+v0.0.10 把能力面从 77 项扩到 116 项。规格见 `docs/02-design/v27-capability-parity.md`，完整清单与三方对比见 `docs/01-architecture/capability-matrix.md`。
+
+| 域 | 新增能力 | 说明 |
+| --- | --- | --- |
+| 图形 | `graphics.pipeline`、`graphics.volume.list/get/set/create`、`graphics.renderer_features`、`graphics.post_processing`、`graphics.light_probes`、`graphics.reflection_probes`、`bake.light_probes`、`bake.reflection_probes` | Volume/后处理/Renderer Feature 走反射（需 URP/HDRP）；探针只烘没有公开 API，返回带 `hint` 说明真实语义 |
+| 物理 | `physics.joints`、`physics.collision_matrix`、`physics.material`、`physics.body`、`physics.forces`、`physics.simulate`、`physics.2d.settings/body/raycast` | 关节/碰撞矩阵/物理材质/力/2D；`physics.simulate` 为危险能力（默认关闭） |
+| UI Toolkit | `uitk.uxml`、`uitk.uss`、`uitk.panel_settings`、`uitk.document` | UXML/USS 文本资产 CRUD + 校验；PanelSettings/UIDocument 读写；视觉树只读 |
+| 输入 | `input.mouse`、`input.keyboard`、`input.type_text`、`input.device`、`input.sequence` | 只作用于 Play Mode；依赖 `com.unity.inputsystem`（反射访问），未装包返回 `capability_unavailable` |
+| 编辑器元数据 | `tag.list/ensure/remove`、`layer.list/ensure/remove`、`editor.set_active_tool` | 写 `ProjectSettings/TagManager.asset`；`tag.remove`/`layer.remove` 为危险能力（默认关闭） |
+| 文档与签名 | `reflect.signature`、`docs.search`、`docs.get` | 程序集精确签名（含工程自定义程序集）+ 本机官方 ScriptReference 检索；文档缺失返回 `docs_unavailable` |
+
+`bridge_docs` 与上述 `unity.docs.*` 的分工：
+
+- `bridge_docs`：DSH 侧直接读安装目录文档，**不需要实例在线**，适合写代码前查 API；
+- `unity.docs.*`：跟着运行实例走，能拿到该实例实际版本的文档；`unity.reflect.signature` 读的是**真实程序集**，比文档更可信。
+
 ## 典型流程
 
 1. `bridge_targets` 找到目标实例（未安装时状态为 `unprobed`）。
@@ -67,7 +88,7 @@
 
 ## 限制
 
-- 探针是**按域拆分的 C# partial class 源码包**（9 个文件），作为 embedded package 写入 `<工程>/Packages/com.dsh.bridge/Editor/`；首次写入会让 Unity 编译并重载一次，卸载删除整目录。
+- 探针是**按域拆分的 C# partial class 源码包**（15 个文件），作为 embedded package 写入 `<工程>/Packages/com.dsh.bridge/Editor/`；首次写入会让 Unity 编译并重载一次，卸载删除整目录。
 - 传输基于文件轮询（约 100ms），单次调用延迟通常在 100–300ms。
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
@@ -447,6 +468,7 @@ return true;
 ### 授权与危险能力
 
 - 探针侧 `_reflectCapabilities` 与 DSH `DEFAULT_DANGEROUS` 同为 13 项：asset.refresh/delete/move/rename/duplicate、importer.set、menu.execute、package.add/remove 以及 4 个反射能力。
+  （v0.0.10 起扩到 **16 项**，新增 `unity.tag.remove`、`unity.layer.remove`、`unity.physics.simulate`；两侧由单测强制双向一致。）
 - 反射面拒绝元编程类型（Type/MethodInfo/FieldInfo/Assembly/Activator/Delegate 等）与返回句柄；batch 内嵌 code 需 `code.execute` 未被 `bridge.denied` 禁用。
 
 ### 作业

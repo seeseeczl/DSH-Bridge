@@ -121,6 +121,34 @@ await expectPass('E13', 'bake.navmesh（作业化）', 'unity.bake.navmesh', {},
 await expectReject('F01', '未知能力被拒绝', 'unity.no.such.capability', {}, 'capability_unsupported')
 await expectReject('F02', '路径逃逸被拒绝', 'unity.asset.read', { path: '/etc/passwd' }, 'path_escape')
 
+// ============ v27 能力抽查（图形/物理/UI Toolkit/输入/元数据/文档） ============
+/** 包/环境依赖能力：成功则断言；返回「依赖缺失」类错误码也算通过（环境缺失是合法结果）。 */
+async function expectPassOrUnavailable(id, name, capability, args, check) {
+  try {
+    const data = await call(capability, args)
+    let verdict = { pass: true }
+    try { verdict = await check(data) } catch (error) { verdict = { pass: false, reason: `check threw: ${error.message}` } }
+    record(id, name, verdict.pass, { data, verdict })
+    return data
+  } catch (error) {
+    const allowed = ['capability_unavailable', 'docs_unavailable', 'not_playing']
+    record(id, name, allowed.includes(error.code), { skipped: allowed.includes(error.code), error: error.message, code: error.code })
+    return null
+  }
+}
+await expectPass('G01', 'graphics.pipeline', 'unity.graphics.pipeline', {}, (d) => ({ pass: typeof d.pipeline === 'string' && Array.isArray(d.supported) }))
+await expectPassOrUnavailable('G02', 'graphics.volume.list', 'unity.graphics.volume.list', { limit: 10 }, (d) => ({ pass: Array.isArray(d.volumes) }))
+await expectPassOrUnavailable('G03', 'graphics.renderer_features', 'unity.graphics.renderer_features', { action: 'list' }, (d) => ({ pass: Array.isArray(d.renderers) }))
+await expectPass('G04', 'physics.collision_matrix', 'unity.physics.collision_matrix', { action: 'get' }, (d) => ({ pass: Array.isArray(d.layers) && d.layers.length === 32 }))
+await expectPass('G05', 'physics.joints', 'unity.physics.joints', { action: 'list' }, (d) => ({ pass: Array.isArray(d.joints) }))
+await expectPass('G06', 'uitk.uxml create', 'unity.uitk.uxml', { action: 'create', path: 'Assets/VerifyLive/live.uxml' }, (d) => ({ pass: d.created === true }))
+await expectPass('G07', 'tag.ensure', 'unity.tag.ensure', { name: 'VerifyTag' }, (d) => ({ pass: d.tag === 'VerifyTag' }))
+await expectPass('G08', 'layer.ensure', 'unity.layer.ensure', { name: 'VerifyLayer', index: 31 }, (d) => ({ pass: d.layer === 'VerifyLayer' && d.index === 31 }))
+await expectPass('G09', 'editor.set_active_tool', 'unity.editor.set_active_tool', { tool: 'move' }, (d) => ({ pass: /move/i.test(String(d.after)) }))
+await expectPassOrUnavailable('G10', 'docs.search', 'unity.docs.search', { query: 'Rigidbody', limit: 5 }, (d) => ({ pass: d.available === true && Array.isArray(d.results) }))
+await expectPass('G11', 'reflect.signature', 'unity.reflect.signature', { type: 'UnityEngine.Rigidbody', member: 'AddForce' }, (d) => ({ pass: Array.isArray(d.members) && d.members.some((m) => m.name === 'AddForce') }))
+await expectReject('G12', 'input.keyboard 非 PlayMode 拒绝', 'unity.input.keyboard', { action: 'press', key: 'space' }, 'not_playing')
+
 // ============ 审计修复回归抽查（AUD-CODE-001 / v0.0.9） ============
 await expectReject('F03', 'PlayMode 测试显式拒绝', 'unity.test.run', { mode: 'playmode' }, 'playmode_unsupported')
 await expectReject('F04', '非法 jobId 拒绝', 'unity.job.status', { jobId: '../instance' }, 'invalid_argument')

@@ -36,6 +36,12 @@ export const DEFAULT_DANGEROUS = Object.freeze([
   // 包管理会改写工程依赖并可能拉取远端包，默认关闭；build/bake 属常规编辑操作，默认开启。
   'unity.package.add',
   'unity.package.remove',
+  // v27：破坏工程级引用或推进物理世界的能力默认关闭。
+  // tag/layer 删除会让场景里已有引用变成 Undefined/未命名层，且没有 Undo 之外的恢复路径；
+  // physics.simulate 会推进世界状态（在 Edit Mode 下尤其容易留下意外位移），必须显式授权。
+  'unity.tag.remove',
+  'unity.layer.remove',
+  'unity.physics.simulate',
 ])
 
 /** 探针侧永久关闭的能力：即使 DSH 放行，探针也会拒绝。

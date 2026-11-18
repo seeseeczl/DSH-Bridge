@@ -61,7 +61,7 @@
   },
   "fitness": {
     "known_loc_exceptions": {
-      "note": "\u5df2\u6279\u51c6\u7684 LOC \u4f8b\u5916\uff0c\u5b9e\u4f53\u5728 docs/00-governance/architecture-exception-debt-register.md\uff1b\u6b64\u5904\u4ec5\u767b\u8bb0\u8def\u5f84\uff0c\u907f\u514d\u7b2c\u4e8c\u5957\u9608\u503c\u3002",
+      "note": "已批准的 LOC 例外，实体在 docs/00-governance/architecture-exception-debt-register.md；此处仅登记路径，避免第二套阈值。",
       "paths": [
         "packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl"
       ]

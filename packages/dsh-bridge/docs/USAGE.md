@@ -148,3 +148,100 @@ bridge_call {instance_id, capability, args_json}
 - **资产创建**：已存在文件需 `overwrite:true`，否则 `already_exists`；响应含 `created` / `overwritten`；写入 `Packages/com.dsh.bridge/**` 报 `path_denied`。
 - **场景**：路径必须工程内 + `.unity`；Single 模式遇未保存场景报 `scene_dirty`（`discardChanges:true` 显式丢弃）；失败抛 `not_found` / `io_error`。
 - **作业**：构建失败落 `failed`；PlayMode 测试报 `playmode_unsupported`；test 作业 30 分钟超时；非法 `jobId` 报 `invalid_argument`；`bake.navmesh` 返回 `jobId`。
+
+## 10. v0.0.10 新增能力（39 项）
+
+规格与完整参数见 `docs/02-design/v27-capability-parity.md`；能力清单见仓库根 `docs/01-architecture/capability-matrix.md`。
+
+### 图形（依赖 URP/HDRP 包；缺失返回 `capability_unavailable`）
+
+```jsonc
+{}                                                // unity.graphics.pipeline（管线检测）
+{ "action": "list", "limit": 20 }                 // unity.graphics.volume.list
+{ "target": { "path": "Global Volume" } }         // unity.graphics.volume.get（profile 参数）
+{ "target": { "path": "Global Volume" }, "component": "Bloom",
+  "parameters": [{ "name": "intensity", "value": 0.5 }] }   // unity.graphics.volume.set
+{ "name": "Global Volume", "path": "Assets/Settings/PostVolume.asset" }   // unity.graphics.volume.create
+{ "action": "list" }                              // unity.graphics.renderer_features（URP renderer data）
+{ "action": "set", "typeName": "MyFeature", "enabled": true }   // renderer_features 启停
+{ "action": "get" }                               // unity.graphics.post_processing
+{ "action": "list" } / { "action": "set", "target": { "path": "Probes" },
+  "positions": [[0,1,0],[1,1,0]] }                // unity.graphics.light_probes
+{ "action": "list" } / { "action": "set", "target": { "path": "Refl" },
+  "changes": { "intensity": 1.5, "resolution": 256 } }      // unity.graphics.reflection_probes
+{ "action": "start" }                             // unity.bake.light_probes（实际触发全场景烘焙，见返回 hint）
+{ "action": "bake", "target": { "path": "Refl" } }// unity.bake.reflection_probes
+```
+
+### 物理
+
+```jsonc
+{ "action": "list" }                              // unity.physics.joints
+{ "action": "add", "target": { "path": "Door" }, "type": "hinge" }   // 关节增删改查
+{ "action": "get" }                               // unity.physics.collision_matrix（已忽略层对）
+{ "action": "set", "layerA": "Player", "layerB": "Enemy", "ignore": true }
+{ "action": "create", "path": "Assets/Physics/Bouncy.physicMaterial" }   // unity.physics.material
+{ "target": { "path": "Ball" }, "changes": { "mass": 2, "useGravity": false } }   // unity.physics.body
+{ "target": { "path": "Ball" }, "action": "impulse", "vector": [0,5,0] }  // unity.physics.forces
+{ "action": "step", "steps": 10, "deltaTime": 0.02 }  // unity.physics.simulate（危险能力，默认关闭）
+{ "changes": { "gravity": [0,-9.81,0] } }          // unity.physics.2d.settings
+{ "target": { "path": "Ball2D" }, "changes": { "gravityScale": 0 } }  // unity.physics.2d.body
+{ "kind": "ray", "origin": [0,0], "direction": [1,0], "distance": 5 }  // unity.physics.2d.raycast
+```
+
+### UI Toolkit
+
+```jsonc
+{ "action": "create", "path": "Assets/UI/Main.uxml" }          // unity.uitk.uxml
+{ "action": "read", "path": "Assets/UI/Main.uxml" }            // 读取文本
+{ "action": "validate", "path": "Assets/UI/Main.uxml" }        // LoadAssetAtPath<VisualTreeAsset>
+{ "action": "query", "path": "Assets/UI/Main.uxml" }           // 元素 tag/name/class 摘要
+{ "action": "create", "path": "Assets/UI/Main.uss" }           // unity.uitk.uss
+{ "action": "create", "path": "Assets/UI/PanelSettings.asset" }// unity.uitk.panel_settings
+{ "action": "set", "path": "Assets/UI/PanelSettings.asset",
+  "changes": { "referenceResolution": [1920,1080] } }
+{ "action": "list" } / { "action": "tree", "target": { "path": "UI" } }   // unity.uitk.document
+```
+
+### Play Mode 输入（需 `com.unity.inputsystem`；非 Play Mode 返回 `not_playing`）
+
+```jsonc
+{ "action": "click", "position": [100, 200], "button": "left" }   // unity.input.mouse
+{ "action": "press", "key": "space" }                              // unity.input.keyboard
+{ "text": "hello", "charDelayMs": 10 }                             // unity.input.type_text
+{ "action": "list" } / { "action": "add", "layout": "Gamepad" }    // unity.input.device（虚拟设备）
+{ "steps": [ { "op": "key", "key": "space" }, { "op": "wait", "ms": 100 },
+             { "op": "mouse", "action": "click", "position": [10,10] } ] }   // unity.input.sequence
+{ "action": "status", "seqId": "..." }                             // 查询序列进度
+```
+
+### 编辑器元数据
+
+```jsonc
+{}                                                // unity.tag.list
+{ "name": "Interactable", "applyTo": "Door" }     // unity.tag.ensure（幂等 + 可选赋值）
+{ "name": "Interactable" }                        // unity.tag.remove（危险能力，默认关闭）
+{}                                                // unity.layer.list
+{ "name": "Interactable", "index": 8 }            // unity.layer.ensure（8-31；0-7 内置不可改）
+{ "index": 8 }                                    // unity.layer.remove（危险能力，默认关闭）
+{ "tool": "move" }                                // unity.editor.set_active_tool
+```
+
+### 官方文档与签名（防幻觉）
+
+```jsonc
+{}                                                // unity.docs.search
+{ "query": "Rigidbody", "limit": 10 }             // unity.docs.search
+{ "symbol": "Rigidbody.AddForce" }                // unity.docs.get（签名 + 描述 + 示例）
+{ "type": "UnityEngine.Rigidbody", "member": "AddForce" }   // unity.reflect.signature（真实程序集签名）
+```
+
+`bridge_docs` 是 DSH 工具，**不需要运行中的实例**：
+
+```jsonc
+{ "query": "Rigidbody" }                          // 搜索本机引擎官方文档
+{ "symbol": "Rigidbody.AddForce" }                // 读取页面（签名/描述/示例）
+{ "symbol": "Rigidbody", "engine": "unity" }      // 指定引擎（auto/unity/tuanjie）
+```
+
+边界：`unity.docs.*` 从引擎安装目录的 `Documentation/<lang>/ScriptReference` 读取（只读、离线）；文档缺失时返回 `docs_unavailable`。`unity.reflect.signature` 读的是运行中程序集，包含工程自定义类型，比文档更贴近实际。

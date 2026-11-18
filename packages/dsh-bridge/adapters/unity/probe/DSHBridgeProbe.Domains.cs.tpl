@@ -119,6 +119,15 @@ namespace DSHBridge
             d["gpuMemoryMB"] = (long)SystemInfo.graphicsMemorySize;
             d["shaderLevel"] = (long)SystemInfo.graphicsShaderLevel;
             d["targetFrameRate"] = (long)Application.targetFrameRate;
+            // v27：运行时渲染计数（UnityStats 是 internal，走 Graphics.cs 的反射 helper）。
+            // 取不到时显式标记 statsUnavailable，而不是省略字段让调用方误以为为 0。
+            var statsUnavailable = false;
+            long graphicsStat;
+            if (GraphicsTryRenderStat("batches", out graphicsStat)) d["batches"] = graphicsStat; else statsUnavailable = true;
+            if (GraphicsTryRenderStat("drawCalls", out graphicsStat)) d["drawCalls"] = graphicsStat; else statsUnavailable = true;
+            if (GraphicsTryRenderStat("triangles", out graphicsStat)) d["triangles"] = graphicsStat; else statsUnavailable = true;
+            if (GraphicsTryRenderStat("vertices", out graphicsStat)) d["vertices"] = graphicsStat; else statsUnavailable = true;
+            if (statsUnavailable) d["statsUnavailable"] = true;
             return d;
         }
 

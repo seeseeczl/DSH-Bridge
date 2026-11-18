@@ -29,13 +29,13 @@ test('插件模块导出契约', () => {
   assert.equal(typeof plugin.apply, 'function')
 })
 
-test('apply 注册 10 个工具且 schema 完整', async () => {
+test('apply 注册 11 个工具且 schema 完整', async () => {
   const { ctx, registered } = mockContext()
   await plugin.apply(ctx, { auditPath: null })
-  assert.equal(registered.length, 10)
+  assert.equal(registered.length, 11)
   const names = registered.map((t) => t.name).sort()
   assert.deepEqual(names, [
-    'bridge_call', 'bridge_events', 'bridge_install', 'bridge_knowledge_delete', 'bridge_knowledge_list',
+    'bridge_call', 'bridge_docs', 'bridge_events', 'bridge_install', 'bridge_knowledge_delete', 'bridge_knowledge_list',
     'bridge_knowledge_read', 'bridge_knowledge_save', 'bridge_preinstall', 'bridge_targets', 'bridge_uninstall',
   ])
   for (const tool of registered) {
@@ -89,4 +89,22 @@ test('配置解析：环境变量与显式配置优先级', () => {
     if (previous === undefined) delete process.env.DSH_BRIDGE_ALLOW_DANGEROUS
     else process.env.DSH_BRIDGE_ALLOW_DANGEROUS = previous
   }
+})
+
+test('bridge_docs 无参数时返回结构化错误而不是抛异常', async () => {
+  const { ctx, registered } = mockContext()
+  await plugin.apply(ctx, { auditPath: null })
+  const tool = registered.find((t) => t.name === 'bridge_docs')
+  const value = await tool.execute({}, {})
+  assert.equal(value.source, 'local-docs')
+  assert.match(JSON.stringify(value), /invalid_args/)
+})
+
+test('bridge_docs 支持无实例的符号检索（本机无文档时也返回结构化结果）', async () => {
+  const { ctx, registered } = mockContext()
+  await plugin.apply(ctx, { auditPath: null })
+  const tool = registered.find((t) => t.name === 'bridge_docs')
+  const value = await tool.execute({ symbol: 'Rigidbody', limit: 3 }, {})
+  assert.equal(value.source, 'local-docs')
+  assert.ok(['search', 'doc', 'error'].includes(value.mode), `unexpected mode: ${value.mode}`)
 })

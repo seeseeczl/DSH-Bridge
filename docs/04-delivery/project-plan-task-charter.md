@@ -65,6 +65,7 @@ kickoff_completion: complete
 | TASK-0026 | FR-0010, FR-0011, MOD-0001 | 主题知识库与工程预植入的需求登记与验收对账 | FR 基线 | `packages/dsh-bridge/core/knowledge.mjs`, `core/preinstall.mjs` | `transport/**` | lead / 2026-11-17 | REG-KNOWLEDGE-001、REG-INSTALL-001 | 知识库路径越界 | project-plan-task-charter.md | done |
 | TASK-0027 | FR-0012, FR-0013, MOD-0003 | 后台唤醒与事件/拒绝可观测的需求登记与验收对账 | FR 基线 | `packages/dsh-bridge/adapters/unity/wake.mjs`, `transport/maintenance.mjs` | `packages/dsh-bridge/index.mjs` | lead / 2026-11-17 | REG-RECOVERY-001、REG-EVENT-001、REG-SEC-003 | 唤醒后未恢复前台 | project-plan-task-charter.md | done |
 | TASK-0028 | BUG-0001, MOD-0001/MOD-0002/MOD-0003 | 修复 instance.json 的 bootId 指向不存在通道目录：探针复用前校验目录齐全 + 心跳前自愈；DSH 侧新增 channel_missing 状态与 inspectBootDirs | BUG-0001 | `packages/dsh-bridge/transport/channel.mjs`, `transport/mailbox.mjs`, `core/discovery.mjs`, `core/lifecycle.mjs`, `core/bridge.mjs`, `adapters/unity/probe/DSHBridgeProbe.cs.tpl` | `Assets/**`（禁止在仓库内写工程文件） | — / lead / 2026-11-18 | REG-CHANNEL-001、REG-CHANNEL-002、REG-CHANNEL-003；`npm run verify` 退出码 0 | 目录缺失被误判为 ready | project-plan-task-charter.md | done |
+| TASK-0032 | FR-0015, MOD-0003/MOD-0005 | v27 能力补齐：图形/物理/UI Toolkit/Play Mode 输入/编辑器元数据/文档签名 39 项能力与 `bridge_docs` | FR-0015 | `packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.*.cs.tpl`, `packages/dsh-bridge/tools/**`, `tests/unity-probe/**` | `Assets/**`（禁止在仓库内写工程文件） | lead / 2026-11-19 | REG-PARITY-001/002/003、REG-DOCS-001；`npm run verify` 退出码 0 | 能力清单漂移或危险闸门单侧遗漏 | project-plan-task-charter.md | done |
 
 ## 验证、风险与回滚
 
@@ -88,4 +89,3 @@ kickoff_completion: complete
 - [x] 已填写 14 张原子任务卡，并为每张任务给出验证和停止条件。
 - [x] 已登记里程碑、依赖、风险、回滚和审计日期。
 - [x] 完成后将 front matter 的 `kickoff_completion` 改为 `complete`。
-

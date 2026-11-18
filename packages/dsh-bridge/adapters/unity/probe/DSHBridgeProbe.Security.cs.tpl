@@ -109,7 +109,7 @@ namespace DSHBridge
         }
 
         // ===== 授权闸门（AA-OPT-001 / AUD-CODE-001 P1-5）=====
-        // 与 DSH 侧 DEFAULT_DANGEROUS 完全一致的 13 项危险能力，在探针侧同样默认关闭：
+        // 与 DSH 侧 DEFAULT_DANGEROUS 完全一致的 16 项危险能力，在探针侧同样默认关闭：
         // 只有「安装时注入的源码快照」或 argv 整机旁路能放行，绕过 DSH 直接写 inbox 也一样会被拒绝。
         // 闸门必须发生在 Execute 之前：被拒绝的请求 executionState=not-started，调用方可安全重试。
         //
@@ -240,6 +240,20 @@ namespace DSHBridge
             if (cap == "unity.scene.open") return SceneOpen(args);
             if (cap == "unity.scene.save") return SceneSave(args);
             if (cap == "unity.selection.set") return SelectionSet(args);
+            // v27 能力补齐：按域拆分的分发器，返回 null 表示本域不认领该能力。
+            // 新增能力时只改对应域文件，避免所有域并行时争用本文件。
+            var domainResult = TryGraphics(cap, args);
+            if (domainResult != null) return domainResult;
+            domainResult = TryPhysics(cap, args);
+            if (domainResult != null) return domainResult;
+            domainResult = TryUiToolkit(cap, args);
+            if (domainResult != null) return domainResult;
+            domainResult = TryInputPlay(cap, args);
+            if (domainResult != null) return domainResult;
+            domainResult = TryEditorMeta(cap, args);
+            if (domainResult != null) return domainResult;
+            domainResult = TryDocs(cap, args);
+            if (domainResult != null) return domainResult;
             throw new KnownError("capability_unsupported", "未知能力: " + cap);
         }
     }

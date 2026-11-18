@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { renderProbeFiles } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 import { assertProbeToolchain, CSC_COMMAND } from './toolchain.mjs'
+import { collectExtraStubs } from './extra-stubs.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -35,9 +36,11 @@ export async function checkProbeCompiles() {
     probePaths.push(filePath)
   }
   await writeFile(stubsPath, await readFile(join(here, 'unity-stubs.cs'), 'utf8'), 'utf8')
+  // 域级 stub：每个域一个独立文件，避免并行开发时改同一个共享 stub。
+  const extraStubs = await collectExtraStubs()
   const result = await run(CSC_COMMAND, [
     '-nologo', '-define:UNITY_EDITOR', '-target:library', '-warn:0',
-    `-out:${outPath}`, stubsPath, ...probePaths,
+    `-out:${outPath}`, stubsPath, ...extraStubs.files, ...probePaths,
   ])
   return { ...result, dir }
 }

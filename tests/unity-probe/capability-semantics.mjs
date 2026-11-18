@@ -7,10 +7,11 @@ import { execFile, spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { renderProbeFiles } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 import { assertProbeToolchain, CSC_COMMAND, resolveMonoCommand } from './toolchain.mjs'
+import { collectExtraStubs } from './extra-stubs.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const run = promisify(execFile)
@@ -18,7 +19,32 @@ const run = promisify(execFile)
 /** 由 Node 侧覆盖的输出文件名；每次运行独立，避免读到脏数据。 */
 const RESULT_FILE = 'semantics-results.json'
 
-function harnessSource() {
+/**
+ * 域级用例模块（tests/unity-probe/cases/*.mjs）：默认导出 C# 语句字符串。
+ * 片段会被拼接进 harness 的 `Main`，因此可以直接使用 `results` 局部变量与
+ * `Run/RunAuthorized/Args/Dict/List` 等 helper。约定见 cases/README.md。
+ */
+async function loadDomainCases() {
+  const dir = join(here, 'cases')
+  let entries = []
+  try {
+    entries = (await readdir(dir)).filter((name) => name.endsWith('.mjs')).sort()
+  } catch {
+    return ''
+  }
+  const parts = []
+  for (const name of entries) {
+    const module = await import(`${pathToFileURL(join(dir, name)).href}?v=${Date.now()}`)
+    const snippet = module.default ?? module.cases
+    if (typeof snippet !== 'string' || snippet.trim() === '') {
+      throw new Error(`域级用例模块 ${name} 必须默认导出非空 C# 片段字符串`)
+    }
+    parts.push(`// ---- 域级用例：${name} ----\n${snippet.trim()}`)
+  }
+  return parts.join('\n\n')
+}
+
+function harnessSource(extraCases = '') {
   return `// 自动生成的驱动：仅调用探针 public/static 入口，不修改探针实现。
 using System;
 using System.Collections.Generic;
@@ -163,6 +189,9 @@ public static class Harness
             try { Submit("unity.code.execute", Args(new object[] { "code", "return " + repeat + ";" })); }
             catch (System.Exception) { }
         }
+
+        // ===== 域级能力用例（tests/unity-probe/cases/*.mjs 注入）=====
+__DOMAIN_CASES_PLACEHOLDER__
 
         var payload = new Dictionary<string, object>();
         payload["writes"] = DSHBridgeStub.FileWrites;
@@ -419,7 +448,7 @@ public static class Harness
         sink.Add(row);
     }
 }
-`
+`.replace('__DOMAIN_CASES_PLACEHOLDER__', extraCases)
 }
 
 async function compile(workDir) {
@@ -428,6 +457,8 @@ async function compile(workDir) {
   const stubsPath = join(workDir, 'semantics-stubs.cs')
   const harnessPath = join(workDir, 'harness.cs')
   const exePath = join(workDir, 'semantics.exe')
+  const extraStubs = await collectExtraStubs()
+  const extraCases = await loadDomainCases()
   // 探针的 Execute 是 private static；测试副本里注入一个公开转发入口，模板本身保持 private。
   const anchor = '        static object Execute(string cap, Dictionary<string, object> args)'
   // 拆分后 Execute 位于 Security 文件；跨 partial class 文件（同一类）注入照样可用。
@@ -554,10 +585,10 @@ async function compile(workDir) {
     probePaths.push(target)
   }
   await writeFile(stubsPath, await readFile(join(here, 'semantics-stubs.cs'), 'utf8'), 'utf8')
-  await writeFile(harnessPath, harnessSource(), 'utf8')
+  await writeFile(harnessPath, harnessSource(extraCases), 'utf8')
   const { stdout, stderr } = await run(CSC_COMMAND, [
     '-nologo', '-define:UNITY_EDITOR', '-target:exe', '-warn:0',
-    `-out:${exePath}`, stubsPath, ...probePaths, harnessPath,
+    `-out:${exePath}`, stubsPath, ...extraStubs.files, ...probePaths, harnessPath,
   ]).catch((error) => ({ stdout: error.stdout ?? '', stderr: error.stderr ?? String(error) }))
   return { exePath, output: `${stdout}${stderr}` }
 }

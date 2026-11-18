@@ -3,6 +3,7 @@ import { INSTANCE_ID } from './schema.mjs'
 import { loadDefineTool } from './resolve.mjs'
 import { createPreinstallTool } from './bridge-preinstall.mjs'
 import { createKnowledgeTools } from './bridge-knowledge.mjs'
+import { createDocsTool } from './bridge-docs.mjs'
 import { createLifecycleTools } from './bridge-lifecycle.mjs'
 
 // DSH 工具面：少量通用工具 + 运行时能力清单，扩展新软件不需要新增工具。
@@ -163,5 +164,6 @@ export async function createBridgeTools({ bridge, defineTool }) {
     ...createLifecycleTools(tool, bridge),
     createPreinstallTool(tool, bridge),
     ...createKnowledgeTools(tool, bridge),
+    createDocsTool(tool),
   ]
 }

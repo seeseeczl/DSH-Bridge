@@ -379,3 +379,38 @@
 - **WHEN** 文档描述 `requestHash` 与四元组校验
 - **THEN** 明确它们只防「误配对」，不构成身份认证
 - **AND** 说明文件邮箱协议在同机同用户模型下无法提供认证，真隔离只能来自 OS 层
+
+### Requirement: v27 能力扩展（图形 / 物理 / UI Toolkit / 输入 / 元数据 / 文档）
+
+探针 SHALL 在 v27 中提供 39 项扩展能力，覆盖图形、物理、UI Toolkit、Play Mode 输入、编辑器元数据与文档签名六组；
+所有能力 SHALL 由对应域的分发器认领，且能力清单与 DSH 侧 `UNITY_CAPABILITIES` 完全一致（116 项）。
+
+#### Scenario: 能力可被分发与调用
+
+- **WHEN** 调用方对声明为 116 项之一的 v27 能力发起 `bridge_call`
+- **THEN** 探针的域分发器（`TryGraphics` / `TryPhysics` / `TryUiToolkit` / `TryInputPlay` / `TryEditorMeta` / `TryDocs`）认领并执行该能力
+- **AND** 未知能力仍返回 `capability_unsupported`
+
+#### Scenario: 缺失依赖时确定性降级
+
+- **WHEN** 图形能力依赖的 URP/HDRP 包不存在，或输入能力依赖的 Input System 包不存在，或本机未安装引擎文档
+- **THEN** 返回 `capability_unavailable` / `docs_unavailable` 并附 `hint`
+- **AND** 探针不得崩溃、不得返回伪造的成功结果
+
+#### Scenario: Play Mode 输入约束
+
+- **WHEN** 在非 Play Mode 调用 `unity.input.*`
+- **THEN** 返回 `not_playing`
+- **AND** 输入序列（`unity.input.sequence`）的进度状态只在探针进程内有效；域重载后查询返回 `sequence_lost`
+
+#### Scenario: 新增危险能力默认关闭
+
+- **WHEN** 未显式授权调用 `unity.tag.remove` / `unity.layer.remove` / `unity.physics.simulate`
+- **THEN** DSH 侧返回 `capability_disabled`，探针侧对绕过 DSH 的请求返回 `capability_denied`
+- **AND** 探针 `_reflectCapabilities` 与 DSH `DEFAULT_DANGEROUS`（16 项）由单测强制双向一致
+
+#### Scenario: 文档与签名可离线查询
+
+- **WHEN** 调用方使用 `bridge_docs`（无需实例）或 `unity.docs.search/get`（经实例）
+- **THEN** 返回本机引擎安装内官方 ScriptReference 的检索结果与页面正文，`source` 标明 `local-docs`
+- **AND** `unity.reflect.signature` 返回运行中程序集的 C# 风格签名（含重载与参数类型），供调用前核对

@@ -25,6 +25,13 @@ export const PROBE_TEMPLATE_FILES = Object.freeze([
   { file: 'DSHBridgeProbe.Assets.cs', template: 'DSHBridgeProbe.Assets.cs.tpl' },
   { file: 'DSHBridgeProbe.Jobs.cs', template: 'DSHBridgeProbe.Jobs.cs.tpl' },
   { file: 'DSHBridgeProbe.Domains.cs', template: 'DSHBridgeProbe.Domains.cs.tpl' },
+  // v27 能力补齐：每个域一个 partial 文件，独立分发器（TryXxx），并行开发互不冲突。
+  { file: 'DSHBridgeProbe.Graphics.cs', template: 'DSHBridgeProbe.Graphics.cs.tpl' },
+  { file: 'DSHBridgeProbe.Physics.cs', template: 'DSHBridgeProbe.Physics.cs.tpl' },
+  { file: 'DSHBridgeProbe.UiToolkit.cs', template: 'DSHBridgeProbe.UiToolkit.cs.tpl' },
+  { file: 'DSHBridgeProbe.InputPlay.cs', template: 'DSHBridgeProbe.InputPlay.cs.tpl' },
+  { file: 'DSHBridgeProbe.EditorMeta.cs', template: 'DSHBridgeProbe.EditorMeta.cs.tpl' },
+  { file: 'DSHBridgeProbe.Docs.cs', template: 'DSHBridgeProbe.Docs.cs.tpl' },
   { file: 'DSHBridgeProbe.Execution.cs', template: 'DSHBridgeProbe.Execution.cs.tpl' },
   { file: 'DSHBridgeProbe.MonoCompiler.cs', template: 'DSHBridgeProbe.MonoCompiler.cs.tpl' },
 ])

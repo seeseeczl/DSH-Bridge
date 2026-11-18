@@ -37,7 +37,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 - 安装：写包 → 激活 → 等编译完成 → 恢复（实测 5～10 秒就绪）；
 - 调用：若实例在后台且心跳陈旧，先唤醒再发请求，完成后恢复。
 
-## Unity 能力（77 项）
+## Unity 能力（116 项）
 
 | 分组 | 能力 |
 | --- | --- |
@@ -57,7 +57,16 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 | 长任务作业 | `unity.job.list` `unity.job.status` `unity.job.cancel`（持久化到 `Library/DSHBridge/jobs/`，域重载后可查，未完成的标 `interrupted`） |
 | 垂直域 | `unity.graphics.quality/render_settings/stats` `unity.profiler.status/set` `unity.physics.settings/raycast` `unity.animation.info/set` `unity.vfx.particles/control` `unity.ui.canvases` `unity.probuilder.state` `unity.sprite.info` `unity.texture.generate` |
 | 原生交互 | `unity.window.list` `unity.window.focus` `unity.input.send`（受管层：编辑器窗口与输入注入；系统级模态对话框需 OS 自动化，不在纯 C# 探针范围） |
+| 图形（v0.0.10） | `unity.graphics.pipeline` `graphics.volume.list/get/set/create` `graphics.renderer_features` `graphics.post_processing` `graphics.light_probes` `graphics.reflection_probes` `unity.bake.light_probes` `unity.bake.reflection_probes` |
+| 物理（v0.0.10） | `unity.physics.joints` `physics.collision_matrix` `physics.material` `physics.body` `physics.forces` `physics.simulate`（默认关闭） `physics.2d.settings/body/raycast` |
+| UI Toolkit（v0.0.10） | `unity.uitk.uxml` `uitk.uss` `uitk.panel_settings` `uitk.document` |
+| Play Mode 输入（v0.0.10） | `unity.input.mouse` `input.keyboard` `input.type_text` `input.device` `input.sequence`（需 `com.unity.inputsystem`） |
+| 编辑器元数据（v0.0.10） | `unity.tag.list/ensure/remove` `unity.layer.list/ensure/remove` `unity.editor.set_active_tool`（remove 默认关闭） |
+| 文档与签名（v0.0.10） | `unity.reflect.signature`（程序集精确签名） `unity.docs.search/get`（本机官方 ScriptReference） |
 | 编辑器 | `unity.menu.execute`（默认关闭，需 `allowDangerous`） `unity.playmode.set` `unity.asset.refresh` |
+
+> v0.0.10 的能力规格见 `docs/02-design/v27-capability-parity.md`；完整矩阵与三方对比见 `docs/01-architecture/capability-matrix.md`。
+> 查官方 API 文档优先用 `bridge_docs`（无需实例在线）：`bridge_docs {"query":"Rigidbody"}` / `{"symbol":"Rigidbody.AddForce"}`。
 
 `unity.api.invoke` 是覆盖长尾的兜底：给定句柄或类型名，可以调用任意方法/属性/字段；返回值会自动变成可复用的句柄。
 
@@ -92,7 +101,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 
 ## 安全边界
 
-传输层：通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转），审计覆盖全部 10 个工具。
+传输层：通道目录权限 `0700`，配对使用 `instanceId + bootId + nonce + requestId` 四元组；危险能力默认拒绝并写入审计日志（`~/.dsh/bridge/audit.log`，0600，超 8 MiB 轮转），审计覆盖全部 11 个工具。
 
 执行层（探针内，见 `DETAIL.md`）：
 
@@ -120,7 +129,7 @@ core/       Bridge 编排、身份、生命周期、预植入、知识库
 transport/  文件邮箱（零端口）+ 通道维护
 adapters/   适配器契约 + unity（发现/安装/探针/唤醒/扫描）+ blender 骨架
 safety/     危险能力、路径校验、审计
-tools/      10 个 DSH 工具
+tools/      11 个 DSH 工具
 ```
 
 ## 平台支持

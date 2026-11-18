@@ -5,7 +5,7 @@
 // 与两个既有验收的分工：
 //   npm run verify          —— 离线契约/单元/文档门禁
 //   npm run verify:live     —— 直连探针的能力矩阵（绕过 DSH 插件层）
-//   npm run verify:tools    —— 本脚本：走 DSH 插件的 10 个工具（bridge_targets/call/…）
+//   npm run verify:tools    —— 本脚本：走 DSH 插件的 11 个工具（bridge_targets/call/docs/…）
 //
 // 用法：node scripts/verify-dsh-tool-surface.mjs <projectPath> [--json]
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -70,7 +70,7 @@ async function runTool(name, args = {}) {
 
 // ---------- 0) 探针就绪 ----------
 const raw = JSON.parse(await readFile(INSTANCE_FILE, 'utf8'))
-record('T00', '探针就绪（直读 instance.json）', raw.probeVersion === PROBE_VERSION && raw.capabilities?.length === 77, {
+record('T00', '探针就绪（直读 instance.json）', raw.probeVersion === PROBE_VERSION && raw.capabilities?.length === 116, {
   probe: raw.probeVersion, caps: raw.capabilities?.length, sourceHash: raw.sourceHash,
 })
 
@@ -83,7 +83,7 @@ try {
     instances: value.instances.map((i) => `${i.instanceId}[${i.status}]`), capabilities: value.capabilities?.length, adapters: value.adapters,
   })
   const unityCaps = (value.capabilities ?? []).filter((item) => String(item.capability ?? '').startsWith('unity.'))
-  record('T02', 'bridge_targets 暴露 77 项 Unity 能力（含危险标记）', unityCaps.length === 77, {
+  record('T02', 'bridge_targets 暴露 116 项 Unity 能力（含危险标记）', unityCaps.length === 116, {
     unity: unityCaps.length, total: value.capabilities?.length,
   })
 } catch (error) {
@@ -165,7 +165,7 @@ try {
 try {
   const { value } = await runTool('bridge_install', { instance_id: instanceId, dry_run: true })
   const csFiles = value.files.filter((file) => file.relativePath.endsWith('.cs'))
-  record('T09', 'bridge_install dry_run（多文件、不落盘）', value.dryRun === true && value.files.length === 10 && csFiles.length === 9, {
+  record('T09', 'bridge_install dry_run（多文件、不落盘）', value.dryRun === true && value.files.length === 16 && csFiles.length === 15, {
     files: value.files.length, cs: csFiles.length, changed: value.changed, probeVersion: value.probeVersion,
   })
 } catch (error) {
@@ -179,6 +179,18 @@ try {
 } catch (error) {
   // 不同版本返回结构可能不同：只要工具可用（不抛 schema 错误）即通过
   record('T10', 'bridge_preinstall 预览', error.code !== 'invalid_output', { error: error.message, code: error.code })
+}
+
+// ---------- 10) bridge_docs（不依赖实例的离线文档检索） ----------
+try {
+  const { value } = await runTool('bridge_docs', { symbol: 'Rigidbody', limit: 3 })
+  const hasDoc = ['doc', 'search'].includes(value.mode) && JSON.stringify(value).includes('Rigidbody')
+  // 本机未安装 Documentation 时 mode=error 也是合法结果：工具必须给出结构化说明而不是抛异常。
+  record('T12', 'bridge_docs 离线检索官方文档', value.source === 'local-docs' && (hasDoc || value.mode === 'error'), {
+    mode: value.mode, engine: value.engine?.vendor, count: value.count ?? value.results?.length, error: value.error?.code,
+  })
+} catch (error) {
+  record('T12', 'bridge_docs 离线检索官方文档', false, { error: error.message, code: error.code })
 }
 
 // ---------- 9) bridge_knowledge 全链路 ----------

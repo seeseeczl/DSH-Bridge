@@ -6,6 +6,7 @@ import { renderProbeFiles, readProbeTemplateText } from '../../packages/dsh-brid
 /** 渲染全部 partial 文件并拼接（跨文件断言用）。 */
 const renderAll = (options) => renderProbeFiles(options).files.map((file) => file.content).join('\n')
 import { UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
+import { DEFAULT_DANGEROUS } from '../../packages/dsh-bridge/safety/policy.mjs'
 
 // 探针源码形态检查（AA-OPT-013）。
 //
@@ -104,7 +105,18 @@ test('探针声明的能力集合与 UNITY_CAPABILITIES 完全一致', async () 
   const probeCaps = [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()
   const adapterCaps = [...UNITY_CAPABILITIES].sort()
   assert.deepEqual(probeCaps, adapterCaps, '探针与适配器能力清单漂移')
-  assert.ok(adapterCaps.length >= 77, '能力面不应回退')
+  assert.ok(adapterCaps.length >= 116, 'v27 能力面不应回退（116 项）')
+})
+
+// v27：危险能力闸门必须与 DSH 侧 DEFAULT_DANGEROUS 完全一致。
+// 单侧漏加会让「DSH 默认关闭」变成假安全：绕过 DSH 直接写 inbox 就能执行。
+test('探针危险能力闸门与 DEFAULT_DANGEROUS 完全一致（双向）', async () => {
+  const source = readProbeTemplateText()
+  const match = source.match(/_reflectCapabilities = new string\[\] \{([\s\S]*?)\};/)
+  assert.ok(match, '找不到探针 _reflectCapabilities 数组')
+  const probeDanger = [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()
+  const policyDanger = [...DEFAULT_DANGEROUS].sort()
+  assert.deepEqual(probeDanger, policyDanger, '探针闸门与 policy.DEFAULT_DANGEROUS 漂移')
 })
 
 // 审计修复（AUD-CODE-001）：P0/P1/P2 关键机制必须在源码里可验证。
@@ -151,4 +163,22 @@ test('审计修复：危险能力闸门扩展到全部危险能力（13 项）',
   ]) {
     assert.match(source, new RegExp(`_reflectCapabilities[\\s\\S]*${capability.replace(/\./g, '\\.')}`), `危险能力闸门缺少 ${capability}`)
   }
+})
+
+// v27：每个域一个分发器，且 Execute 必须调用全部六个；分发里的能力名必须都在声明的 116 项内。
+test('v27 域分发器齐备、被 Execute 调用且不越出能力清单', async () => {
+  const source = readProbeTemplateText()
+  for (const domain of ['Graphics', 'Physics', 'UiToolkit', 'InputPlay', 'EditorMeta', 'Docs']) {
+    assert.match(source, new RegExp(`static Dictionary<string, object> Try${domain}\\(string cap`), `缺少 Try${domain} 分发器`)
+    assert.match(source, new RegExp(`domainResult = Try${domain}\\(cap, args\\)`), `Execute 未调用 Try${domain}`)
+  }
+  const dispatched = [...source.matchAll(/cap == "(unity\.[a-z0-9.]+)"/g)].map((m) => m[1])
+  const unknown = [...new Set(dispatched)].filter((cap) => !UNITY_CAPABILITIES.includes(cap))
+  assert.deepEqual(unknown, [], '存在未声明为能力的固定分发：' + unknown.join(', '))
+})
+
+test('v27 渲染统计扩展在取不到时显式标记', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /GraphicsTryRenderStat\("batches"/)
+  assert.match(source, /statsUnavailable/)
 })

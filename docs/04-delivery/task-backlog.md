@@ -70,3 +70,4 @@ evidence: []
 | --- | --- | --- | --- | --- |
 | TASK-0030 | FR-0014 | 完成 | 探针 v24：截图 + 帧序列/脚本编辑 + validate/生产管线（构建/测试/包管理/烘焙）/垂直域/原生交互/作业化/菜单解禁 | REG-SHOT-001/002、REG-MENU-001、REG-SCRIPT-001/002、REG-PROD-001、REG-JOB-001、REG-NATIVE-001 |
 | TASK-0031 | EXC-0001 | 完成 | 探针拆为 9 文件 partial class 包（ADR-0003），安装器/模板/测试适配多文件；REL-0005 | `npm test` 141 绿 + 多文件真机 57/57 |
+| TASK-0032 | FR-0015 | 完成 | v27 能力补齐：39 项能力（图形 11/物理 9/UI Toolkit 4/输入 5/元数据 7/文档签名 3）+ `bridge_docs` 离线文档工具；探针 15 文件、能力面 116 项 | REG-PARITY-001/002/003、REG-DOCS-001 |

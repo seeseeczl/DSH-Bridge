@@ -30,3 +30,6 @@ FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0003,TASK-0030,REG-SHOT-001/REG
 FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0005,TASK-0030,REG-TOOL-001,2026-11-18,REL-0004,lead,能力补全的 DSH 工具面输出契约与授权一致性
 FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0001,TASK-0030,REG-NATIVE-001/REG-PROD-001/REG-JOB-001,2026-11-18,REL-0004,lead,作业持久化与窗口/输入受管交互
 
+FR-0015,functional,implemented,ARCH-REQ-0001,MOD-0003,TASK-0032,REG-PARITY-001/REG-PARITY-002/REG-PARITY-003,2026-11-19,REL-0007,lead,v27 探针能力补齐：图形/物理/UI Toolkit/Play Mode 输入/编辑器元数据/文档签名
+FR-0015,functional,implemented,ARCH-REQ-0001,MOD-0005,TASK-0032,REG-DOCS-001,2026-11-19,REL-0007,lead,bridge_docs 离线官方文档检索工具（不依赖实例）
+FR-0015,functional,implemented,ARCH-REQ-0001,MOD-0001,TASK-0032,REG-PARITY-003,2026-11-19,REL-0007,lead,危险能力闸门扩展到 16 项并新增双向一致性测试

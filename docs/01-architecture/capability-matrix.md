@@ -2,20 +2,20 @@
 id: CAP-0001
 type: capability-matrix
 status: approved
-version: 0.1.0
+version: 0.2.0
 created_at: 2026-11-18T23:55:00+08:00
 owner: lead
-related: [FR-0014, REL-0004, ARCH-REQ-0001]
-supersedes: []
-evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl, docs/04-delivery/REL-0004.md]
+related: [FR-0014, REL-0004, REL-0007, ARCH-REQ-0001, ARCH-0002]
+supersedes: [CAP-0001@0.1.0]
+evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl, docs/04-delivery/REL-0007.md, docs/02-design/v27-capability-parity.md]
 ---
 
 # DSH-Bridge｜能力矩阵（对标 MCP / Codely Bridge）
 
 > 口径：DSH 侧能力清单以 `packages/dsh-bridge/adapters/unity/index.mjs` 的 `UNITY_CAPABILITIES` 为准（与探针 `_capabilities` 由单测强制一致）；MCP 侧以 CoplayDev/unity-mcp 的 50 个工具为主要参照；Codely 侧以 `cn.tuanjie.codely.bridge` 1.0.81 的 19~21 个命令族为参照。
-> 验证环境：团结引擎 2022.3.62t7（macOS，OSXEditor）。「真机」列标明该能力在真机验收中的批次。
+> 验证环境：团结引擎 2022.3.62t7（macOS，OSXEditor）。「真机」列标明该能力在真机验收中的批次；`v27 离线` 表示已通过 csc 编译 + mono 语义用例，尚未做实机回归（如实标注，不冒充真机）。
 
-**能力总数：77 项｜探针版本：v24｜传输：工程内文件邮箱（零端口、无 MCP server）**
+**能力总数：116 项｜探针版本：v27｜DSH 工具：11 个｜传输：工程内文件邮箱（零端口、无 MCP server）**
 
 ## 传输与安装形态对比
 
@@ -23,7 +23,7 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 | --- | --- | --- | --- |
 | 通信 | 工程内文件邮箱（`Library/DSHBridge/`），无监听端口 | TCP/HTTP server（如 8080） | TCP 25916（动态分配） |
 | 目标端安装 | C# partial class 源码包（embedded package，可整体删除） | UPM 包 + Python server | UPM 包 + 三平台原生库 |
-| 暴露形态 | DSH 工具（`bridge_*` 10 个） | MCP 标准协议 | 无公开协议（仅自家 Codely 生态） |
+| 暴露形态 | DSH 工具（`bridge_*` 11 个） | MCP 标准协议 | 无公开协议（仅自家 Codely 生态） |
 | 多实例 | `instanceId` + 文件邮箱隔离 | 端口/实例名路由 | 端口动态分配 |
 
 ## 能力矩阵
@@ -101,7 +101,7 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 | **垂直域** | | | | |
 | `unity.graphics.quality` | 见 DETAIL | manage_graphics | — | v18 |
 | `unity.graphics.render_settings` | 见 DETAIL | manage_graphics | — | v18 |
-| `unity.graphics.stats` | 见 DETAIL | manage_graphics | — | v18 |
+| `unity.graphics.stats` | 见 DETAIL | manage_graphics | — | v18 / v27 扩展 |
 | `unity.profiler.status` | 见 DETAIL | manage_profiler | — | v18 |
 | `unity.profiler.set` | 见 DETAIL | manage_profiler | — | v18 |
 | `unity.physics.settings` | 见 DETAIL | manage_physics | — | v18 |
@@ -114,6 +114,51 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 | `unity.probuilder.state` | 见 DETAIL | manage_probuilder | — | v19 |
 | `unity.sprite.info` | 见 DETAIL | manage_sprite | — | v19 |
 | `unity.texture.generate` | 见 DETAIL | manage_texture | — | v19 |
+| **图形（v27 补齐）** | | | | |
+| `unity.graphics.pipeline` | 见 DETAIL | manage_graphics (pipeline) | — | v27 离线 |
+| `unity.graphics.volume.list` | 见 DETAIL | manage_graphics (volume) | — | v27 离线 |
+| `unity.graphics.volume.get` | 见 DETAIL | manage_graphics (volume/get) | — | v27 离线 |
+| `unity.graphics.volume.set` | 见 DETAIL | manage_graphics (volume/set) | — | v27 离线 |
+| `unity.graphics.volume.create` | 见 DETAIL | manage_graphics (volume/create) | — | v27 离线 |
+| `unity.graphics.renderer_features` | 见 DETAIL | manage_graphics (renderer features) | — | v27 离线 |
+| `unity.graphics.post_processing` | 见 DETAIL | manage_graphics (post-processing) | — | v27 离线 |
+| `unity.graphics.light_probes` | 见 DETAIL | manage_graphics (lightprobe) | — | v27 离线 |
+| `unity.graphics.reflection_probes` | 见 DETAIL | manage_graphics (reflectionprobe) | — | v27 离线 |
+| `unity.bake.light_probes` | 见 DETAIL | manage_graphics (bake) | manage_bake | v27 离线 |
+| `unity.bake.reflection_probes` | 见 DETAIL | manage_graphics (bake) | manage_bake | v27 离线 |
+| **物理（v27 补齐）** | | | | |
+| `unity.physics.joints` | 见 DETAIL | manage_physics (joints) | — | v27 离线 |
+| `unity.physics.collision_matrix` | 见 DETAIL | manage_physics (collision matrix) | — | v27 离线 |
+| `unity.physics.material` | 见 DETAIL | manage_physics (material) | — | v27 离线 |
+| `unity.physics.body` | 见 DETAIL | manage_physics (body) | — | v27 离线 |
+| `unity.physics.forces` | 见 DETAIL | manage_physics (forces) | — | v27 离线 |
+| `unity.physics.simulate` | 见 DETAIL | manage_physics (simulate) | — | v27 离线 |
+| `unity.physics.2d.settings` | 见 DETAIL | manage_physics (2D settings) | — | v27 离线 |
+| `unity.physics.2d.body` | 见 DETAIL | manage_physics (2D body) | — | v27 离线 |
+| `unity.physics.2d.raycast` | 见 DETAIL | manage_physics (2D raycast) | — | v27 离线 |
+| **UI Toolkit（v27 补齐）** | | | | |
+| `unity.uitk.uxml` | 见 DETAIL | manage_ui (UXML) | unity_ui_toolkit | v27 离线 |
+| `unity.uitk.uss` | 见 DETAIL | manage_ui (USS) | unity_ui_toolkit | v27 离线 |
+| `unity.uitk.panel_settings` | 见 DETAIL | manage_ui (PanelSettings) | unity_ui_toolkit | v27 离线 |
+| `unity.uitk.document` | 见 DETAIL | manage_ui (visual tree) | unity_ui_toolkit | v27 离线 |
+| **Play Mode 输入（v27 补齐）** | | | | |
+| `unity.input.mouse` | 见 DETAIL | — | manage_input (mouse) | v27 离线 |
+| `unity.input.keyboard` | 见 DETAIL | — | manage_input (keyboard) | v27 离线 |
+| `unity.input.type_text` | 见 DETAIL | — | manage_input (type_text) | v27 离线 |
+| `unity.input.device` | 见 DETAIL | — | manage_input (virtual device) | v27 离线 |
+| `unity.input.sequence` | 见 DETAIL | — | manage_input (sequence) | v27 离线 |
+| **编辑器元数据（v27 补齐）** | | | | |
+| `unity.tag.list` | 见 DETAIL | manage_editor (tags) | manage_editor (tags) | v27 离线 |
+| `unity.tag.ensure` | 见 DETAIL | manage_editor (tags) | manage_editor (tags) | v27 离线 |
+| `unity.tag.remove` | 见 DETAIL | manage_editor (tags) | manage_editor (tags) | v27 离线 |
+| `unity.layer.list` | 见 DETAIL | manage_editor (layers) | manage_editor (layers) | v27 离线 |
+| `unity.layer.ensure` | 见 DETAIL | manage_editor (layers) | manage_editor (layers) | v27 离线 |
+| `unity.layer.remove` | 见 DETAIL | manage_editor (layers) | manage_editor (layers) | v27 离线 |
+| `unity.editor.set_active_tool` | 见 DETAIL | manage_editor (active tool) | manage_editor | v27 离线 |
+| **文档与签名（v27 补齐）** | | | | |
+| `unity.reflect.signature` | 见 DETAIL | unity_reflect | — | v27 离线 |
+| `unity.docs.search` | 见 DETAIL | unity_docs | — | v27 离线 |
+| `unity.docs.get` | 见 DETAIL | unity_docs | — | v27 离线 |
 | **原生交互（受管层）** | | | | |
 | `unity.window.list` | 见 DETAIL | — | manage_editor (get_windows) | v22 |
 | `unity.window.focus` | 见 DETAIL | — | manage_window_bridge | v22 |
@@ -127,6 +172,7 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 - **事务性批处理**：`unity.api.batch` 共享 Undo 组 + 失败回滚 + `onError` 补偿（MCP batch_execute 明确非事务）。
 - **安装期能力授权快照 + 审计**：运行期无法提权；危险能力默认拒绝。
 - **探针可逆**：embedded package 单目录删除即卸载；只写 `.git/info/exclude`。
+- **离线文档工具 `bridge_docs`**（v27）：不依赖运行中的实例，直接检索本机引擎安装里的官方 ScriptReference；MCP 的 `unity_docs` 需要 MCP server 在线。
 
 ## 已知边界
 
@@ -135,11 +181,15 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 - **测试运行依赖 test-framework**：`unity.test.run` 运行时动态编译桥接（预定义程序集无法引用其 asmdef）；工程需安装 `com.unity.test-framework`。
 - **PlayMode 测试显式拒绝**（v0.0.9）：PlayMode 会触发域重载、桥接回调无法跨域存活，`unity.test.run` 只支持 EditMode；PlayMode 请用 Test Runner 窗口或编辑器 CLI `-runTests`。
 - **NavMesh 烘焙作业化**（v0.0.9）：`unity.bake.navmesh` 返回 `jobId`，按作业轮询结果（`job.result.baked`）。
+- **图形能力依赖 URP/HDRP 包**（v27）：Volume / Renderer Feature / 后处理通过反射访问包类型；内置管线或未装 URP 时返回 `capability_unavailable`，不伪称成功。
+- **LightProbe / ReflectionProbe 烘焙无公开的"只烘探针" API**（v27）：`unity.bake.light_probes` 实际触发 `Lightmapping.BakeAsync()`（全场景），`unity.bake.reflection_probes` 走 `RenderProbe()`；返回带 `hint` 说明真实语义。
+- **Play Mode 输入依赖 `com.unity.inputsystem`**（v27）：未安装或仍用旧 Input Manager 时返回 `capability_unavailable`；`unity.input.sequence` 的状态存在探针内存里，域重载后返回 `sequence_lost`。
+- **本地文档可能缺失**（v27）：部分安装器不装 `Documentation/`；`unity.docs.*` 返回 `docs_unavailable`，`bridge_docs` 返回空引擎列表与说明。
 - **协议生态**：不实现 MCP 协议导出（项目第一性原理决策，见 ADR-0001 与优化计划）；仅供 DSH 调用。
 
-## 三方对比（2026-11-19，DSH-Bridge v0.0.9 / 探针 26）
+## 三方对比（2026-11-19，DSH-Bridge v0.0.10 / 探针 27）
 
-> 外部口径：Codely = 团结 Codely CLI Unity Tools 文档（18 工具：17 核心 + refresh，默认端口 25916）；MCP = CoplayDev/unity-mcp v10.3.0（50 个工具入口，工具内再分 action）。DSH = 本仓库 77 项 capability。
+> 外部口径：Codely = 团结 Codely CLI Unity Tools 文档（18 工具：17 核心 + refresh，默认端口 25916）；MCP = CoplayDev/unity-mcp v10.3.0（50 个工具入口，工具内再分 action）。DSH = 本仓库 116 项 capability。
 > 说明：三者粒度不同（DSH 是细粒度 capability；Codely/MCP 是「工具 + action」），下表按**能力点**近似对齐，不追求精确等量。
 
 ### 形态对比
@@ -147,41 +197,41 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 | 维度 | DSH-Bridge | Codely Bridge | MCP for Unity |
 | --- | --- | --- | --- |
 | 传输 | 工程内文件邮箱，零端口、零 server | TCP（默认 25916） | MCP 协议（stdio/HTTP + Python server） |
-| 目标端安装 | 9 文件 partial class embedded package，整目录可删 | UPM 包（cn.tuanjie.codely.bridge） | UPM 包 + Python/uv server |
-| 接口形态 | DSH 插件 77 个 capability（10 个 bridge_* 工具） | 18 个工具，约 120 个 action | 50 个工具，约 250+ 个 action |
+| 目标端安装 | 15 文件 partial class embedded package，整目录可删 | UPM 包（cn.tuanjie.codely.bridge） | UPM 包 + Python/uv server |
+| 接口形态 | DSH 插件 116 个 capability（11 个 bridge_* 工具） | 18 个工具，约 120 个 action | 50 个工具，约 250+ 个 action |
 | 多实例 | instanceId + 邮箱天然隔离 | 单工程配置文件 `.com-unity-codely.json` | set_active_instance 显式路由 |
 | 依赖 | 仅目标编辑器；探针零第三方依赖 | 需要 Codely CLI | 需要 Python 3.10+ / uv / MCP client |
 | 卸载 | 删除包目录 + `.git/info/exclude` 条目 | 包管理器移除 | 包 + server 移除 |
 
 ### 覆盖对比（按能力域）
 
-| 域 | DSH-Bridge（77 项中的对应部分） | Codely（action 数） | MCP（action 数） | 差距判断 |
+| 域 | DSH-Bridge（116 项中的对应部分） | Codely（action 数） | MCP（action 数） | 差距判断 |
 | --- | --- | --- | --- | --- |
 | 观测/检索 | status/console/hierarchy/scene.list/asset.find/object.find/search.content/asset.read | editor.get_state/console.get/scene.get_hierarchy/asset.search/get_info（全量） | manage_scene.get_hierarchy/find_gameobjects/find_in_file/read_console/manage_asset.search | DSH 缺编译摘要与控制台增量 token、分页 cursor |
-| 编辑器控制 | playmode.set/selection.set/menu.execute/window.list/focus | unity_editor 26 actions（编译流水线/等待空闲/标签/层/激活工具/窗口/选区） | manage_editor（play/pause/stop/tags/layers/deploy）+ refresh_unity | **DSH 缺编译流水线与等待、标签/层管理、激活工具** |
+| 编辑器控制 | playmode.set/selection.set/menu.execute/window.list/focus + **tag/layer list-ensure-remove + set_active_tool** | unity_editor 26 actions（编译流水线/等待空闲/标签/层/激活工具/窗口/选区） | manage_editor（play/pause/stop/tags/layers/deploy）+ refresh_unity | **标签/层/激活工具已补齐**；仍缺编译流水线与等待 |
 | 场景 | scene.list/open/save + 校验/未保存保护 | unity_scene（ensure_open/ensure_saved/create/load/save/hierarchy/get_build_settings） | manage_scene（create/load/save/hierarchy/get_build_settings/scene_view_frame） | DSH 缺 ensure_* 幂等与 build_settings/scene_view_frame |
 | GameObject/组件 | create/delete/rename/duplicate/setActive/setParent/setTransform + component.add/remove/set/get | unity_gameobject 17 actions（含 create_batch/edit_batch/ensure_*） | manage_gameobject/manage_components（含 batch/look_at/move_relative） | DSH 缺批量编辑、ensure_*、look_at/move_relative |
 | Prefab | create/instantiate/open/save/close（含 dirty 保护） | gameobject.saveAsPrefab + prefab stage（无独立 prefab 工具） | manage_prefabs（get_info/hierarchy/modify_contents） | **DSH 缺 headless 编辑与 hierarchy 查询** |
 | 资产 | create/read/rename/move/delete/duplicate/importer.get/set | unity_asset 20 actions（ensure_has_meta/ensure_meta_integrity/import/import_asset/batch） | manage_asset（search/import/create/modify/batch）+ manage_prefabs | DSH 缺 meta 完整性/导入控制/批量 |
 | 材质/Shader | material.get/set（含 SRP 默认 shader 选择） | unity_shader 6 actions（SRP 检测/材质 shader 映射/CRUD） | manage_material/manage_shader（assign/renderer color/modes） | **DSH 缺 shader 管理、材质分配** |
 | 纹理 | texture.generate（4 种图案）+ sprite.info | unity_asset（纹理创建在 asset_type） | manage_texture（pattern/gradient/色板） | 近似；DSH 图案类型略少 |
-| UI | ui.canvases | unity_ui_toolkit（PanelSettings/UXML/USS） | manage_ui（UXML/USS/PanelSettings/visual tree） | **DSH 缺 UI Toolkit 资产与视觉树** |
+| UI | ui.canvases + **uitk.uxml/uss/panel_settings/document** | unity_ui_toolkit（PanelSettings/UXML/USS） | manage_ui（UXML/USS/PanelSettings/visual tree） | **UI Toolkit 资产已补齐**；视觉树只读，缺"编辑 UI 元素" |
 | 脚本编辑 | get_sha/apply_edits/validate/asset.create(script) | unity_script 9 actions（结构 op：replace_method/insert_method/regex_replace/applyMode/level） | create_script/script_apply_edits/apply_text_edits/validate_script/delete_script/find_in_file | **DSH 缺结构化方法级 op 与多级 validate** |
 | 视觉反馈 | screenshot.capture/sequence（PNG 帧序列，落 Library） | unity_screenshot 4 模式 + SceneView GIF | manage_camera/manage_scene（include_image base64、surround/orbit 批量、positioned） | **DSH 缺内联 base64、多角度批量、GIF** |
-| 输入 | input.send（编辑器窗口事件：key/mouse/scroll，delivered） | unity_input 14 actions（PlayMode 鼠标/键盘/type_text/虚拟设备/sequence） | manage_physics 之外无独立输入工具 | **DSH 缺 PlayMode 输入模拟与虚拟设备** |
+| 输入 | input.send（编辑器窗口事件）+ **input.mouse/keyboard/type_text/device/sequence（Play Mode）** | unity_input 14 actions（PlayMode 鼠标/键盘/type_text/虚拟设备/sequence） | manage_physics 之外无独立输入工具 | **Play Mode 输入已补齐**；依赖 Input System 包 |
 | 测试 | test.run（EditMode，异步作业，超时/取消） | 无独立测试工具（workflow.compile_and_validate） | run_tests/get_test_job（filter：names/groups/categories/assemblies） | **DSH 优于 Codely；弱于 MCP 的过滤维度** |
 | 构建 | build.start（异步作业，产物定位） | 无构建工具 | manage_build | **DSH 领先 Codely；与 MCP 接近** |
 | 包管理 | package.list/add/remove | unity_package（install/remove/list/wait） | manage_packages（12 actions：registry/embed/search/dependency） | **DSH 缺 registry/embed/search/依赖检查** |
-| 烘焙 | bake.navmesh（作业）/bake.lighting（作业，归属校验） | unity_bake（navmesh/lighting/wait/clear/scope） | manage_graphics bake + manage_profiler | DSH 缺 wait/clear/scope |
-| 图形 | graphics.quality/render_settings/stats（3 项） | 无独立图形工具（asset 内材质） | manage_graphics 33 actions（volume/post-processing/renderer features/pipeline/bake/lightprobe/reflectionprobe/stats） | **DSH 差距最大域之一** |
-| 物理 | physics.settings/raycast（2 项） | 无物理工具 | manage_physics 30+ actions（joints/collision matrix/2D/forces/simulate/material） | **DSH 差距最大域之一** |
+| 烘焙 | bake.navmesh（作业）/bake.lighting（作业）/ **bake.light_probes / bake.reflection_probes** | unity_bake（navmesh/lighting/wait/clear/scope） | manage_graphics bake + manage_profiler | 探针烘焙已补齐；仍缺 wait/clear/scope 统一控制 |
+| 图形 | quality/render_settings/stats + **pipeline/volume×4/renderer_features/post_processing/light_probes/reflection_probes（11 项）** | 无独立图形工具（asset 内材质） | manage_graphics 33 actions（volume/post-processing/renderer features/pipeline/bake/lightprobe/reflectionprobe/stats） | **已对齐主路径**；参数深度与版本容错仍在收敛 |
+| 物理 | settings/raycast + **joints/collision_matrix/material/body/forces/simulate/2d×3（9 项）** | 无物理工具 | manage_physics 30+ actions（joints/collision matrix/2D/forces/simulate/material） | **已对齐主路径**；2D 关节细分少于 MCP |
 | 动画 | animation.info/set | 无动画工具 | manage_animation（多 action） | DSH 缺状态机/片段级操作 |
 | VFX | vfx.particles/control | 无 | 无独立（manage_editor?） | DSH 相对领先或无对手 |
 | ProBuilder | probuilder.state（只读） | 无 | manage_probuilder 40+ actions（mesh 编辑） | **DSH 差距最大域** |
-| UI Toolkit | 无 | unity_ui_toolkit（4 actions） | manage_ui（7 actions） | 缺口 |
+| UI Toolkit | uitk.uxml/uss/panel_settings/document | unity_ui_toolkit（4 actions） | manage_ui（7 actions） | **已补齐资产与只读视觉树**；缺元素级编辑 |
 | 作业/异步 | job.list/status/cancel + 六态 + 域重载恢复 + 持久化 | op_id + wait_*（无持久化/取消） | get_test_job/manage_packages.status（无通用作业） | **DSH 独特优势（跨域重载可查/取消）** |
 | 状态管理 | editor.status + events（编译/PlayMode/错误事件流） | UnityCurrentState + state_delta + 观察失效 | MCP resources（project/info/scene/volumes 等） | DSH 有事件流；缺状态增量与资源订阅 |
-| 文档/API 反射 | reflect.invoke/api.members（运行时反射，可执行） | 无（有 execute_csharp_script） | unity_reflect/unity_docs（类型/签名/官方文档，防幻觉） | **DSH 缺文档库；DSH 反射可执行更强** |
+| 文档/API 反射 | reflect.invoke/api.members + **reflect.signature/docs.search/docs.get + bridge_docs** | 无（有 execute_csharp_script） | unity_reflect/unity_docs（类型/签名/官方文档，防幻觉） | **文档与签名已补齐**；DSH 反射可执行更强 |
 | 自定义工具 | 无（用 code.execute 替代） | execute_custom_tool | execute_custom_tool + resources | 缺口 |
 | 工作流压缩 | 无（api.batch 事务性批量可部分替代） | unity_workflow（init_session/compile_and_validate/checkpoint/install_package_and_validate） | batch_execute（非事务）+ 文档化工作流 | 缺口（可用 batch 组合） |
 | C# 执行 | code.execute（mono/Roslyn 双后端） | execute_csharp_script（Roslyn） | execute_custom_tool/execute_csharp_script? | 三家均有；DSH 双后端 |
@@ -191,13 +241,14 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 - **零端口/零 server**：不监听、不依赖 Python/Node，整包可删；Codely 需要 TCP 25916，MCP 需要 Python server。
 - **事务性批量**：`api.batch` 共享 Undo 组 + 失败回滚 + onError 补偿；MCP batch_execute 明确非事务，Codely 批量是"0 匹配提前停止"。
 - **作业体系**：构建/测试/包/烘焙/navmesh 统一 job（持久化、跨域重载可查、取消、六态）；MCP 只有测试 job，Codely 只有 op_id+wait（无持久化）。
-- **危险能力治理**：默认拒绝 + 安装期源码授权快照 + 探针侧 13 项闸门 + 审计；MCP 无授权模型，Codely 只有菜单黑名单与 PlayMode 写保护。
+- **危险能力治理**：默认拒绝 + 安装期源码授权快照 + 探针侧闸门 + 审计；MCP 无授权模型，Codely 只有菜单黑名单与 PlayMode 写保护。
 - **截图不污染仓库**：产物落 `Library/DSHBridge/artifacts/` 并自动清理；MCP/Codely 默认写 `Assets/`。
 - **测试运行与构建**：Codely 没有独立测试/构建工具；DSH 两者都有（作业化）。
 - **多实例隔离**：instanceId + 邮箱；Codely 单工程配置文件。
 - **事务性与可逆安装**：探针可整体删除，`.git/info/exclude` 不污染 `.gitignore`。
+- **离线文档检索**：`bridge_docs` 不需要实例/网络，直接用本机引擎安装里的官方文档。
 
 ### DSH 主要差距（按可补齐 vs 架构性）
 
-- **可补齐（实现缺口）**：图形 volume/post-processing/renderer features、物理 joints/collision matrix/2D/simulate、ProBuilder mesh 编辑、UI Toolkit、Shader 管理、材质分配、PlayMode 输入模拟、截图 base64/多角度批量、包 registry/embed/search、编译流水线控制与等待、标签/层管理、ensure_* 幂等族、结构化脚本 op、文档/API 查询库、自定义工具注册。
+- **可补齐（实现缺口）**：ProBuilder mesh 编辑、Shader 管理、材质分配、截图内联 base64/多角度批量/GIF、包 registry/embed/search/依赖检查、编译流水线控制与等待、scene/gameobject 的 ensure_* 幂等族、结构化脚本 op、自定义工具注册、UI 元素级编辑。
 - **架构性（短期不做）**：实时串流（需原生层）、系统级模态对话框（需 OS 自动化）、MCP 协议兼容（项目决策：只面向 DSH）、Windows/Linux 平台（未实现）。

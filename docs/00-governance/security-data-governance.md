@@ -40,7 +40,9 @@ evidence: []
 - 危险能力清单（与 `packages/dsh-bridge/safety/policy.mjs` 的 `DEFAULT_DANGEROUS` 保持一致，AA-OPT-001）：
   `unity.reflect.invoke`、`unity.api.invoke`、`unity.api.members`、`unity.api.batch`、`unity.asset.refresh`、
   `unity.asset.delete`、`unity.asset.move`、`unity.asset.rename`、`unity.asset.duplicate`、`unity.importer.set`、
-  `unity.menu.execute`、`unity.package.add`、`unity.package.remove`；**默认全部关闭**。
+  `unity.menu.execute`、`unity.package.add`、`unity.package.remove`、`unity.tag.remove`、`unity.layer.remove`、
+  `unity.physics.simulate`；**默认全部关闭**。v27 追加三项的理由：删除 tag/layer 会让场景已有引用变成
+  Undefined/未命名层且难以恢复；`physics.simulate` 会推进物理世界，在 Edit Mode 下留下意外位移。
 - 探针永久关闭（`PROBE_BLOCKED`）：当前为空。用户决策（2026-11-18）：能力与自由优先，`unity.menu.execute`
   从永久封禁降级为可授权危险能力，风险由调用方在 `allowDangerous` 中显式承担。
 - `unity.code.execute` 是**唯一默认开启**的高权能力（等价 MCP `execute_code`，ASE 编辑流程依赖它）。

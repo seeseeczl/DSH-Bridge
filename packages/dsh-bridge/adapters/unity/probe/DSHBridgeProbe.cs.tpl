@@ -41,8 +41,8 @@ namespace DSHBridge
         const double InitRetryInterval = 30.0;
 
         // ===== 安全边界（AA-OPT-001/002/003）=====
-        // 与 DSH 侧 safety/policy.mjs 的 DEFAULT_DANGEROUS 保持**完全一致**（13 项）：
-        // 它们要么能改变宿主状态（资产破坏/导入设置/包依赖/菜单执行/强制刷新），
+        // 与 DSH 侧 safety/policy.mjs 的 DEFAULT_DANGEROUS 保持**完全一致**（16 项）：
+        // 它们要么能改变宿主状态（资产破坏/导入设置/包依赖/菜单执行/强制刷新/工程级标签层删除/物理推进），
         // 要么提供常驻反射执行面，因此即使请求绕过 DSH 直接写进 inbox，探针也会拒绝。
         // 真正的用户授权在 DSH 侧；探针只认安装时渲染进 _grantedCapabilities 的源码快照，
         // 或 argv 整机旁路，运行期无法通过写 Library 下的文件自行提权。
@@ -52,7 +52,9 @@ namespace DSHBridge
             "unity.reflect.invoke", "unity.api.invoke", "unity.api.members", "unity.api.batch",
             "unity.asset.refresh", "unity.asset.delete", "unity.asset.move", "unity.asset.rename",
             "unity.asset.duplicate", "unity.importer.set", "unity.menu.execute",
-            "unity.package.add", "unity.package.remove"
+            "unity.package.add", "unity.package.remove",
+            // v27：工程级破坏操作与物理世界推进，同样默认关闭（与 policy.mjs 逐项对应）。
+            "unity.tag.remove", "unity.layer.remove", "unity.physics.simulate"
         };
         // 探针侧永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
         // 用户决策（2026-11-18）：能力与自由优先，unity.menu.execute 从永久封禁降级为
@@ -145,7 +147,32 @@ namespace DSHBridge
             // 补充：截图序列（录屏帧序列）与脚本编译校验。
             "unity.screenshot.sequence", "unity.script.validate",
             // 通用反射执行面扩展：批量事务与进程内代码执行（等价 MCP execute_code）。
-            "unity.api.batch", "unity.code.execute"
+            "unity.api.batch", "unity.code.execute",
+            // ===== v27 能力补齐（对标 MCP for Unity / Codely 的深水区）=====
+            // 图形：管线检测 / Volume 与后处理 / Renderer Feature / 探针 / 烘焙。
+            "unity.graphics.pipeline",
+            "unity.graphics.volume.list", "unity.graphics.volume.get",
+            "unity.graphics.volume.set", "unity.graphics.volume.create",
+            "unity.graphics.renderer_features", "unity.graphics.post_processing",
+            "unity.graphics.light_probes", "unity.graphics.reflection_probes",
+            "unity.bake.light_probes", "unity.bake.reflection_probes",
+            // 物理：关节 / 碰撞矩阵 / 物理材质 / 刚体 / 力 / 模拟 / 2D。
+            "unity.physics.joints", "unity.physics.collision_matrix",
+            "unity.physics.material", "unity.physics.body", "unity.physics.forces",
+            "unity.physics.simulate",
+            "unity.physics.2d.settings", "unity.physics.2d.body", "unity.physics.2d.raycast",
+            // UI Toolkit：UXML / USS / PanelSettings / UIDocument。
+            "unity.uitk.uxml", "unity.uitk.uss",
+            "unity.uitk.panel_settings", "unity.uitk.document",
+            // Play Mode 输入：鼠标 / 键盘 / 文本 / 虚拟设备 / 序列。
+            "unity.input.mouse", "unity.input.keyboard", "unity.input.type_text",
+            "unity.input.device", "unity.input.sequence",
+            // 编辑器元数据：tag / layer 的 list-ensure-remove + 激活工具。
+            "unity.tag.list", "unity.tag.ensure", "unity.tag.remove",
+            "unity.layer.list", "unity.layer.ensure", "unity.layer.remove",
+            "unity.editor.set_active_tool",
+            // 文档与签名（防幻觉）：官方 ScriptReference 检索 + 程序集精确签名。
+            "unity.reflect.signature", "unity.docs.search", "unity.docs.get"
         };
 
         static DSHBridgeProbe()

@@ -93,3 +93,5 @@ evidence: []
 | 2026-11-19T00:20:00+08:00 | USAGE-0001 | 新增能力使用指南（docs/USAGE.md）与真机验收脚本 scripts/verify-live-capabilities.mjs（34/34 通过，含延迟基准 p50=86ms/p95=168ms） | lead |  | packages/dsh-bridge/docs/USAGE.md |
 | 2026-11-19T00:35:00+08:00 | TOOLS-0001 | 新增 DSH 工具面端到端验收（scripts/verify-dsh-tool-surface.mjs，13/13 通过）：真实插件 apply() + mock 运行时 + 真实探针 v25，覆盖 10 个工具与危险能力默认拒绝 | lead |  | scripts/verify-dsh-tool-surface.mjs |
 | 2026-11-19T01:00:00+08:00 | REL-0006 | AUD-CODE-001 修复发布 v0.0.9（探针 26）：P0/P1/P2 全部修复，7 个并行修复 agent 分工 + Lead 收口；离线门禁与真机回归通过 | lead |  | docs/04-delivery/REL-0006.md |
+| 2026-11-19T01:35:00+08:00 | FR-0015 / ARCH-0002 | v27 能力补齐：探针 15 文件、能力面 77 → 116（图形 11/物理 9/UI Toolkit 4/输入 5/元数据 7/文档签名 3）；危险能力 16 项并新增双向一致性测试；DSH 新增 bridge_docs（11 工具） | lead |  | docs/01-architecture/capability-matrix.md |
+| 2026-11-19T01:35:00+08:00 | REL-0007 | 发布 v0.0.10（探针 27）：7 个域并行实现 + Lead 收口；离线编译/语义/单测/文档门禁全绿；真机批次待补 | lead |  | docs/04-delivery/REL-0007.md |

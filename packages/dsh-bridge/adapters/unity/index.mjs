@@ -18,7 +18,7 @@ import { withWake } from './wake.mjs'
 import { backlog, sweepEvents } from '../../transport/maintenance.mjs'
 import { installProbe, probePaths, uninstallProbe } from './installer.mjs'
 
-export const PROBE_VERSION = '26'
+export const PROBE_VERSION = '27'
 
 export const UNITY_CAPABILITIES = Object.freeze([
   'unity.editor.status',
@@ -112,6 +112,52 @@ export const UNITY_CAPABILITIES = Object.freeze([
   // 只有整段编译执行才能保持 Undo 组与 AssetDatabase 刷新时序一致。
   'unity.api.batch',
   'unity.code.execute',
+  // ===== v27 能力补齐（对标 MCP for Unity / Codely 的深水区）=====
+  // 图形：管线检测 / Volume 与后处理 / Renderer Feature / 探针 / 烘焙。
+  'unity.graphics.pipeline',
+  'unity.graphics.volume.list',
+  'unity.graphics.volume.get',
+  'unity.graphics.volume.set',
+  'unity.graphics.volume.create',
+  'unity.graphics.renderer_features',
+  'unity.graphics.post_processing',
+  'unity.graphics.light_probes',
+  'unity.graphics.reflection_probes',
+  'unity.bake.light_probes',
+  'unity.bake.reflection_probes',
+  // 物理：关节 / 碰撞矩阵 / 物理材质 / 刚体 / 力 / 模拟 / 2D。
+  'unity.physics.joints',
+  'unity.physics.collision_matrix',
+  'unity.physics.material',
+  'unity.physics.body',
+  'unity.physics.forces',
+  'unity.physics.simulate',
+  'unity.physics.2d.settings',
+  'unity.physics.2d.body',
+  'unity.physics.2d.raycast',
+  // UI Toolkit：UXML / USS / PanelSettings / UIDocument。
+  'unity.uitk.uxml',
+  'unity.uitk.uss',
+  'unity.uitk.panel_settings',
+  'unity.uitk.document',
+  // Play Mode 输入：鼠标 / 键盘 / 文本 / 虚拟设备 / 序列。
+  'unity.input.mouse',
+  'unity.input.keyboard',
+  'unity.input.type_text',
+  'unity.input.device',
+  'unity.input.sequence',
+  // 编辑器元数据：tag / layer 的 list-ensure-remove + 激活工具。
+  'unity.tag.list',
+  'unity.tag.ensure',
+  'unity.tag.remove',
+  'unity.layer.list',
+  'unity.layer.ensure',
+  'unity.layer.remove',
+  'unity.editor.set_active_tool',
+  // 文档与签名（防幻觉）：官方 ScriptReference 检索 + 程序集精确签名。
+  'unity.reflect.signature',
+  'unity.docs.search',
+  'unity.docs.get',
 ])
 
 export function createUnityAdapter({ adapterId = 'unity' } = {}) {
