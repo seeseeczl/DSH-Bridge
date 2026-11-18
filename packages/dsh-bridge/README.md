@@ -37,7 +37,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 - 安装：写包 → 激活 → 等编译完成 → 恢复（实测 5～10 秒就绪）；
 - 调用：若实例在后台且心跳陈旧，先唤醒再发请求，完成后恢复。
 
-## Unity 能力（76 项）
+## Unity 能力（77 项）
 
 | 分组 | 能力 |
 | --- | --- |
@@ -53,7 +53,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 | 导入设置 | `unity.importer.get/set`（纹理/模型/音频） |
 | 视觉 | `unity.screenshot.capture`（GameView / SceneView / 指定相机 → PNG，落 `Library/DSHBridge/artifacts/`）；`unity.screenshot.sequence`（定间隔帧序列，录屏的帧序列等价物） |
 | 脚本编辑 | `unity.script.get_sha` `unity.script.apply_edits`（SHA 乐观锁 + 1-based 行列 patch）；`unity.script.validate`（mono-mcs 编译校验，逐条诊断） |
-| 生产管线 | `unity.build.start` `unity.bake.navmesh` `unity.bake.lighting` `unity.package.list`（`unity.package.add/remove` 默认关闭） |
+| 生产管线 | `unity.build.start` `unity.test.run` `unity.bake.navmesh` `unity.bake.lighting` `unity.package.list`（`unity.package.add/remove` 默认关闭） |
 | 长任务作业 | `unity.job.list` `unity.job.status` `unity.job.cancel`（持久化到 `Library/DSHBridge/jobs/`，域重载后可查，未完成的标 `interrupted`） |
 | 垂直域 | `unity.graphics.quality/render_settings/stats` `unity.profiler.status/set` `unity.physics.settings/raycast` `unity.animation.info/set` `unity.vfx.particles/control` `unity.ui.canvases` `unity.probuilder.state` `unity.sprite.info` `unity.texture.generate` |
 | 原生交互 | `unity.window.list` `unity.window.focus` `unity.input.send`（受管层：编辑器窗口与输入注入；系统级模态对话框需 OS 自动化，不在纯 C# 探针范围） |
@@ -83,7 +83,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
-- 测试运行（TestRunnerApi）暂未提供专用能力：它需要 asmdef 引用 test-framework 程序集，而单文件探针编译在预定义程序集内（实测引用 `UnityEditor.TestTools` 直接编译失败）；需要时可由调用方用 `unity.code.execute` 执行测试调用代码。
+- `unity.test.run` 走「运行时动态编译桥接」：探针在预定义程序集内无法直接引用 test-framework（asmdef），因此运行时定位 `Library/ScriptAssemblies/UnityEditor.TestRunner.dll` 并动态编译一段实现 `ICallbacks` 的桥接代码启动 TestRunnerApi；**需要工程已安装 `com.unity.test-framework` 且编译完成**。
 - 传输基于文件轮询（约 80ms），单次调用延迟通常 100–300ms。
 - 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）、`unity.menu.execute`、资产破坏性能力与包增删（`unity.package.add/remove`）默认关闭，需 `allowDangerous` 显式开启（用户决策：能力与自由优先，风险由调用方承担）。
 - 本机信任模型：同用户进程可读取通道身份文件；配对校验防的是跨用户与误投递，不是同用户恶意进程。

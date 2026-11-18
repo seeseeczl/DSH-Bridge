@@ -106,7 +106,7 @@ namespace DSHBridge
             "unity.script.get_sha", "unity.script.apply_edits",
             // 生产管线与长任务作业（能力补全第 3/6 项）：构建 / 包管理 / 烘焙 / 作业查询取消。
             "unity.job.list", "unity.job.status", "unity.job.cancel",
-            "unity.build.start",
+            "unity.build.start", "unity.test.run",
             "unity.package.list", "unity.package.add", "unity.package.remove",
             "unity.bake.navmesh", "unity.bake.lighting",
             // 垂直域第一批（能力补全第 4 项）：图形 / Profiler / 物理。
@@ -322,6 +322,7 @@ namespace DSHBridge
                     SweepStaleOutbox();
                 }
                 JobTick();
+                PollTestJobs();
                 if (_scanning || now < _nextScan) return;
                 _nextScan = now + ScanInterval;
                 Poll();
@@ -893,6 +894,7 @@ namespace DSHBridge
             if (cap == "unity.job.list") return JobList(args);
             if (cap == "unity.job.status") return JobStatus(args);
             if (cap == "unity.job.cancel") return JobCancel(args);
+            if (cap == "unity.test.run") return TestRun(args);
             if (cap == "unity.build.start") return BuildStart(args);
             if (cap == "unity.package.list") return PackageList(args);
             if (cap == "unity.package.add") return PackageAdd(args);
@@ -2801,6 +2803,246 @@ namespace DSHBridge
             job["cancelRequested"] = true;
             d["cancelled"] = true;
             d["jobId"] = jobId;
+            return d;
+        }
+
+        // ===== 测试运行（能力补全第 3 项补全，等价 MCP run_tests/get_test_job）=====
+        // 约束：探针编译在预定义程序集内，无法直接引用 test-framework 的 asmdef（实测 CS0234）。
+        // 方案：运行时定位 Library/ScriptAssemblies/UnityEditor.TestRunner.dll，动态编译一段
+        // 实现 ICallbacks 的桥接代码（显式 references），反射启动 TestRunnerApi；
+        // 回调把结果写成一行文本，由 PollTestJobs 轮询完成 job（域重载时 job 标 interrupted）。
+        static string FindTestRunnerAssembly()
+        {
+            var direct = Path.Combine(_projectRoot, "Library", "ScriptAssemblies", "UnityEditor.TestRunner.dll");
+            if (File.Exists(direct)) return direct;
+            try
+            {
+                var dir = Path.Combine(_projectRoot, "Library", "ScriptAssemblies");
+                if (Directory.Exists(dir))
+                {
+                    var files = Directory.GetFiles(dir, "UnityEditor.TestRunner.dll", SearchOption.AllDirectories);
+                    if (files.Length > 0) return files[0];
+                }
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        static string TestBridgeSource()
+        {
+            return @"using System;
+using System.IO;
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.TestTools.TestRunner.Api;
+
+public static class DshTestBridge
+{
+    public class Callbacks : ICallbacks
+    {
+        readonly string resultPath;
+        public Callbacks(string resultPath) { this.resultPath = resultPath; }
+        public void RunStarted(ITestAdaptor testsToRun) { }
+        public void RunFinished(ITestResultAdaptor result)
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(resultPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                var line = (result != null ? result.PassCount : 0) + ""|"" + (result != null ? result.FailCount : 0)
+                    + ""|"" + (result != null ? result.SkipCount : 0) + ""|"" + (result != null ? result.InconclusiveCount : 0)
+                    + ""|"" + (result != null ? result.Duration.ToString(System.Globalization.CultureInfo.InvariantCulture) : ""0"")
+                    + ""|"" + (result != null ? result.TestStatus.ToString() : ""None"");
+                File.WriteAllText(resultPath, line);
+            }
+            catch (Exception) { }
+        }
+        public void TestStarted(ITestAdaptor test) { }
+        public void TestFinished(ITestResultAdaptor result) { }
+    }
+
+    public static string Start(string resultPath, string mode, string[] testNames)
+    {
+        var filter = new Filter();
+        filter.testMode = mode == ""playmode"" ? TestMode.PlayMode : TestMode.EditMode;
+        if (testNames != null && testNames.Length > 0) filter.testNames = testNames;
+        var settings = new ExecutionSettings();
+        settings.filters = new Filter[] { filter };
+        var api = new TestRunnerApi();
+        api.RegisterCallbacks(new Callbacks(resultPath));
+        api.Execute(settings);
+        return ""started"";
+    }
+}";
+        }
+
+        static string CompileAndStartTestBridge(string testRunnerDll, string resultPath, string mode, List<string> names)
+        {
+            EnsureMonoCompiler();
+            bool referencesCached;
+            long referencesBuildMs;
+            var references = CollectReferencesForMonoCompiler(out referencesCached, out referencesBuildMs);
+            var facadesNetStandard = Path.Combine(
+                Path.GetDirectoryName(RoslynDirectory()), "4.7.1-api", "Facades", "netstandard.dll");
+            var hasFacades = File.Exists(facadesNetStandard);
+            var effectiveReferences = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var reference in references)
+            {
+                var normalized = reference.Replace('\\', '/');
+                if (normalized.IndexOf("/NetStandard/compat/", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                var fileName = Path.GetFileName(reference);
+                if (hasFacades && string.Equals(fileName, "netstandard.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (seen.Add(facadesNetStandard)) effectiveReferences.Add(facadesNetStandard);
+                    continue;
+                }
+                if (seen.Add(reference)) effectiveReferences.Add(reference);
+            }
+            if (seen.Add(testRunnerDll)) effectiveReferences.Add(testRunnerDll);
+            // UnityEditor.TestRunner 依赖 UnityEngine.TestRunner（ITestAdaptor 等类型可能跨程序集）。
+            var engineTestRunner = Path.Combine(Path.GetDirectoryName(testRunnerDll), "UnityEngine.TestRunner.dll");
+            if (File.Exists(engineTestRunner) && seen.Add(engineTestRunner)) effectiveReferences.Add(engineTestRunner);
+            var parameters = Activator.CreateInstance(_tCompilerParameters);
+            SetProperty(parameters, "GenerateInMemory", true);
+            SetProperty(parameters, "GenerateExecutable", false);
+            SetProperty(parameters, "TreatWarningsAsErrors", false);
+            SetProperty(parameters, "CompilerOptions", "-nowarn:1685 -nowarn:1701 -nowarn:1702 -nostdlib -define:UNITY_EDITOR");
+            var referenced = GetProperty(parameters, "ReferencedAssemblies");
+            var addReference = referenced == null ? null : FindMethod(referenced.GetType(), "Add", delegate (ParameterInfo[] ps) { return ps.Length == 1 && ps[0].ParameterType == typeof(string); });
+            if (addReference != null)
+            {
+                foreach (var reference in effectiveReferences)
+                {
+                    try { addReference.Invoke(referenced, new object[] { reference }); } catch (Exception) { }
+                }
+            }
+            var provider = Activator.CreateInstance(_tCodeProvider);
+            var compile = FindMethod(_tCodeProvider, "CompileAssemblyFromSource", delegate (ParameterInfo[] ps)
+            {
+                return ps.Length == 2 && ps[0].ParameterType.Name == "CompilerParameters" && ps[1].ParameterType == typeof(string[]);
+            });
+            if (compile == null) throw new KnownError("code_execute_unavailable", "当前运行时不支持 C# 编译");
+            var results = compile.Invoke(provider, new object[] { parameters, new string[] { TestBridgeSource() } });
+            var errors = GetProperty(results, "Errors");
+            var diagnostics = new List<object>();
+            var errorCollection = errors as IEnumerable;
+            if (errorCollection != null)
+            {
+                foreach (var item in errorCollection)
+                {
+                    if (item == null) continue;
+                    var warning = GetProperty(item, "IsWarning");
+                    var isWarning = warning is bool && (bool)warning;
+                    if (isWarning) continue;
+                    var row = new Dictionary<string, object>();
+                    row["message"] = System.Convert.ToString(GetProperty(item, "ErrorText"), CultureInfo.InvariantCulture) ?? string.Empty;
+                    row["line"] = System.Convert.ToInt64(GetProperty(item, "Line") ?? 0L, CultureInfo.InvariantCulture);
+                    diagnostics.Add(row);
+                    if (diagnostics.Count >= 20) break;
+                }
+            }
+            var assembly = GetProperty(results, "CompiledAssembly");
+            if (assembly == null)
+                throw new KnownError("test_bridge_compile_failed", "测试桥接代码编译失败", MiniJson.Serialize(diagnostics));
+            var bridgeType = ((System.Reflection.Assembly)assembly).GetType("DshTestBridge", false);
+            if (bridgeType == null) throw new KnownError("test_bridge_compile_failed", "编译产物中找不到 DshTestBridge");
+            var start = bridgeType.GetMethod("Start", BindingFlags.Public | BindingFlags.Static);
+            if (start == null) throw new KnownError("test_bridge_compile_failed", "DshTestBridge 缺少 Start 方法");
+            var returned = start.Invoke(null, new object[] { resultPath, mode, names.ToArray() });
+            return System.Convert.ToString(returned, CultureInfo.InvariantCulture);
+        }
+
+        static void PickTestResult(Dictionary<string, object> job, string resultPath)
+        {
+            try
+            {
+                if (!File.Exists(resultPath)) return;
+                var line = File.ReadAllText(resultPath).Trim();
+                if (line.Length == 0) return;
+                var parts = line.Split('|');
+                var result = new Dictionary<string, object>();
+                if (parts.Length >= 6)
+                {
+                    result["passed"] = ToLongValue(parts[0]);
+                    result["failed"] = ToLongValue(parts[1]);
+                    result["skipped"] = ToLongValue(parts[2]);
+                    result["inconclusive"] = ToLongValue(parts[3]);
+                    result["durationSeconds"] = ToDoubleValue(parts[4]);
+                    result["status"] = parts[5];
+                }
+                CompleteJob(job, result);
+                try { File.Delete(resultPath); } catch (Exception) { }
+            }
+            catch (Exception) { }
+        }
+
+        static long ToLongValue(string raw)
+        {
+            long parsed;
+            return long.TryParse(raw ?? "", NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) ? parsed : 0L;
+        }
+
+        static double ToDoubleValue(string raw)
+        {
+            double parsed;
+            return double.TryParse(raw ?? "", NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ? parsed : 0d;
+        }
+
+        static void PollTestJobs()
+        {
+            if (_jobs.Count == 0) return;
+            var rows = new List<Dictionary<string, object>>();
+            foreach (var pair in _jobs) rows.Add(pair.Value);
+            for (var i = 0; i < rows.Count; i++)
+            {
+                var job = rows[i];
+                if (GetString(job, "kind") != "test-run") continue;
+                var status = GetString(job, "status");
+                if (status != "pending" && status != "running") continue;
+                var resultPath = GetString(job, "resultPath");
+                if (string.IsNullOrEmpty(resultPath)) continue;
+                PickTestResult(job, resultPath);
+            }
+        }
+
+        static Dictionary<string, object> TestRun(Dictionary<string, object> args)
+        {
+            var mode = (GetString(args, "mode") ?? "editmode").ToLowerInvariant();
+            if (mode != "editmode" && mode != "playmode")
+                throw new KnownError("invalid_argument", "mode 只能是 editmode 或 playmode");
+            var names = GetStringList(args, "tests");
+            var testRunnerDll = FindTestRunnerAssembly();
+            if (testRunnerDll == null)
+                throw new KnownError("test_framework_missing", "工程未安装 test-framework（找不到 Library/ScriptAssemblies/UnityEditor.TestRunner.dll）；请先 unity.package.add com.unity.test-framework 并等待编译完成");
+            var job = CreateJob("test-run", "TestRunner " + mode, false);
+            var resultDir = Path.Combine(_projectRoot, "Library", "DSHBridge", "test");
+            Directory.CreateDirectory(resultDir);
+            var resultPath = Path.Combine(resultDir, "result-" + GetString(job, "id") + ".txt");
+            try
+            {
+                job["resultPath"] = resultPath;
+                var started = CompileAndStartTestBridge(testRunnerDll, resultPath, mode, names);
+                job["bridgeStart"] = started;
+                PersistJob(job);
+                PickTestResult(job, resultPath);
+            }
+            catch (KnownError known)
+            {
+                // 保留内部诊断（例如桥接代码编译失败的逐条错误），不要用外层错误覆盖。
+                FailJob(job, known);
+                throw;
+            }
+            catch (Exception error)
+            {
+                FailJob(job, error);
+                throw new KnownError("test_start_failed", "启动测试失败: " + error.Message, error.GetType().Name);
+            }
+            var d = new Dictionary<string, object>();
+            d["jobId"] = job["id"];
+            d["mode"] = mode;
+            d["tests"] = (long)names.Count;
+            d["testRunnerAssembly"] = "Library/ScriptAssemblies/UnityEditor.TestRunner.dll";
             return d;
         }
 

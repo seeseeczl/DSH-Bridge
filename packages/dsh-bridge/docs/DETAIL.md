@@ -40,6 +40,7 @@
 | `unity.script.apply_edits` | 1-based 行列级 patch；支持 `preconditionSha256`、越界/重叠拒绝、原子落盘 |
 | `unity.script.validate` | 用 mono-mcs 进程内编译校验脚本，返回 valid/errorCount/diagnostics（等价 MCP validate_script） |
 | `unity.build.start` | 异步构建当前平台（作业化）；输出**不得**写进 `Library/`；产物支持 `.app`/`.exe` |
+| `unity.test.run` | 异步跑 EditMode/PlayMode 测试（作业化）；动态编译桥接 TestRunnerApi，结果回传 passed/failed/skipped/duration |
 | `unity.package.list` | 已注册包列表；`add`/`remove` 为异步作业（默认关闭，属危险能力） |
 | `unity.bake.navmesh` / `unity.bake.lighting` | NavMesh 同步烘焙 / 光照异步烘焙（作业化） |
 | `unity.job.list/status/cancel` | 长任务作业查询与取消；作业持久化到 `Library/DSHBridge/jobs/`，域重载后未完成的标 `interrupted` |
@@ -71,7 +72,7 @@
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
 - 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与 `unity.menu.execute` 默认关闭；开启方式见下节。
-- 生产管线已覆盖构建/包管理/烘焙；**测试运行未实现**：TestRunnerApi 需要 asmdef 引用 test-framework，而探针在预定义程序集内无法直接引用（实测编译报 CS0234）。探针侧已不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先）。
+- 测试运行（`unity.test.run`）走运行期动态编译桥接：探针先定位 `Library/ScriptAssemblies/UnityEditor.TestRunner.dll`，再动态编译一段实现 `ICallbacks` 的桥接代码调用 TestRunnerApi；需工程已安装 `com.unity.test-framework` 并编译完成。探针侧已不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先）。
 
 ## 安装位置与工作区
 

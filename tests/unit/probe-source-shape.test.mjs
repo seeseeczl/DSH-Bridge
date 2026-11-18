@@ -82,3 +82,12 @@ test('探针包含截图序列与脚本编译校验', async () => {
   assert.match(source, /ValidateCode/)
   assert.match(source, /CompileAssemblyFromSource/)
 })
+
+// 能力补全第 3 项补全：测试运行（动态编译桥接 TestRunnerApi）。
+test('探针包含测试运行能力（动态编译桥接）', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.match(source, /unity\.test\.run/)
+  assert.match(source, /TestRunnerApi/)
+  assert.match(source, /test_framework_missing/)
+  assert.match(source, /PollTestJobs/)
+})

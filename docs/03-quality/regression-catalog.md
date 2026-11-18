@@ -48,7 +48,7 @@ evidence: [docs/adversarial-audits/2026-11-16-144546-audit-report.md, docs/adver
 | REG-KNOWLEDGE-002 | BUG-0002, FR-0010 | 主题删除定位语义 | 主题原文（含全角括号）与 slug 均可删除；不存在返回 `removed: false`；路径逃逸仍拒绝 | `tests/unit/knowledge.test.mjs` |
 | REG-SCRIPT-001 | 能力补全第 2 项, FR-0008 | 脚本精细编辑 | `get_sha` 返回 64 位 sha256；`apply_edits` 按 1-based 行列 patch、支持 preconditionSha256 乐观锁、拒绝越界/重叠；原子落盘 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-JOB-001 | 能力补全第 6 项 | 长任务作业化 | 作业持久化到工程 Library 下的 jobs 目录；`unity.job.list`、`unity.job.status`、`unity.job.cancel` 可用；域重载后运行中作业标 `interrupted`；不可取消作业返回 `cancelled:false` | `tests/unit/probe-source-shape.test.mjs` |
-| REG-PROD-001 | 能力补全第 3 项 | 生产管线 | `unity.build.start` 异步构建成功且产物路径真实存在；构建输出写进工程 Library 目录会被拒绝；`unity.package.list` 返回已注册包；`unity.bake.navmesh` 与 `unity.bake.lighting` 可执行 | `tests/unit/probe-source-shape.test.mjs` |
+| REG-PROD-001 | 能力补全第 3 项 | 生产管线 | `unity.build.start` 异步构建成功且产物路径真实存在；构建输出写进工程 Library 目录会被拒绝；`unity.package.list` 返回已注册包；`unity.test.run` 动态编译桥接后可跑通 EditMode 测试；`unity.bake.navmesh` 与 `unity.bake.lighting` 可执行 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-NATIVE-001 | 能力补全第 5 项 | 原生交互（受管层） | `unity.window.list` 枚举编辑器窗口；`unity.window.focus` 聚焦窗口；`unity.input.send` 注入 key/mouse/scroll 事件；未知窗口/空事件被拒绝 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-SHOT-002 | 能力补全第 1 项, FR-0014 | 截图序列（录屏帧序列） | `unity.screenshot.sequence` 按 count/interval 生成 N 帧 PNG 到 artifacts 序列目录并返回文件清单 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-SCRIPT-002 | 能力补全第 2 项, FR-0014 | 脚本编译校验 | `unity.script.validate` 对合法脚本 valid=true，对语法错误脚本返回 errorCount>0 与逐条 diagnostics | `tests/unit/probe-source-shape.test.mjs` |

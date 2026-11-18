@@ -87,3 +87,4 @@ evidence: []
 | 2026-11-18T23:15:00+08:00 | 能力补全-3 | 探针 v18-v19：垂直域第一批（图形/Profiler/物理 8/8）与第二批（动画/粒子/UI/ProBuilder/Sprite/纹理 6/6）真机通过 | lead |  | docs/03-quality/regression-catalog.md |
 | 2026-11-18T23:22:00+08:00 | 能力补全-4 | 探针 v22：原生交互（窗口枚举/聚焦/输入注入）6/6 真机通过；能力面 44 → 74 项 | lead |  | docs/04-delivery/REL-0004.md |
 | 2026-11-18T23:30:00+08:00 | REL-0004 | 发布 v0.0.7：能力补全（FR-0014），138 项测试全绿 | lead |  | docs/04-delivery/REL-0004.md |
+| 2026-11-18T23:50:00+08:00 | 能力补全-5 | 探针 v24：unity.test.run 用运行期动态编译桥接绕过 asmdef 限制，EditMode 测试真机跑通（passed=1）；能力面 77 项 | lead |  | docs/04-delivery/REL-0004.md |
