@@ -2,7 +2,7 @@
 
 > 能力总数 77 项。完整清单与 MCP/Codely 对标见 `docs/01-architecture/capability-matrix.md`；
 > 本文件是**调用方式与注意事项**，按使用频率组织。
-> 真机验收：`npm run verify:live -- <projectPath>`（需要编辑器已打开目标工程）。
+> 真机验收：`npm run verify:live -- <projectPath>`（直连探针能力矩阵）；`npm run verify:tools -- <projectPath>`（走 DSH 插件 10 个工具的端到端验收）。都需要编辑器已打开目标工程。
 
 ## 0. 基本流程
 

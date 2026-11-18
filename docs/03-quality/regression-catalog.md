@@ -53,3 +53,4 @@ evidence: [docs/adversarial-audits/2026-11-16-144546-audit-report.md, docs/adver
 | REG-SHOT-002 | 能力补全第 1 项, FR-0014 | 截图序列（录屏帧序列） | `unity.screenshot.sequence` 按 count/interval 生成 N 帧 PNG 到 artifacts 序列目录并返回文件清单 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-SCRIPT-002 | 能力补全第 2 项, FR-0014 | 脚本编译校验 | `unity.script.validate` 对合法脚本 valid=true，对语法错误脚本返回 errorCount>0 与逐条 diagnostics | `tests/unit/probe-source-shape.test.mjs` |
 | REG-LIVE-001 | 能力补全（FR-0014） | 真机能力验收 | `scripts/verify-live-capabilities.mjs` 直连运行中探针：基础矩阵 + 新增能力抽查 + 延迟基准 p50/p95 + 测试产物清理 | `scripts/verify-live-capabilities.mjs` |
+| REG-TOOLS-001 | 能力补全（FR-0014）, FR-0003 | DSH 工具面端到端 | `scripts/verify-dsh-tool-surface.mjs`：真实插件 apply() 注册的 10 个工具经 bridge_targets/call/events/install/preinstall/knowledge 调用真实探针；输出满足 lossless JSON 与 schema | `scripts/verify-dsh-tool-surface.mjs` |

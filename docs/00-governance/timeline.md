@@ -91,3 +91,4 @@ evidence: []
 | 2026-11-18T23:58:00+08:00 | CAP-0001 | 新增能力矩阵文档（77 项能力 × MCP/Codely 对标 + 已知边界）；EXC-0001 偿还条件触发登记 TASK-0031 | lead |  | docs/01-architecture/capability-matrix.md |
 | 2026-11-19T00:10:00+08:00 | REL-0005 / ADR-0003 | 偿还 EXC-0001：探针拆为 9 文件 partial class 包（主文件 5951→826 LOC），安装器/模板/测试适配；探针 25；真机多文件 57/57；发布 v0.0.8 | lead |  | docs/04-delivery/REL-0005.md |
 | 2026-11-19T00:20:00+08:00 | USAGE-0001 | 新增能力使用指南（docs/USAGE.md）与真机验收脚本 scripts/verify-live-capabilities.mjs（34/34 通过，含延迟基准 p50=86ms/p95=168ms） | lead |  | packages/dsh-bridge/docs/USAGE.md |
+| 2026-11-19T00:35:00+08:00 | TOOLS-0001 | 新增 DSH 工具面端到端验收（scripts/verify-dsh-tool-surface.mjs，13/13 通过）：真实插件 apply() + mock 运行时 + 真实探针 v25，覆盖 10 个工具与危险能力默认拒绝 | lead |  | scripts/verify-dsh-tool-surface.mjs |

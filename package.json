@@ -12,6 +12,7 @@
     "check:probe": "node tests/unity-probe/compile-check.mjs",
     "doctor": "node scripts/bridge-doctor.mjs",
     "verify:live": "node scripts/verify-live-capabilities.mjs",
+    "verify:tools": "node scripts/verify-dsh-tool-surface.mjs",
     "verify": "npm run test && npm run check:probe && npm run check:docs && openspec validate --specs && node scripts/check-openspec-state.mjs && python3 /Users/long/.dsh/skills/project-architect/scripts/check_project_architecture.py --root . --check-docs --check-kickoff --check-traceability --check-fitness --strict",
     "check:docs": "node scripts/check-doc-consistency.mjs"
   },
