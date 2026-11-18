@@ -61,6 +61,8 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 
 `unity.api.invoke` 是覆盖长尾的兜底：给定句柄或类型名，可以调用任意方法/属性/字段；返回值会自动变成可复用的句柄。
 
+> 调用方式与注意事项（含新能力的参数示例）见 [docs/USAGE.md](docs/USAGE.md)；真机验收用 `npm run verify:live -- <projectPath>`。
+
 ## 主题知识化
 
 `bridge_knowledge_save/list/read/delete` 把「某个功能的实现方案」存成文档：
