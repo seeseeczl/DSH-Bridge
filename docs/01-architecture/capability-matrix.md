@@ -133,5 +133,7 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 - **实时串流**：Codely 用 native WebRTC 推画面；DSH 的零端口架构不引入监听通道，实时串流需原生层，属已知边界（截图/帧序列已覆盖视觉反馈与自验收）。
 - **系统级模态对话框应答**：OS 级自动化，纯 C# 探针不可行（Codely 用 native 扫描/点击）；`unity.input.send` 只注入编辑器窗口事件。
 - **测试运行依赖 test-framework**：`unity.test.run` 运行时动态编译桥接（预定义程序集无法引用其 asmdef）；工程需安装 `com.unity.test-framework`。
+- **PlayMode 测试显式拒绝**（v0.0.9）：PlayMode 会触发域重载、桥接回调无法跨域存活，`unity.test.run` 只支持 EditMode；PlayMode 请用 Test Runner 窗口或编辑器 CLI `-runTests`。
+- **NavMesh 烘焙作业化**（v0.0.9）：`unity.bake.navmesh` 返回 `jobId`，按作业轮询结果（`job.result.baked`）。
 - **协议生态**：不实现 MCP 协议导出（项目第一性原理决策，见 ADR-0001 与优化计划）；仅供 DSH 调用。
 
