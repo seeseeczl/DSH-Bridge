@@ -105,6 +105,8 @@ namespace UnityEngine
 {
     using System;
 
+    public class UnityException : Exception { }
+
     public enum LogType { Error, Assert, Warning, Log, Exception }
     public enum RuntimePlatform { OSXEditor, WindowsEditor, LinuxEditor }
 
@@ -175,6 +177,8 @@ namespace UnityEngine
     public class Texture2D : Texture
     {
         public Texture2D(int width, int height, TextureFormat format, bool mipChain) { }
+        public int width { get; set; }
+        public int height { get; set; }
         public void ReadPixels(Rect source, int destX, int destY) { }
         public void Apply() { }
         public void SetPixels(Color[] colors) { }
@@ -212,6 +216,7 @@ namespace UnityEngine
         public AnimatorControllerParameter[] parameters => new AnimatorControllerParameter[0];
         public float GetFloat(string name) => 0f;
         public void SetFloat(string name, float value) { }
+        public void SetInt(string name, int value) { }
         public int GetInteger(string name) => 0;
         public void SetInteger(string name, int value) { }
         public bool GetBool(string name) => false;
@@ -257,6 +262,7 @@ namespace UnityEngine
         public Vector2 mousePosition;
         public Vector2 delta;
         public EventModifiers modifiers;
+        public int clickCount;
     }
 
     public class GUIContent
@@ -300,6 +306,7 @@ namespace UnityEngine
         public void SetColor(string name, Color value) { }
         public float GetFloat(string name) => 0f;
         public void SetFloat(string name, float value) { }
+        public void SetInt(string name, int value) { }
         public Vector4 GetVector(string name) => new Vector4();
         public void SetVector(string name, Vector4 value) { }
         public Texture GetTexture(string name) => null;
@@ -379,6 +386,12 @@ namespace UnityEngine
         public static string graphicsDeviceName => "Fake GPU";
         public static int graphicsMemorySize => 1024;
         public static int graphicsShaderLevel => 50;
+        public static int maxTextureSize => 8192;
+    }
+
+    public static class ScreenCapture
+    {
+        public static Texture2D CaptureScreenshotAsTexture() => new Texture2D(1, 1, TextureFormat.RGBA32, false);
     }
 
     public static class Physics
@@ -458,6 +471,7 @@ namespace UnityEngine.SceneManagement
     public static class SceneManager
     {
         public static Scene GetActiveScene() => new Scene();
+        public static Scene GetSceneAt(int index) => new Scene();
         public static int sceneCount => 1;
     }
 
@@ -466,6 +480,7 @@ namespace UnityEngine.SceneManagement
         public string name => "FakeScene";
         public string path => "Assets/Fake.unity";
         public bool IsValid() => true;
+        public bool isDirty => false;
         public GameObject[] GetRootGameObjects() => new GameObject[0];
     }
 }
@@ -558,7 +573,7 @@ namespace UnityEditor
         public static EditorWindow focusedWindow => null;
         public void Focus() { }
         public void Repaint() { }
-        public void SendEvent(Event e) { }
+        public bool SendEvent(Event e) => true;
     }
 
     public class AssetImporter
@@ -806,6 +821,7 @@ namespace UnityEditor.SceneManagement
     {
         public string assetPath => string.Empty;
         public UnityEngine.GameObject prefabContentsRoot => new UnityEngine.GameObject();
+        public UnityEngine.SceneManagement.Scene scene => new UnityEngine.SceneManagement.Scene();
         public void ClearDirtiness() { }
     }
 

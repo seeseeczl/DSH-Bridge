@@ -26,53 +26,64 @@ namespace DSHBridge
         // 把 GameView / SceneView / 指定相机渲染成 PNG，落在 <工程>/Library/DSHBridge/artifacts/，
         // 不进 Assets、不进版本库，返回相对/绝对路径、尺寸与字节数，供 Agent 直接读图做自验收。
         // 参数：target=game|scene|camera（默认 game）；camera/handle（target=camera 时）；
-        //       width/height（默认 1280x720，上限 8192）。
+        //       width/height（默认 1280x720，上限 min(8192, SystemInfo.maxTextureSize)）。
+        // Play Mode 下 target=game 优先用 ScreenCapture（GameView 的真实呈现：Overlay UI、
+        // 多相机 stacking、后处理），失败或非 Play Mode 才回退相机渲染，并用 fallback 显式标注。
+        const int ScreenshotArtifactRetainCount = 200;
+
         static Dictionary<string, object> ScreenshotCapture(Dictionary<string, object> args)
         {
-            var target = GetString(args, "target") ?? "game";
-            target = target.ToLowerInvariant();
-            var width = (int)Math.Max(1, Math.Min(8192, ToLong(args, "width", 1280)));
-            var height = (int)Math.Max(1, Math.Min(8192, ToLong(args, "height", 720)));
-            Camera cam = null;
-            if (target == "scene")
-            {
-                var sceneView = UnityEditor.SceneView.lastActiveSceneView;
-                if (sceneView == null || sceneView.camera == null) throw new KnownError("no_scene_view", "当前没有活动的 Scene View");
-                cam = sceneView.camera;
-            }
-            else if (target == "camera")
-            {
-                var handle = GetString(args, "handle");
-                var wanted = GetString(args, "camera");
-                if (!string.IsNullOrEmpty(handle))
-                {
-                    cam = GetHandle(handle) as Camera;
-                    if (cam == null) throw new KnownError("invalid_handle", "句柄不是相机: " + handle);
-                }
-                else if (!string.IsNullOrEmpty(wanted))
-                {
-                    var cameras = Camera.allCameras;
-                    for (var i = 0; i < cameras.Length; i++)
-                    {
-                        if (cameras[i].name == wanted) { cam = cameras[i]; break; }
-                    }
-                    if (cam == null) throw new KnownError("camera_not_found", "找不到相机: " + wanted);
-                }
-                else throw new KnownError("invalid_argument", "target=camera 需要 camera 或 handle 参数");
-            }
-            else if (target == "game" || target == "main")
-            {
-                cam = Camera.main;
-                if (cam == null)
-                {
-                    var cameras = Camera.allCameras;
-                    if (cameras.Length > 0) cam = cameras[0];
-                }
-                if (cam == null) throw new KnownError("no_camera", "工程里没有可用相机（GameView/MainCamera）");
-            }
-            else throw new KnownError("invalid_argument", "未知 target: " + target + "（game/scene/camera）");
+            var target = (GetString(args, "target") ?? "game").ToLowerInvariant();
+            if (target != "game" && target != "main" && target != "scene" && target != "camera")
+                throw new KnownError("invalid_argument", "未知 target: " + target + "（game/scene/camera）");
+            var maxDimension = ScreenshotMaxDimension();
+            var width = (int)Math.Max(1, Math.Min(maxDimension, ToLong(args, "width", 1280)));
+            var height = (int)Math.Max(1, Math.Min(maxDimension, ToLong(args, "height", 720)));
+            var fallbackReasons = new List<string>();
 
-            var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+            // Play Mode 下 ScreenCapture 拿到的才是 GameView 实际呈现（含 Overlay Canvas 等），
+            // 相机渲染只是近似；先试它，任何失败都回退相机并记录原因，绝不静默降级。
+            if ((target == "game" || target == "main") && EditorApplication.isPlaying)
+            {
+                Texture2D screenTexture = null;
+                try
+                {
+                    screenTexture = ScreenCapture.CaptureScreenshotAsTexture();
+                    if (screenTexture != null)
+                    {
+                        var screenPng = screenTexture.EncodeToPNG();
+                        var screenResponse = WriteScreenshotArtifact(screenPng, target);
+                        screenResponse["target"] = target;
+                        screenResponse["camera"] = null;
+                        screenResponse["width"] = (long)screenTexture.width;
+                        screenResponse["height"] = (long)screenTexture.height;
+                        if (screenTexture.width != width || screenTexture.height != height)
+                        {
+                            screenResponse["requestedWidth"] = (long)width;
+                            screenResponse["requestedHeight"] = (long)height;
+                        }
+                        screenResponse["captureMode"] = "screen";
+                        screenResponse["fallback"] = false;
+                        return screenResponse;
+                    }
+                    fallbackReasons.Add("screen_capture_null");
+                }
+                catch (Exception e)
+                {
+                    fallbackReasons.Add("screen_capture_failed:" + e.GetType().Name);
+                }
+                finally
+                {
+                    if (screenTexture != null) UnityEngine.Object.DestroyImmediate(screenTexture);
+                }
+            }
+
+            var cam = ResolveScreenshotCamera(args, target, true, fallbackReasons);
+            RenderTexture rt = null;
+            try { rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB); }
+            catch (Exception e) { throw new KnownError("render_failed", "无法创建 " + width + "x" + height + " 的 RenderTexture: " + MessageOf(e)); }
+            if (rt == null)
+                throw new KnownError("render_failed", "无法创建 " + width + "x" + height + " 的 RenderTexture（显存不足或尺寸超限）");
             var previousTarget = cam.targetTexture;
             var previousActive = RenderTexture.active;
             Texture2D tex = null;
@@ -85,22 +96,19 @@ namespace DSHBridge
                 tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
                 tex.Apply();
                 var png = tex.EncodeToPNG();
-                var dir = System.IO.Path.Combine(_projectRoot, "Library", "DSHBridge", "artifacts");
-                System.IO.Directory.CreateDirectory(dir);
-                var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture);
-                var file = System.IO.Path.Combine(dir, "screenshot-" + target + "-" + stamp + ".png");
-                System.IO.File.WriteAllBytes(file, png);
-                var d = new Dictionary<string, object>();
-                d["path"] = "Library/DSHBridge/artifacts/" + System.IO.Path.GetFileName(file);
-                d["absolutePath"] = file;
-                d["target"] = target;
-                d["camera"] = cam.name;
-                d["width"] = (long)width;
-                d["height"] = (long)height;
-                d["bytes"] = (long)png.Length;
-                d["format"] = "png";
-                d["capturedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-                return d;
+                var response = WriteScreenshotArtifact(png, target);
+                response["target"] = target;
+                response["camera"] = cam.name;
+                response["width"] = (long)width;
+                response["height"] = (long)height;
+                response["captureMode"] = "camera";
+                AppendScreenshotFallback(response, fallbackReasons);
+                return response;
+            }
+            catch (KnownError) { throw; }
+            catch (Exception e)
+            {
+                throw new KnownError("render_failed", "相机渲染截图失败: " + MessageOf(e));
             }
             finally
             {
@@ -109,6 +117,136 @@ namespace DSHBridge
                 if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
                 RenderTexture.ReleaseTemporary(rt);
             }
+        }
+
+        /// <summary>截图尺寸硬上限：不能超过 GPU 的单纹理上限，也不能超过探针自己承诺的 8192。</summary>
+        static int ScreenshotMaxDimension()
+        {
+            var limit = 8192;
+            try
+            {
+                var maxTextureSize = SystemInfo.maxTextureSize;
+                if (maxTextureSize > 0 && maxTextureSize < limit) limit = maxTextureSize;
+            }
+            catch (Exception) { }
+            return Math.Max(1, limit);
+        }
+
+        static string ScreenshotArtifactsDirectory()
+        {
+            return System.IO.Path.Combine(_projectRoot, "Library", "DSHBridge", "artifacts");
+        }
+
+        /// <summary>同毫秒也可能连续调用：时间戳外再加短随机后缀，避免截图互相覆盖。</summary>
+        static string ScreenshotUniqueSuffix()
+        {
+            return DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture)
+                + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        }
+
+        /// <summary>
+        /// 生成前按数量清理 artifacts：只保留最近 ScreenshotArtifactRetainCount 个文件，
+        /// 防止长时间使用后目录无界增长。清理失败不影响截图主流程（最坏情况是没清掉）。
+        /// </summary>
+        static void PruneScreenshotArtifacts()
+        {
+            try
+            {
+                var dir = ScreenshotArtifactsDirectory();
+                if (!System.IO.Directory.Exists(dir)) return;
+                var files = System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories);
+                if (files == null || files.Length <= ScreenshotArtifactRetainCount) return;
+                var ordered = new List<KeyValuePair<string, DateTime>>(files.Length);
+                for (var i = 0; i < files.Length; i++)
+                {
+                    try { ordered.Add(new KeyValuePair<string, DateTime>(files[i], System.IO.File.GetLastWriteTimeUtc(files[i]))); }
+                    catch (Exception) { }
+                }
+                ordered.Sort(delegate (KeyValuePair<string, DateTime> left, KeyValuePair<string, DateTime> right)
+                {
+                    return left.Value.CompareTo(right.Value);
+                });
+                var removeCount = ordered.Count - ScreenshotArtifactRetainCount;
+                for (var i = 0; i < removeCount; i++)
+                {
+                    try { System.IO.File.Delete(ordered[i].Key); } catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>把 PNG 字节写进 artifacts，返回路径/字节数等公共字段；渲染或写盘失败一律报 render_failed。</summary>
+        static Dictionary<string, object> WriteScreenshotArtifact(byte[] png, string target)
+        {
+            if (png == null || png.Length == 0)
+                throw new KnownError("render_failed", "PNG 编码结果为空，截图未写入");
+            PruneScreenshotArtifacts();
+            var dir = ScreenshotArtifactsDirectory();
+            try { System.IO.Directory.CreateDirectory(dir); }
+            catch (Exception e) { throw new KnownError("render_failed", "无法创建截图目录: " + MessageOf(e)); }
+            var fileName = "screenshot-" + target + "-" + ScreenshotUniqueSuffix() + ".png";
+            var file = System.IO.Path.Combine(dir, fileName);
+            try { System.IO.File.WriteAllBytes(file, png); }
+            catch (Exception e) { throw new KnownError("render_failed", "截图写入失败: " + MessageOf(e)); }
+            var d = new Dictionary<string, object>();
+            d["path"] = "Library/DSHBridge/artifacts/" + fileName;
+            d["absolutePath"] = file;
+            d["bytes"] = (long)png.Length;
+            d["format"] = "png";
+            d["capturedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            return d;
+        }
+
+        /// <summary>回退标记：调用方据此知道「看到的不是理想路径」（PlayMode 无 ScreenCapture / 无 MainCamera）。</summary>
+        static void AppendScreenshotFallback(Dictionary<string, object> response, List<string> fallbackReasons)
+        {
+            var fallback = fallbackReasons != null && fallbackReasons.Count > 0;
+            response["fallback"] = fallback;
+            if (fallback) response["fallbackReason"] = string.Join("; ", fallbackReasons.ToArray());
+        }
+
+        /// <summary>解析截图用的相机；target=game 优先 Camera.main，退回 allCameras[0] 时记 no_main_camera。</summary>
+        static Camera ResolveScreenshotCamera(Dictionary<string, object> args, string target, bool allowExplicitCamera, List<string> fallbackReasons)
+        {
+            if (target == "scene")
+            {
+                var sceneView = UnityEditor.SceneView.lastActiveSceneView;
+                if (sceneView == null || sceneView.camera == null) throw new KnownError("no_scene_view", "当前没有活动的 Scene View");
+                return sceneView.camera;
+            }
+            if (target == "camera")
+            {
+                if (!allowExplicitCamera) throw new KnownError("invalid_argument", "该能力只支持 target=game|scene（收到 camera）");
+                var handle = GetString(args, "handle");
+                var wanted = GetString(args, "camera");
+                if (!string.IsNullOrEmpty(handle))
+                {
+                    var handled = GetHandle(handle) as Camera;
+                    if (handled == null) throw new KnownError("invalid_handle", "句柄不是相机: " + handle);
+                    return handled;
+                }
+                if (!string.IsNullOrEmpty(wanted))
+                {
+                    var cameras = Camera.allCameras;
+                    for (var i = 0; i < cameras.Length; i++)
+                    {
+                        if (cameras[i].name == wanted) return cameras[i];
+                    }
+                    throw new KnownError("camera_not_found", "找不到相机: " + wanted);
+                }
+                throw new KnownError("invalid_argument", "target=camera 需要 camera 或 handle 参数");
+            }
+            if (target != "game" && target != "main")
+                throw new KnownError("invalid_argument", "未知 target: " + target + "（game/scene/camera）");
+            var main = Camera.main;
+            if (main != null) return main;
+            var allCameras = Camera.allCameras;
+            if (allCameras.Length > 0)
+            {
+                if (fallbackReasons != null) fallbackReasons.Add("no_main_camera:" + allCameras[0].name);
+                return allCameras[0];
+            }
+            throw new KnownError("no_camera", "工程里没有可用相机（GameView/MainCamera）");
         }
 
         // ===== 脚本精细编辑（能力补全第 2 项）=====
@@ -134,6 +272,8 @@ namespace DSHBridge
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var full = ResolveProjectPath(path, "path");
+            // P1-2：apply_edits 是默认开启的写能力，必须拒绝写探针自身源码（提权向量）。
+            EnsureWritableAssetPath(ToProjectRelative(full), "path");
             EnsureTextable(full, "path");
             if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
             var bytes = System.IO.File.ReadAllBytes(full);
@@ -144,6 +284,93 @@ namespace DSHBridge
             return d;
         }
 
+        /// <summary>
+        /// 显式按 BOM 判定编码后解码（UTF-8 BOM / UTF-8 / UTF-16LE/BE BOM）。
+        /// 无 BOM 时按**严格 UTF-8** 校验：非法字节直接报 invalid_encoding，而不是静默替换成 U+FFFD
+        /// 再写回去损坏源码（旧实现用 ReadAllText + UTF-8 写回，BOM/编码会被整文件改写）。
+        /// 返回的 Encoding 保留了 BOM 语义，写回时原样恢复。
+        /// </summary>
+        static string DecodeTextFileWithEncoding(byte[] bytes, out Encoding encoding, out bool hadBom, out string encodingName)
+        {
+            if (bytes == null) bytes = new byte[0];
+            if (bytes.Length >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF)
+            {
+                encoding = null;
+                hadBom = true;
+                encodingName = "utf-32be";
+                throw new KnownError("invalid_encoding", "不支持 UTF-32（BE）编码的文本文件");
+            }
+            if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00)
+            {
+                encoding = null;
+                hadBom = true;
+                encodingName = "utf-32le";
+                throw new KnownError("invalid_encoding", "不支持 UTF-32（LE）编码的文本文件");
+            }
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            {
+                encoding = new UTF8Encoding(true);
+                hadBom = true;
+                encodingName = "utf-8-bom";
+                return encoding.GetString(bytes, 3, bytes.Length - 3);
+            }
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            {
+                encoding = new UnicodeEncoding(false, true);
+                hadBom = true;
+                encodingName = "utf-16le-bom";
+                return encoding.GetString(bytes, 2, bytes.Length - 2);
+            }
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            {
+                encoding = new UnicodeEncoding(true, true);
+                hadBom = true;
+                encodingName = "utf-16be-bom";
+                return encoding.GetString(bytes, 2, bytes.Length - 2);
+            }
+            // 无 BOM：不猜测 UTF-16（保守），只接受合法 UTF-8。
+            hadBom = false;
+            encodingName = "utf-8";
+            try
+            {
+                var strictUtf8 = new UTF8Encoding(false, true);
+                var text = strictUtf8.GetString(bytes);
+                encoding = new UTF8Encoding(false);
+                return text;
+            }
+            catch (DecoderFallbackException)
+            {
+                encoding = null;
+                throw new KnownError("invalid_encoding", "文件不是合法 UTF-8 且没有 BOM；为避免写回损坏内容已拒绝（请先转成 UTF-8 或带 BOM 的 UTF-16）");
+            }
+        }
+
+        /// <summary>检测主换行；混合行尾文件统一成主换行（无法在任意 patch 后逐行保持原样）。</summary>
+        static string DetectDominantNewline(string text, out bool mixed)
+        {
+            mixed = false;
+            if (string.IsNullOrEmpty(text)) return "\n";
+            var crlfCount = 0;
+            var lfCount = 0;
+            for (var i = 0; i < text.Length; i++)
+            {
+                if (text[i] != '\n') continue;
+                if (i > 0 && text[i - 1] == '\r') crlfCount++;
+                else lfCount++;
+            }
+            mixed = crlfCount > 0 && lfCount > 0;
+            if (crlfCount == 0 && lfCount == 0) return "\n";
+            return crlfCount >= lfCount ? "\r\n" : "\n";
+        }
+
+        /// <summary>把任意行尾先归一到 LF：避免把 "\r\n" 插进 CRLF 文件后变成 "\r\r\n"。</summary>
+        static string NormalizeTextToLf(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text ?? string.Empty;
+            if (text.IndexOf('\r') < 0) return text;
+            return text.Replace("\r\n", "\n").Replace('\r', '\n');
+        }
+
         static Dictionary<string, object> ScriptApplyEdits(Dictionary<string, object> args)
         {
             var path = GetString(args, "path");
@@ -151,6 +378,7 @@ namespace DSHBridge
             var full = ResolveProjectPath(path, "path");
             EnsureTextable(full, "path");
             if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
+            // 只读一次字节：sha、precondition 与正文解码基于同一份快照，避免中途被外部改动造成错配。
             var originalBytes = System.IO.File.ReadAllBytes(full);
             var shaBefore = Sha256HexBytes(originalBytes);
             var precondition = GetString(args, "preconditionSha256");
@@ -159,9 +387,14 @@ namespace DSHBridge
             var edits = AsObjectList(args, "edits");
             if (edits.Count == 0) throw new KnownError("invalid_argument", "edits 不能为空");
 
-            var original = System.IO.File.ReadAllText(full);
-            var newline = original.Contains("\r\n") ? "\r\n" : "\n";
-            var lines = original.Replace("\r\n", "\n").Split('\n');
+            Encoding encoding;
+            bool hadBom;
+            string encodingName;
+            var original = DecodeTextFileWithEncoding(originalBytes, out encoding, out hadBom, out encodingName);
+            bool mixedNewlines;
+            var newline = DetectDominantNewline(original, out mixedNewlines);
+            var originalToLf = NormalizeTextToLf(original);
+            var lines = originalToLf.Split('\n');
             var starts = new List<int>();
             starts.Add(0);
             for (var i = 0; i < lines.Length; i++) starts.Add(starts[i] + lines[i].Length + 1);
@@ -174,7 +407,18 @@ namespace DSHBridge
                 var startColumn = (int)ToLong(raw, "startColumn", 1);
                 var endLine = (int)ToLong(raw, "endLine", startLine);
                 var endColumn = (int)ToLong(raw, "endColumn", startColumn);
-                var text = raw.ContainsKey("text") ? (raw["text"] as string ?? string.Empty) : string.Empty;
+                // text 缺失 = 纯删除（保持原契约）；显式给了但不是字符串（数字/对象/null）必须报错，
+                // 不能当成空串静默删掉一段代码。
+                object textValue;
+                var text = string.Empty;
+                if (raw.TryGetValue("text", out textValue))
+                {
+                    var textString = textValue as string;
+                    if (textString == null)
+                        throw new KnownError("invalid_argument", "edits[" + i + "].text 必须是字符串（收到 "
+                            + (textValue == null ? "null" : textValue.GetType().Name) + "）");
+                    text = NormalizeTextToLf(textString);
+                }
                 if (startLine < 1 || startLine > lines.Length) throw new KnownError("edit_out_of_range", "edits[" + i + "] startLine 越界: " + startLine);
                 if (endLine < startLine || endLine > lines.Length) throw new KnownError("edit_out_of_range", "edits[" + i + "] endLine 越界: " + endLine);
                 if (startColumn < 1 || startColumn > lines[startLine - 1].Length + 1) throw new KnownError("edit_out_of_range", "edits[" + i + "] startColumn 越界: " + startColumn);
@@ -209,7 +453,7 @@ namespace DSHBridge
                 if (i > 0 && startOffset < ops[i - 1][1]) throw new KnownError("edits_overlap", "edits 区间重叠（第 " + i + " 条）");
                 ops.Add(new[] { startOffset, endOffset });
             }
-            var builder = new StringBuilder(original.Replace("\r\n", "\n"));
+            var builder = new StringBuilder(originalToLf);
             for (var i = parsed.Count - 1; i >= 0; i--)
             {
                 var startOffset = (int)ops[i][0];
@@ -221,129 +465,252 @@ namespace DSHBridge
             if (newline == "\r\n") updated = updated.Replace("\n", "\r\n");
 
             // 原子写：先写临时文件再替换，避免半截文件被编辑器编译到。
+            // 编码沿用原文件（BOM 由 Encoding 的 preamble 恢复）。
             var tmp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                System.IO.File.WriteAllText(tmp, updated, new System.Text.UTF8Encoding(false));
+                System.IO.File.WriteAllText(tmp, updated, encoding);
                 System.IO.File.Replace(tmp, full, null);
+            }
+            catch (Exception e)
+            {
+                throw new KnownError("write_failed", "写回失败: " + MessageOf(e));
             }
             finally
             {
                 if (System.IO.File.Exists(tmp)) System.IO.File.Delete(tmp);
             }
-            var shaAfter = Sha256HexBytes(System.IO.File.ReadAllBytes(full));
+            var updatedBytes = System.IO.File.ReadAllBytes(full);
             var refresh = args.ContainsKey("refresh") ? ToBool(args, "refresh") : true;
             if (refresh) AssetDatabase.Refresh();
             var d = new Dictionary<string, object>();
             d["path"] = ToProjectRelative(full);
             d["applied"] = (long)parsed.Count;
             d["sha256Before"] = shaBefore;
-            d["sha256After"] = shaAfter;
+            d["sha256After"] = Sha256HexBytes(updatedBytes);
             d["bytesBefore"] = (long)originalBytes.Length;
-            d["bytesAfter"] = (long)System.IO.File.ReadAllBytes(full).Length;
+            d["bytesAfter"] = (long)updatedBytes.Length;
+            d["encoding"] = encodingName;
+            d["bom"] = hadBom;
+            d["newline"] = newline == "\r\n" ? "crlf" : "lf";
+            d["mixedNewlines"] = mixedNewlines;
             d["refreshed"] = refresh;
             return d;
         }
 
         // ===== 截图序列（录屏的帧序列等价物，能力补全第 1 项补充）=====
         // 纯 C# 探针无法编码视频；这里按固定间隔截 N 帧 PNG 到工程内目录，供 DSH 侧合成/查看。
-        // 注意：循环在主线程同步执行（Sleep 会短暂阻塞编辑器），count/intervalMs 已做上限约束。
+        // 同步实现可接受的前提是**总阻塞时长有硬预算**：count×(intervalMs+单帧估算) 超过预算直接拒绝，
+        // 避免旧实现 count≤600 × intervalMs≤10000 把主线程占住约 100 分钟（DSH 侧 30s 超时风暴）。
+        const int ScreenshotSequenceBudgetMs = 10000;
+        const int ScreenshotSequenceMaxCount = 200;
+        const int ScreenshotSequenceMaxIntervalMs = 5000;
+
+        /// <summary>单帧耗时估算：固定开销 + 像素量线性项（刻意保守偏高），只用于总预算判定。</summary>
+        static long EstimateSequenceFrameCostMs(int width, int height)
+        {
+            var pixels = (long)width * (long)height;
+            var cost = 8L + pixels / 20000L;
+            return Math.Min(cost, 2000L);
+        }
+
         static Dictionary<string, object> ScreenshotSequence(Dictionary<string, object> args)
         {
             var target = (GetString(args, "target") ?? "game").ToLowerInvariant();
-            var width = (int)Math.Max(1, Math.Min(8192, ToLong(args, "width", 640)));
-            var height = (int)Math.Max(1, Math.Min(8192, ToLong(args, "height", 360)));
-            var count = (int)Math.Max(1, Math.Min(600, ToLong(args, "count", 10)));
-            var intervalMs = (int)Math.Max(0, Math.Min(10000, ToLong(args, "intervalMs", 200)));
-            var name = GetString(args, "dir");
-            var safeName = "";
-            if (!string.IsNullOrEmpty(name))
+            if (target != "game" && target != "main" && target != "scene")
+                throw new KnownError("invalid_argument", "sequence 只支持 target=game|scene");
+            var maxDimension = ScreenshotMaxDimension();
+            var width = (int)Math.Max(1, Math.Min(maxDimension, ToLong(args, "width", 640)));
+            var height = (int)Math.Max(1, Math.Min(maxDimension, ToLong(args, "height", 360)));
+
+            var requestedCount = Math.Max(1, ToLong(args, "count", 10));
+            if (requestedCount > ScreenshotSequenceMaxCount)
+                throw new KnownError("invalid_argument", "count 超过上限 " + ScreenshotSequenceMaxCount + "（收到 " + requestedCount + "）");
+            var count = (int)requestedCount;
+            var requestedIntervalMs = ToLong(args, "intervalMs", 200);
+            if (requestedIntervalMs < 0) requestedIntervalMs = 0;
+            if (requestedIntervalMs > ScreenshotSequenceMaxIntervalMs)
+                throw new KnownError("invalid_argument", "intervalMs 超过上限 " + ScreenshotSequenceMaxIntervalMs + "（收到 " + requestedIntervalMs + "）");
+            var intervalMs = (int)requestedIntervalMs;
+            var frameCostMs = EstimateSequenceFrameCostMs(width, height);
+            var plannedDurationMs = (long)count * ((long)intervalMs + frameCostMs);
+            if (plannedDurationMs > ScreenshotSequenceBudgetMs)
             {
-                for (var i = 0; i < name.Length; i++)
+                throw new KnownError(
+                    "invalid_argument",
+                    "预计阻塞主线程 " + plannedDurationMs + "ms，超过预算 " + ScreenshotSequenceBudgetMs
+                        + "ms：请降低 count 或 intervalMs（当前单帧估算 " + frameCostMs + "ms）",
+                    "count=" + count + ", intervalMs=" + intervalMs + ", width=" + width + ", height=" + height
+                        + ", plannedDurationMs=" + plannedDurationMs + ", budgetMs=" + ScreenshotSequenceBudgetMs);
+            }
+
+            var dirName = "sequence-" + ScreenshotUniqueSuffix();
+            var requestedName = GetString(args, "dir");
+            if (!string.IsNullOrEmpty(requestedName))
+            {
+                var safeName = string.Empty;
+                for (var i = 0; i < requestedName.Length; i++)
                 {
-                    var c = name[i];
+                    var c = requestedName[i];
                     if (char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.') safeName += c;
                 }
                 if (safeName.Length == 0) throw new KnownError("invalid_argument", "dir 名称不合法（只允许字母数字 - _ .）");
+                dirName = dirName + "-" + safeName;
             }
-            var dirName = "sequence-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture)
-                + (safeName.Length > 0 ? "-" + safeName : "");
-            var dir = System.IO.Path.Combine(_projectRoot, "Library", "DSHBridge", "artifacts", dirName);
-            Directory.CreateDirectory(dir);
-            Camera cam;
-            if (target == "scene")
+
+            // 先解析 target/校验参数、再确定取帧方式，最后才 CreateDirectory：
+            // 任何参数或状态错误都不会在 artifacts 下留下空序列目录。
+            var fallbackReasons = new List<string>();
+            Camera cam = null;
+            var useScreenCapture = (target == "game" || target == "main") && EditorApplication.isPlaying;
+            Texture2D prefetchedScreenTexture = null;
+            if (useScreenCapture)
             {
-                var sceneView = UnityEditor.SceneView.lastActiveSceneView;
-                if (sceneView == null || sceneView.camera == null) throw new KnownError("no_scene_view", "当前没有活动的 Scene View");
-                cam = sceneView.camera;
-            }
-            else if (target == "game" || target == "main")
-            {
-                cam = Camera.main;
-                if (cam == null)
+                try { prefetchedScreenTexture = ScreenCapture.CaptureScreenshotAsTexture(); }
+                catch (Exception e) { fallbackReasons.Add("screen_capture_failed:" + e.GetType().Name); }
+                if (prefetchedScreenTexture == null)
                 {
-                    var cameras = Camera.allCameras;
-                    if (cameras.Length > 0) cam = cameras[0];
+                    if (fallbackReasons.Count == 0) fallbackReasons.Add("screen_capture_null");
+                    useScreenCapture = false;
                 }
-                if (cam == null) throw new KnownError("no_camera", "工程里没有可用相机（GameView/MainCamera）");
             }
-            else throw new KnownError("invalid_argument", "sequence 只支持 target=game|scene");
-            var frames = new List<object>();
-            var clock = Stopwatch.StartNew();
-            for (var index = 0; index < count; index++)
+            if (!useScreenCapture) cam = ResolveScreenshotCamera(args, target, false, fallbackReasons);
+
+            var dir = System.IO.Path.Combine(ScreenshotArtifactsDirectory(), dirName);
+            PruneScreenshotArtifacts();
+            try { System.IO.Directory.CreateDirectory(dir); }
+            catch (Exception e)
             {
-                var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                var previousTarget = cam.targetTexture;
-                var previousActive = RenderTexture.active;
-                Texture2D tex = null;
-                try
+                if (prefetchedScreenTexture != null) UnityEngine.Object.DestroyImmediate(prefetchedScreenTexture);
+                throw new KnownError("render_failed", "无法创建序列目录: " + MessageOf(e));
+            }
+
+            var frames = new List<object>();
+            var frameTimestamps = new List<object>();
+            var actualWidth = width;
+            var actualHeight = height;
+            var clock = Stopwatch.StartNew();
+            try
+            {
+                for (var index = 0; index < count; index++)
                 {
-                    cam.targetTexture = rt;
-                    cam.Render();
-                    RenderTexture.active = rt;
-                    tex = new Texture2D(width, height, TextureFormat.RGB24, false);
-                    tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                    tex.Apply();
-                    var png = tex.EncodeToPNG();
+                    frameTimestamps.Add(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
                     var frameName = "frame-" + index.ToString("D4", CultureInfo.InvariantCulture) + ".png";
-                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, frameName), png);
+                    var frameFile = System.IO.Path.Combine(dir, frameName);
+                    if (useScreenCapture)
+                    {
+                        Texture2D screenTexture = null;
+                        try
+                        {
+                            if (index == 0 && prefetchedScreenTexture != null)
+                            {
+                                screenTexture = prefetchedScreenTexture;
+                                prefetchedScreenTexture = null;
+                            }
+                            else screenTexture = ScreenCapture.CaptureScreenshotAsTexture();
+                            if (screenTexture == null) throw new KnownError("render_failed", "ScreenCapture 返回空纹理（第 " + index + " 帧）");
+                            actualWidth = screenTexture.width;
+                            actualHeight = screenTexture.height;
+                            var screenPng = screenTexture.EncodeToPNG();
+                            if (screenPng == null || screenPng.Length == 0) throw new KnownError("render_failed", "PNG 编码结果为空（第 " + index + " 帧）");
+                            System.IO.File.WriteAllBytes(frameFile, screenPng);
+                        }
+                        catch (KnownError) { throw; }
+                        catch (Exception e) { throw new KnownError("render_failed", "ScreenCapture 失败（第 " + index + " 帧）：" + MessageOf(e)); }
+                        finally
+                        {
+                            if (screenTexture != null) UnityEngine.Object.DestroyImmediate(screenTexture);
+                        }
+                    }
+                    else
+                    {
+                        RenderTexture rt = null;
+                        try { rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB); }
+                        catch (Exception e) { throw new KnownError("render_failed", "无法创建 " + width + "x" + height + " 的 RenderTexture（第 " + index + " 帧）: " + MessageOf(e)); }
+                        if (rt == null) throw new KnownError("render_failed", "无法创建 " + width + "x" + height + " 的 RenderTexture（第 " + index + " 帧）");
+                        var previousTarget = cam.targetTexture;
+                        var previousActive = RenderTexture.active;
+                        Texture2D tex = null;
+                        try
+                        {
+                            cam.targetTexture = rt;
+                            cam.Render();
+                            RenderTexture.active = rt;
+                            tex = new Texture2D(width, height, TextureFormat.RGB24, false);
+                            tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                            tex.Apply();
+                            var cameraPng = tex.EncodeToPNG();
+                            if (cameraPng == null || cameraPng.Length == 0) throw new KnownError("render_failed", "PNG 编码结果为空（第 " + index + " 帧）");
+                            System.IO.File.WriteAllBytes(frameFile, cameraPng);
+                        }
+                        catch (KnownError) { throw; }
+                        catch (Exception e) { throw new KnownError("render_failed", "相机渲染截图失败（第 " + index + " 帧）：" + MessageOf(e)); }
+                        finally
+                        {
+                            cam.targetTexture = previousTarget;
+                            RenderTexture.active = previousActive;
+                            if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                            RenderTexture.ReleaseTemporary(rt);
+                        }
+                    }
                     frames.Add("Library/DSHBridge/artifacts/" + dirName + "/" + frameName);
                     if (intervalMs > 0 && index < count - 1) System.Threading.Thread.Sleep(intervalMs);
                 }
-                finally
-                {
-                    cam.targetTexture = previousTarget;
-                    RenderTexture.active = previousActive;
-                    if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
-                    RenderTexture.ReleaseTemporary(rt);
-                }
+            }
+            finally
+            {
+                if (prefetchedScreenTexture != null) UnityEngine.Object.DestroyImmediate(prefetchedScreenTexture);
             }
             clock.Stop();
+
             var d = new Dictionary<string, object>();
             d["dir"] = "Library/DSHBridge/artifacts/" + dirName;
             d["frames"] = frames;
+            d["frameTimestamps"] = frameTimestamps;
             d["count"] = (long)frames.Count;
-            d["width"] = (long)width;
-            d["height"] = (long)height;
+            d["width"] = (long)actualWidth;
+            d["height"] = (long)actualHeight;
+            if (actualWidth != width || actualHeight != height)
+            {
+                d["requestedWidth"] = (long)width;
+                d["requestedHeight"] = (long)height;
+            }
             d["target"] = target;
-            d["camera"] = cam.name;
+            d["camera"] = cam == null ? null : cam.name;
+            d["captureMode"] = useScreenCapture ? "screen" : "camera";
+            d["plannedDurationMs"] = plannedDurationMs;
+            d["budgetMs"] = (long)ScreenshotSequenceBudgetMs;
+            d["frameCostEstimateMs"] = frameCostMs;
             d["elapsedMs"] = clock.ElapsedMilliseconds;
             d["blocking"] = true;
+            AppendScreenshotFallback(d, fallbackReasons);
             return d;
         }
 
         // ===== 脚本编译校验（能力补全第 2 项补充，等价 MCP validate_script）=====
         // 复用 code.execute 的 mono-mcs 进程内编译链路：只编译、不执行，返回逐条诊断。
+        // 只接受 .cs：把 .json/.unity/.txt 当 C# 编译除了制造无意义语法错误没有任何价值。
         static Dictionary<string, object> ScriptValidate(Dictionary<string, object> args)
         {
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var full = ResolveProjectPath(path, "path");
+            if (!string.Equals(System.IO.Path.GetExtension(full), ".cs", StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("invalid_argument", "script.validate 只接受 .cs 文件（收到 " + path + "）");
             EnsureTextable(full, "path");
             if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
-            var code = System.IO.File.ReadAllText(full);
-            return ValidateCode(code, ToProjectRelative(full));
+            Encoding encoding;
+            bool hadBom;
+            string encodingName;
+            var code = DecodeTextFileWithEncoding(System.IO.File.ReadAllBytes(full), out encoding, out hadBom, out encodingName);
+            var response = ValidateCode(code, ToProjectRelative(full));
+            response["encoding"] = encodingName;
+            response["bom"] = hadBom;
+            return response;
         }
+
+        const int ValidateDiagnosticLimit = 200;
+        const int ValidateDefineLimit = 256;
 
         static Dictionary<string, object> ValidateCode(string code, string displayPath)
         {
@@ -373,9 +740,13 @@ namespace DSHBridge
                 }
                 if (seenEffective.Add(reference)) effectiveReferences.Add(reference);
             }
-            // 工程脚本通常带 UNITY_EDITOR 条件编译：不定义会让 Editor-only using 全部误报。
+            // define 必须来自工程真实编译配置：硬编码 UNITY_2022_3_OR_NEWER 会在其它引擎版本上
+            // 把 #if 分支带错，validate 的结论就不可信。优先用 CompilationPipeline 的 Editor 程序集
+            // （其 defines 就是 Unity 编译 Editor 脚本用的宏集），取不到再退回最小集 UNITY_EDITOR。
+            string definesSource;
+            var defines = CollectEditorCompilerDefines(out definesSource);
             SetProperty(parameters, "CompilerOptions",
-                "-nowarn:1685 -nowarn:1701 -nowarn:1702 -nostdlib -define:UNITY_EDITOR;UNITY_2022_3_OR_NEWER");
+                "-nowarn:1685 -nowarn:1701 -nowarn:1702 -nostdlib -define:" + string.Join(";", defines.ToArray()));
             var referenced = GetProperty(parameters, "ReferencedAssemblies");
             var addReference = referenced == null ? null : FindMethod(referenced.GetType(), "Add", delegate (ParameterInfo[] ps) { return ps.Length == 1 && ps[0].ParameterType == typeof(string); });
             if (addReference != null)
@@ -394,6 +765,7 @@ namespace DSHBridge
             var results = compile.Invoke(provider, new object[] { parameters, new string[] { code } });
             var errors = GetProperty(results, "Errors");
             var diagnostics = new List<object>();
+            var totalDiagnostics = 0;
             var errorCount = 0;
             var warningCount = 0;
             var errorCollection = errors as IEnumerable;
@@ -402,8 +774,12 @@ namespace DSHBridge
                 foreach (var item in errorCollection)
                 {
                     if (item == null) continue;
+                    // 计数在完整集合上做；只有 diagnostics 列表按上限截断（旧实现 break 后计数也不完整）。
+                    totalDiagnostics += 1;
                     var warning = GetProperty(item, "IsWarning");
                     var isWarning = warning is bool && (bool)warning;
+                    if (isWarning) warningCount += 1; else errorCount += 1;
+                    if (diagnostics.Count >= ValidateDiagnosticLimit) continue;
                     var row = new Dictionary<string, object>();
                     row["id"] = System.Convert.ToString(GetProperty(item, "ErrorNumber"), CultureInfo.InvariantCulture);
                     row["message"] = System.Convert.ToString(GetProperty(item, "ErrorText"), CultureInfo.InvariantCulture) ?? string.Empty;
@@ -411,22 +787,102 @@ namespace DSHBridge
                     row["column"] = System.Convert.ToInt64(GetProperty(item, "Column") ?? 0L, CultureInfo.InvariantCulture);
                     row["severity"] = isWarning ? "warning" : "error";
                     diagnostics.Add(row);
-                    if (isWarning) warningCount += 1; else errorCount += 1;
-                    if (diagnostics.Count >= 200) break;
                 }
             }
+            // valid 以 CodeDOM 错误集合自身的 HasErrors 为准（完整集合语义），计数只作展示/兜底。
+            var hasErrorsMember = GetProperty(errors, "HasErrors");
+            var hasErrors = hasErrorsMember is bool ? (bool)hasErrorsMember : errorCount > 0;
             clock.Stop();
             var d = new Dictionary<string, object>();
             d["path"] = displayPath;
-            d["valid"] = errorCount == 0;
+            d["valid"] = !hasErrors;
             d["errorCount"] = (long)errorCount;
             d["warningCount"] = (long)warningCount;
             d["diagnostics"] = diagnostics;
+            d["truncated"] = totalDiagnostics > diagnostics.Count;
+            d["totalDiagnostics"] = (long)totalDiagnostics;
+            d["definesSource"] = definesSource;
+            d["defineCount"] = (long)defines.Count;
             d["backend"] = "mono-mcs";
             d["elapsedMs"] = clock.ElapsedMilliseconds;
             d["referencesCached"] = referencesCached;
             d["referencesBuildMs"] = referencesBuildMs;
             return d;
+        }
+
+        /// <summary>
+        /// 取「Unity 编译 Editor 脚本时实际使用的宏集」：Editor 程序集的 defines 已包含
+        /// 引擎版本宏（UNITY_2022_3_OR_NEWER 等）、平台宏与工程脚本自定义宏。
+        /// 任何反射/管线异常都退回最小集，不让 validate 因为取不到宏而整体失败。
+        /// </summary>
+        static List<string> CollectEditorCompilerDefines(out string source)
+        {
+            var defines = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var pipelineAvailable = false;
+            try
+            {
+                var editorAssemblies = CompilationPipeline.GetAssemblies(AssembliesType.Editor);
+                if (editorAssemblies != null)
+                {
+                    for (var i = 0; i < editorAssemblies.Length; i++)
+                    {
+                        var values = ReadStringArrayMember(editorAssemblies[i], "defines");
+                        if (values == null) continue;
+                        pipelineAvailable = true;
+                        for (var j = 0; j < values.Length; j++)
+                        {
+                            var define = (values[j] ?? string.Empty).Trim();
+                            // 宏来自工程配置，直接拼进 -define: 有参数注入风险：只接受合法 C# 标识符。
+                            if (!IsValidScriptingDefine(define)) continue;
+                            if (defines.Count >= ValidateDefineLimit) break;
+                            if (seen.Add(define)) defines.Add(define);
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            if (!pipelineAvailable || defines.Count == 0)
+            {
+                source = "fallback";
+                return new List<string> { "UNITY_EDITOR" };
+            }
+            if (seen.Add("UNITY_EDITOR")) defines.Add("UNITY_EDITOR");
+            defines.Sort(StringComparer.Ordinal);
+            source = "compilation-pipeline";
+            return defines;
+        }
+
+        /// <summary>按属性/字段名读 string[]（defines 在 UnityEditor.Compilation.Assembly 上是属性）。</summary>
+        static string[] ReadStringArrayMember(object target, string memberName)
+        {
+            if (target == null) return null;
+            var type = target.GetType();
+            try
+            {
+                var property = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.Instance);
+                if (property != null) return property.GetValue(target, null) as string[];
+                var field = type.GetField(memberName, BindingFlags.Public | BindingFlags.Instance);
+                if (field != null) return field.GetValue(target) as string[];
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        /// <summary>只接受 ASCII C# 标识符形式的宏名（长度 ≤64）。</summary>
+        static bool IsValidScriptingDefine(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length > 64) return false;
+            for (var i = 0; i < value.Length; i++)
+            {
+                var c = value[i];
+                var isLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+                if (isLetter) continue;
+                if (i == 0) return false;
+                var isDigit = c >= '0' && c <= '9';
+                if (!isDigit && c != '_') return false;
+            }
+            return true;
         }
     }
 }

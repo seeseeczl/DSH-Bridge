@@ -33,6 +33,9 @@ namespace DSHBridge
         static string PutHandle(object obj)
         {
             if (obj == null) return null;
+            // P1-1：句柄是跨请求复用的对象通道。元编程对象（Type/MethodInfo/...）一旦进表，
+            // 下一步就能拿它继续 GetMethod → Invoke，绕过类型/成员黑名单，因此必须在入口拒绝。
+            EnsureValueTypeAllowed(obj, "句柄化对象");
             var key = "h" + (++_handleSeq).ToString(CultureInfo.InvariantCulture);
             _handles[key] = obj;
             _handleOrder.Enqueue(key);
@@ -130,34 +133,47 @@ namespace DSHBridge
             var includeInactive = ToBool(args, "includeInactive");
 
             var results = new List<object>();
+            long total = 0;
             if (!string.IsNullOrEmpty(path))
             {
                 var t = FindTransformByPath(path);
-                if (t != null) results.Add(DescribeRef(t.gameObject));
+                if (t != null) { total = 1; results.Add(DescribeRef(t.gameObject)); }
             }
             else
             {
+                // P2：component 过滤同时接受短名（Image）与全名（UnityEngine.UI.Image）。
+                // 先按名字解析成 Type，命中后按 IsAssignableFrom 匹配（含基类/接口）；解析不到再退回名称比较。
+                var componentType = string.IsNullOrEmpty(component) ? null : FindType(component);
                 foreach (var go in AllSceneObjects(includeInactive))
                 {
                     if (!string.IsNullOrEmpty(name) && go.name.IndexOf(name, StringComparison.OrdinalIgnoreCase) < 0) continue;
                     if (!string.IsNullOrEmpty(tag) && !go.CompareTag(tag)) continue;
-                    if (!string.IsNullOrEmpty(component))
-                    {
-                        var has = false;
-                        foreach (var c in go.GetComponents<Component>())
-                        {
-                            if (c != null && c.GetType().Name == component) { has = true; break; }
-                        }
-                        if (!has) continue;
-                    }
-                    results.Add(DescribeRef(go));
-                    if (results.Count >= limit) break;
+                    if (!string.IsNullOrEmpty(component) && !HasComponentMatching(go, component, componentType)) continue;
+                    total++;
+                    if (results.Count < limit) results.Add(DescribeRef(go));
                 }
             }
             var d = new Dictionary<string, object>();
             d["count"] = (long)results.Count;
+            d["total"] = total;
+            // P2：truncated 统一用「还有未返回的匹配项」判定，恰好等于 limit 时不能误报截断。
+            d["truncated"] = total > (long)results.Count;
             d["objects"] = results;
             return d;
+        }
+
+        /// <summary>P2：component 过滤同时支持短名与全名；类型解析失败时退回名称比较，不因拼写不同漏匹配。</summary>
+        static bool HasComponentMatching(GameObject go, string wanted, Type wantedType)
+        {
+            foreach (var candidate in go.GetComponents<Component>())
+            {
+                if (candidate == null) continue;
+                var type = candidate.GetType();
+                if (wantedType != null && wantedType.IsAssignableFrom(type)) return true;
+                if (string.Equals(type.Name, wanted, StringComparison.OrdinalIgnoreCase)) return true;
+                if (!string.IsNullOrEmpty(type.FullName) && string.Equals(type.FullName, wanted, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         static object ResolveTarget(Dictionary<string, object> args, out Type staticType)
@@ -180,6 +196,8 @@ namespace DSHBridge
             var assetPath = GetString(args, "asset");
             if (!string.IsNullOrEmpty(assetPath))
             {
+                // AA-OPT-002：资产路径同样先归一化到工程内相对路径，不把原始字符串直传 AssetDatabase。
+                assetPath = ResolveAssetPath(assetPath, "asset");
                 var obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
                 if (obj == null) throw new KnownError("asset_not_found", "找不到资产: " + assetPath);
                 return obj;
@@ -230,10 +248,14 @@ namespace DSHBridge
             if (rawArgs == null) rawArgs = new List<object>();
 
             var type = ResolveBoundType(target, staticType);
+            // P1-1：目标对象 / 静态声明类型 / 实际运行时类型三者都要过黑名单，
+            // 避免「静态类型合法、实际对象是 MethodInfo」这类绕过。
+            EnsureReflectionTargetAllowed(target, staticType);
             // AA-OPT-001：只允许公开成员，且不得触碰硬拒绝清单里的成员。
             EnsureMemberAllowed(type, member, staticType != null);
             var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy
                 | (staticType != null ? BindingFlags.Static : BindingFlags.Instance);
+            var instance = staticType != null ? null : target;
 
             object result = null;
             string usedKind = null;
@@ -243,8 +265,9 @@ namespace DSHBridge
                 var prop = type.GetProperty(member, flags);
                 if (prop != null)
                 {
-                    if (args.ContainsKey("value")) prop.SetValue(staticType != null ? null : target, Coerce(args["value"], prop.PropertyType), null);
-                    else if (prop.CanRead) result = prop.GetValue(staticType != null ? null : target, null);
+                    // P2：value 转换与 reflect.invoke / component.set 对齐（handle/asset/向量/颜色/枚举）。
+                    if (args.ContainsKey("value")) prop.SetValue(instance, CoerceApiValue(args["value"], prop.PropertyType), null);
+                    else if (prop.CanRead) result = prop.GetValue(instance, null);
                     usedKind = "property";
                 }
             }
@@ -253,8 +276,8 @@ namespace DSHBridge
                 var field = type.GetField(member, flags);
                 if (field != null)
                 {
-                    if (args.ContainsKey("value")) field.SetValue(staticType != null ? null : target, Coerce(args["value"], field.FieldType));
-                    else result = field.GetValue(staticType != null ? null : target);
+                    if (args.ContainsKey("value")) field.SetValue(instance, CoerceApiValue(args["value"], field.FieldType));
+                    else result = field.GetValue(instance);
                     usedKind = "field";
                 }
             }
@@ -264,11 +287,14 @@ namespace DSHBridge
                 if (method != null)
                 {
                     EnsureMethodCallable(method);
-                    result = method.Invoke(staticType != null ? null : target, ConvertArgs(method.GetParameters(), rawArgs));
+                    result = method.Invoke(instance, ConvertArgs(method.GetParameters(), rawArgs));
                     usedKind = "method";
                 }
             }
             if (usedKind == null) throw new KnownError("member_not_found", "找不到成员: " + type.Name + "." + member);
+
+            // P1-1：返回的若是元编程对象（Type/MethodInfo/...），绝不能把句柄交给调用方继续 Invoke/GetMethod。
+            EnsureValueTypeAllowed(result, "返回值");
 
             var d = new Dictionary<string, object>();
             d["kind"] = usedKind;
@@ -293,12 +319,135 @@ namespace DSHBridge
             return target.GetType();
         }
 
+        /// <summary>
+        /// P1-1：元编程类型判定。Type/MethodInfo/FieldInfo/ConstructorInfo/PropertyInfo/Assembly/
+        /// Activator/Delegate 这类对象本身就是「可以继续驱动反射」的句柄，典型绕过链是
+        /// Type.GetType → GetMethod → Invoke；因此它们既不能作为反射目标，也不能作为返回值/句柄流出。
+        /// </summary>
+        static bool IsMetaprogrammingType(Type type)
+        {
+            if (type == null) return false;
+            // Type 与所有反射成员信息类型（RuntimeType/MethodInfo/FieldInfo/PropertyInfo/ConstructorInfo…）。
+            if (typeof(System.Reflection.MemberInfo).IsAssignableFrom(type)) return true;
+            if (typeof(System.Reflection.Assembly).IsAssignableFrom(type)) return true;
+            if (typeof(System.Reflection.Module).IsAssignableFrom(type)) return true;
+            if (typeof(System.Reflection.ParameterInfo).IsAssignableFrom(type)) return true;
+            if (typeof(System.Reflection.AssemblyName).IsAssignableFrom(type)) return true;
+            // 委托句柄可以被 DynamicInvoke 直接调用，同样视为可执行句柄。
+            if (typeof(Delegate).IsAssignableFrom(type)) return true;
+            if (type == typeof(System.Activator)) return true;
+            var space = type.Namespace;
+            // System.Reflection.Emit（动态生成 IL）等子命名空间属于执行面入口，一并拒绝。
+            if (!string.IsNullOrEmpty(space)
+                && (space == "System.Reflection" || space.StartsWith("System.Reflection.", StringComparison.Ordinal)))
+                return true;
+            return false;
+        }
+
         static void EnsureTypeAllowed(Type type)
         {
             if (type == null) throw new KnownError("type_not_found", "类型为空");
             var name = type.FullName ?? type.Name;
             if (_deniedTypes.Contains(name) || _deniedTypes.Contains(type.Name))
                 throw new KnownError("type_denied", "类型 " + name + " 在硬拒绝清单内（启动/资产库/进程控制类 API）");
+            // P1-1：_deniedTypes 是字符串清单，版本升级可能漏项；元编程类型在这里兜底硬拒绝。
+            if (IsMetaprogrammingType(type))
+                throw new KnownError("type_denied", "类型 " + name + " 属于元编程句柄（Type/Reflection/Activator/Delegate），已拒绝");
+        }
+
+        /// <summary>
+        /// P1-1：目标对象 / 静态声明类型 / 实际运行时类型三者都要过黑名单。
+        /// 例如静态类型是合法基类、实际对象却是 MethodInfo 时，只看静态类型会漏判。
+        /// </summary>
+        static void EnsureReflectionTargetAllowed(object target, Type staticType)
+        {
+            if (staticType != null) EnsureTypeAllowed(staticType);
+            if (target != null) EnsureTypeAllowed(target.GetType());
+        }
+
+        /// <summary>
+        /// P1-1：反射/执行面的返回值安全检查。允许调用方拿到对象句柄继续操作，
+        /// 但绝不把元编程句柄（Type/MethodInfo/Assembly/Delegate…）交给调用方继续链式调用。
+        /// </summary>
+        static void EnsureValueTypeAllowed(object value, string what)
+        {
+            if (value == null) return;
+            try { EnsureTypeAllowed(value.GetType()); }
+            catch (KnownError e)
+            {
+                throw new KnownError(e.Code, (what ?? "值") + "被拒绝: " + e.Message, e.Detail);
+            }
+        }
+
+        /// <summary>
+        /// P2：api.invoke 的 value 赋值转换，与 reflection 面（ReflectMember/component.set 的 CoerceValue）对齐。
+        /// 等价语义：{handle}/{asset} 引用、UnityEngine 向量/颜色、枚举、字符串、数组、基元。
+        /// </summary>
+        static object CoerceApiValue(object raw, Type target)
+        {
+            if (raw == null) return DefaultOf(target);
+            if (target.IsInstanceOfType(raw)) return raw;
+            var vector = ParseApiVectorLike(target, raw);
+            if (vector != null) return vector;
+            var dict = raw as Dictionary<string, object>;
+            if (dict != null && (dict.ContainsKey("handle") || dict.ContainsKey("asset")))
+            {
+                var handle = GetString(dict, "handle");
+                if (!string.IsNullOrEmpty(handle))
+                {
+                    var obj = GetHandle(handle);
+                    if (obj != null && target.IsInstanceOfType(obj)) return obj;
+                }
+                var asset = GetString(dict, "asset");
+                if (!string.IsNullOrEmpty(asset))
+                {
+                    var loaded = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(asset);
+                    if (loaded != null && target.IsInstanceOfType(loaded)) return loaded;
+                }
+            }
+            if (target.IsEnum) return Enum.Parse(target, System.Convert.ToString(raw, CultureInfo.InvariantCulture), true);
+            if (target == typeof(string)) return System.Convert.ToString(raw, CultureInfo.InvariantCulture);
+            return Coerce(raw, target);
+        }
+
+        /// <summary>P2：{x,y,z,w}/数组/#RRGGBB 形式的 Unity 值类型解析（与 Scene 域的 ParseVectorLike 等价）。</summary>
+        static object ParseApiVectorLike(Type target, object raw)
+        {
+            if (raw == null) return null;
+            var dict = raw as Dictionary<string, object>;
+            var list = raw as List<object>;
+            float Get(string axis, int index)
+            {
+                if (dict != null && dict.ContainsKey(axis)) return (float)System.Convert.ToDouble(dict[axis], CultureInfo.InvariantCulture);
+                if (list != null && list.Count > index) return (float)System.Convert.ToDouble(list[index], CultureInfo.InvariantCulture);
+                return 0f;
+            }
+            if (target == typeof(Vector2)) return new Vector2(Get("x", 0), Get("y", 1));
+            if (target == typeof(Vector3)) return new Vector3(Get("x", 0), Get("y", 1), Get("z", 2));
+            if (target == typeof(Vector4)) return new Vector4(Get("x", 0), Get("y", 1), Get("z", 2), Get("w", 3));
+            if (target == typeof(Quaternion))
+            {
+                if (dict != null && dict.ContainsKey("euler"))
+                {
+                    var e = dict["euler"] as List<object> ?? new List<object>();
+                    return Quaternion.Euler(
+                        e.Count > 0 ? (float)System.Convert.ToDouble(e[0], CultureInfo.InvariantCulture) : 0f,
+                        e.Count > 1 ? (float)System.Convert.ToDouble(e[1], CultureInfo.InvariantCulture) : 0f,
+                        e.Count > 2 ? (float)System.Convert.ToDouble(e[2], CultureInfo.InvariantCulture) : 0f);
+                }
+                return new Quaternion(Get("x", 0), Get("y", 1), Get("z", 2), Get("w", 3));
+            }
+            if (target == typeof(Color))
+            {
+                var s = raw as string;
+                if (!string.IsNullOrEmpty(s) && s.StartsWith("#"))
+                {
+                    Color parsed;
+                    if (ColorUtility.TryParseHtmlString(s, out parsed)) return parsed;
+                }
+                return new Color(Get("r", 0), Get("g", 1), Get("b", 2), dict != null && dict.ContainsKey("a") ? Get("a", 3) : 1f);
+            }
+            return null;
         }
 
         static void EnsureMemberAllowed(Type type, string member, bool isStatic)
@@ -333,32 +482,35 @@ namespace DSHBridge
             Type staticType;
             var target = ResolveTarget(args, out staticType);
             var type = ResolveBoundType(target, staticType);
-            EnsureTypeAllowed(type);
+            // P1-1：静态类型与实际对象类型都要过黑名单。
+            EnsureReflectionTargetAllowed(target, staticType);
             var filter = GetString(args, "filter");
             var limit = (int)Math.Max(1, Math.Min(300, ToLong(args, "limit", 80)));
             // 只列公开成员：非公开成员不可调用，列出来只会误导调用方。
             var flags = BindingFlags.Public | BindingFlags.FlattenHierarchy | BindingFlags.Instance | BindingFlags.Static;
             var rows = new List<object>();
+            long total = 0;
             foreach (var m in type.GetMethods(flags))
             {
                 if (m.IsSpecialName) continue;
                 if (!string.IsNullOrEmpty(filter) && m.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                rows.Add(m.Name + "(" + string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name).ToArray()) + ") : " + m.ReturnType.Name);
-                if (rows.Count >= limit) break;
+                total++;
+                if (rows.Count < limit)
+                    rows.Add(m.Name + "(" + string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name).ToArray()) + ") : " + m.ReturnType.Name);
             }
-            if (rows.Count < limit)
+            foreach (var p in type.GetProperties(flags))
             {
-                foreach (var p in type.GetProperties(flags))
-                {
-                    if (!string.IsNullOrEmpty(filter) && p.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (!string.IsNullOrEmpty(filter) && p.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                total++;
+                if (rows.Count < limit)
                     rows.Add((p.CanRead ? "get " : "") + (p.CanWrite ? "set " : "") + p.PropertyType.Name + " " + p.Name);
-                    if (rows.Count >= limit) break;
-                }
             }
             var d = new Dictionary<string, object>();
             d["type"] = type.FullName;
             d["members"] = rows;
-            d["truncated"] = (long)rows.Count >= limit ? 1L : 0L;
+            d["total"] = total;
+            // P2：truncated 用 total > limit 判定；恰好等于 limit 时不能误报截断。
+            d["truncated"] = total > (long)limit;
             return d;
         }
 
@@ -407,6 +559,8 @@ namespace DSHBridge
                 }
                 if (hits.Count >= limit) break;
             }
+            // P2：命中数触顶说明后面可能还有匹配，不能只靠时间预算标记截断。
+            if (hits.Count >= limit) truncated = true;
             clock.Stop();
             var result = new Dictionary<string, object>();
             result["scanned"] = (long)scanned;
@@ -426,16 +580,98 @@ namespace DSHBridge
             EnsureTextable(full, "path");
             var maxLines = (int)Math.Max(1, Math.Min(2000, ToLong(args, "lines", 400)));
             var offset = (int)Math.Max(0, ToLong(args, "offset", 0));
-            string[] lines;
-            try { lines = System.IO.File.ReadAllLines(full); }
+            var lines = new List<string>(Math.Min(maxLines, 256));
+            long totalLines = 0;
+            var truncated = false;
+            try
+            {
+                // P2：逐行流式读取，大文件不再整读进内存；只取目标区间，超出即标记 truncated。
+                using (var reader = new System.IO.StreamReader(full, new UTF8Encoding(false), true))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        totalLines++;
+                        if (totalLines <= offset) continue;
+                        if (lines.Count < maxLines) { lines.Add(line); continue; }
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
             catch (Exception e) { throw new KnownError("read_failed", "读取失败: " + e.Message); }
-            var slice = lines.Skip(offset).Take(maxLines).ToArray();
             var d = new Dictionary<string, object>();
             d["assetPath"] = ToProjectRelative(full);
-            d["totalLines"] = (long)lines.Length;
             d["offset"] = (long)offset;
-            d["text"] = string.Join("\n", slice);
+            d["truncated"] = truncated;
+            if (!truncated) d["totalLines"] = totalLines;
+            else d["nextOffset"] = (long)(offset + lines.Count);
+            d["text"] = string.Join("\n", lines.ToArray());
             return d;
+        }
+
+        // P1-2：探针自身源码目录（embedded package 与旧版安装位置）。写能力不得改写这些文件，
+        // 否则一次编译就会执行任意代码，等于绕过 DSH 侧的能力授权语义。
+        const string ProbePackagePrefix = "Packages/com.dsh.bridge/";
+        const string LegacyProbePrefix = "Assets/DSHBridge/";
+
+        /// <summary>P1-2：任何写路径先过这里；探针自身源码目录一律 path_denied。</summary>
+        static void EnsureWritableAssetPath(string assetPath, string what)
+        {
+            var normalized = (assetPath ?? string.Empty).Replace('\\', '/');
+            if (normalized.StartsWith(ProbePackagePrefix, StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("path_denied", what + " 不允许写入探针自身源码目录 " + ProbePackagePrefix + assetPath);
+            if (normalized.StartsWith(LegacyProbePrefix, StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("path_denied", what + " 不允许写入旧版探针目录 " + LegacyProbePrefix + assetPath);
+        }
+
+        /// <summary>资产是否已存在：文件夹、AssetDatabase 已导入对象、磁盘文件三者任一命中即算存在。</summary>
+        static bool AssetExists(string assetPath)
+        {
+            if (AssetDatabase.IsValidFolder(assetPath)) return true;
+            if (AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath) != null) return true;
+            try
+            {
+                var full = ResolveProjectPath(assetPath, "path");
+                return System.IO.File.Exists(full) || System.IO.Directory.Exists(full);
+            }
+            catch (KnownError) { return false; }
+        }
+
+        /// <summary>
+        /// P2：material 的默认 shader 按当前渲染管线选择。URP/HDRP 下没有 "Standard"，
+        /// 直接回退 Standard 会报错，所以按管线优先，最后才用 Built-in 的 Standard/内置错误 shader 兜底。
+        /// </summary>
+        static Shader FindDefaultMaterialShader()
+        {
+            var candidates = new List<string>();
+            try
+            {
+                var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+                var pipelineName = pipeline == null ? string.Empty : (pipeline.GetType().FullName ?? string.Empty);
+                if (pipelineName.IndexOf("HDRenderPipeline", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pipelineName.IndexOf("HighDefinition", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    candidates.Add("HDRP/Lit");
+                }
+                else if (pipelineName.IndexOf("Universal", StringComparison.OrdinalIgnoreCase) >= 0
+                    || pipelineName.IndexOf("Lightweight", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    candidates.Add("Universal Render Pipeline/Lit");
+                    candidates.Add("Universal Render Pipeline/Simple Lit");
+                    candidates.Add("Universal Render Pipeline/Unlit");
+                }
+            }
+            catch (Exception) { }
+            // Built-in（或管线探测失败）回退 Standard；最后用 Unity 内置错误 shader 兜底，避免此处直接报错。
+            candidates.Add("Standard");
+            candidates.Add("Hidden/InternalErrorShader");
+            for (var i = 0; i < candidates.Count; i++)
+            {
+                var shader = Shader.Find(candidates[i]);
+                if (shader != null) return shader;
+            }
+            return null;
         }
 
         static Dictionary<string, object> AssetCreate(Dictionary<string, object> args)
@@ -445,8 +681,13 @@ namespace DSHBridge
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             // AA-OPT-003：path 此前直接被 Path.Combine(工程根, path) 拼成写盘目标，../ 与绝对路径都能逃逸。
             var assetPath = ResolveAssetPath(path, "path");
+            // P1-2：探针自身源码目录是提权入口，任何 kind 都不允许写。
+            EnsureWritableAssetPath(assetPath, "path");
             var content = GetString(args, "content");
+            // P1-2：写能力默认不覆盖；已存在时必须显式 overwrite:true（脚本 .cs 尤其危险）。
+            var overwrite = ToBool(args, "overwrite");
             var created = false;
+            var overwritten = false;
 
             if (kind == "folder")
             {
@@ -456,41 +697,69 @@ namespace DSHBridge
                     var leaf = System.IO.Path.GetFileName(assetPath);
                     if (string.IsNullOrEmpty(parent)) throw new KnownError("invalid_argument", "无法创建工程根目录下的文件夹");
                     AssetDatabase.CreateFolder(parent, leaf);
+                    // P2：CreateFolder 失败时不抛异常，必须回查资产库确认。
+                    if (!AssetDatabase.IsValidFolder(assetPath))
+                        throw new KnownError("io_error", "文件夹创建失败: " + assetPath);
+                    created = true;
                 }
-                created = true;
             }
-            else if (kind == "script")
+            else if (kind == "script" || kind == "shader" || kind == "text")
             {
-                var name = System.IO.Path.GetFileNameWithoutExtension(assetPath);
-                if (content == null) content = DefaultScript(name);
+                var full = ResolveProjectPath(assetPath, "path");
+                EnsureTextable(full, "path");
+                var exists = System.IO.File.Exists(full);
+                if (exists && !overwrite)
+                    throw new KnownError("already_exists", "目标已存在；如需覆盖请显式传 overwrite:true: " + assetPath);
+                if (content == null)
+                {
+                    var name = System.IO.Path.GetFileNameWithoutExtension(assetPath);
+                    if (kind == "script") content = DefaultScript(name);
+                    else if (kind == "shader") content = DefaultShader(name);
+                    else content = string.Empty;
+                }
                 WriteTextAsset(assetPath, content);
-                created = true;
-            }
-            else if (kind == "shader")
-            {
-                if (content == null) content = DefaultShader(System.IO.Path.GetFileNameWithoutExtension(assetPath));
-                WriteTextAsset(assetPath, content);
-                created = true;
-            }
-            else if (kind == "text")
-            {
-                WriteTextAsset(assetPath, content ?? "");
-                created = true;
+                created = !exists;
+                overwritten = exists;
             }
             else if (kind == "material")
             {
-                var shaderName = GetString(args, "shader") ?? "Standard";
-                var shader = Shader.Find(shaderName);
-                if (shader == null) throw new KnownError("shader_not_found", "找不到 Shader: " + shaderName);
-                var mat = new Material(shader);
-                AssetDatabase.CreateAsset(mat, assetPath);
-                created = true;
+                var exists = AssetExists(assetPath);
+                if (exists && !overwrite)
+                    throw new KnownError("already_exists", "目标已存在；如需覆盖请显式传 overwrite:true: " + assetPath);
+                if (exists) AssetDatabase.DeleteAsset(assetPath);
+                var shaderName = GetString(args, "shader");
+                var shader = string.IsNullOrEmpty(shaderName) ? FindDefaultMaterialShader() : Shader.Find(shaderName);
+                if (shader == null)
+                {
+                    throw new KnownError("shader_not_found", string.IsNullOrEmpty(shaderName)
+                        ? "当前渲染管线找不到可用的默认 Lit Shader；请显式传 shader"
+                        : "找不到 Shader: " + shaderName);
+                }
+                var material = new Material(shader);
+                try
+                {
+                    AssetDatabase.CreateAsset(material, assetPath);
+                }
+                catch (Exception e)
+                {
+                    UnityEngine.Object.DestroyImmediate(material);
+                    throw new KnownError("io_error", "材质创建失败: " + e.Message);
+                }
+                if (!AssetExists(assetPath))
+                {
+                    // P2：CreateAsset 失败时清理临时材质实例，避免留下泄漏对象。
+                    UnityEngine.Object.DestroyImmediate(material);
+                    throw new KnownError("io_error", "材质创建失败（资产库中不存在）: " + assetPath);
+                }
+                created = !exists;
+                overwritten = exists;
             }
             else throw new KnownError("unsupported_kind", "不支持的 kind: " + kind);
 
             AssetDatabase.Refresh();
             var d = new Dictionary<string, object>();
             d["created"] = created;
+            d["overwritten"] = overwritten;
             d["assetPath"] = assetPath;
             d["kind"] = kind;
             return d;
@@ -498,8 +767,9 @@ namespace DSHBridge
 
         static void WriteTextAsset(string assetPath, string content)
         {
-            // 二次确认：即使上层漏判，这里也会再次拦下越界写入。
+            // 二次确认：即使上层漏判，这里也会再次拦下越界写入与探针源码写入。
             var full = ResolveProjectPath(assetPath, "path");
+            EnsureWritableAssetPath(ToProjectRelative(full), "path");
             EnsureTextable(full, "path");
             var dir = System.IO.Path.GetDirectoryName(full);
             if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
@@ -578,8 +848,44 @@ namespace DSHBridge
             var d = new Dictionary<string, object>();
             d["total"] = (long)guids.Length;
             d["scenes"] = rows;
+            // P2：截断标记统一为 total > limit。
+            d["truncated"] = guids.Length > limit;
             d["active"] = UnityEngine.SceneManagement.SceneManager.GetActiveScene().path;
             return d;
+        }
+
+        /// <summary>
+        /// P2：scene.open 的 mode 严格枚举。拼错不允许静默降级成 Single（会丢掉 additive 语义），
+        /// 未知值一律 invalid_argument。
+        /// </summary>
+        static UnityEditor.SceneManagement.OpenSceneMode ParseOpenSceneMode(string mode)
+        {
+            var normalized = (mode ?? "single").Trim();
+            if (string.Equals(normalized, "single", StringComparison.OrdinalIgnoreCase))
+                return UnityEditor.SceneManagement.OpenSceneMode.Single;
+            if (string.Equals(normalized, "additive", StringComparison.OrdinalIgnoreCase))
+                return UnityEditor.SceneManagement.OpenSceneMode.Additive;
+            if (string.Equals(normalized, "additiveWithoutLoading", StringComparison.OrdinalIgnoreCase))
+            {
+                // AdditiveWithoutLoading 是 Unity 5.3+ 的固定枚举值；按名称解析，避免离线桩缺该成员时编译失败。
+                return (UnityEditor.SceneManagement.OpenSceneMode)Enum.Parse(
+                    typeof(UnityEditor.SceneManagement.OpenSceneMode), "AdditiveWithoutLoading", false);
+            }
+            throw new KnownError("invalid_argument", "mode 只能是 single / additive / additiveWithoutLoading，实际: " + (mode ?? ""));
+        }
+
+        /// <summary>P2：Single 模式会卸载当前已加载场景；有未保存改动时必须显式 discardChanges:true。</summary>
+        static void EnsureNoDirtyScenes(bool discardChanges)
+        {
+            if (discardChanges) return;
+            var count = UnityEngine.SceneManagement.SceneManager.sceneCount;
+            for (var i = 0; i < count; i++)
+            {
+                var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                if (!scene.IsValid() || !scene.isDirty) continue;
+                var label = string.IsNullOrEmpty(scene.path) ? scene.name : scene.path;
+                throw new KnownError("scene_dirty", "场景 " + label + " 有未保存修改；先 unity.scene.save，或显式传 discardChanges:true 丢弃");
+            }
         }
 
         static Dictionary<string, object> SceneOpen(Dictionary<string, object> args)
@@ -587,11 +893,24 @@ namespace DSHBridge
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             if (EditorApplication.isPlaying) throw new KnownError("invalid_state", "Play Mode 下不能切换场景");
-            var mode = GetString(args, "mode") ?? "single";
-            var opened = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(
-                path, mode == "additive" ? UnityEditor.SceneManagement.OpenSceneMode.Additive : UnityEditor.SceneManagement.OpenSceneMode.Single);
+            // P1-3：scene 路径必须走统一的工程内路径闸门，并限定 .unity 扩展名。
+            var assetPath = ResolveAssetPath(path, "path");
+            if (!assetPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("invalid_argument", "scene path 必须以 .unity 结尾: " + assetPath);
+            if (!System.IO.File.Exists(ResolveProjectPath(assetPath, "path")))
+                throw new KnownError("not_found", "场景文件不存在: " + assetPath);
+            // P2：mode 严格枚举；Single 覆盖前检查未保存改动。
+            var modeText = GetString(args, "mode") ?? "single";
+            var openMode = ParseOpenSceneMode(modeText);
+            if (openMode == UnityEditor.SceneManagement.OpenSceneMode.Single)
+                EnsureNoDirtyScenes(ToBool(args, "discardChanges"));
+            var opened = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(assetPath, openMode);
+            // P2：OpenScene 失败时可能不抛异常而返回无效 Scene，必须显式报错。
+            if (!opened.IsValid()) throw new KnownError("io_error", "打开场景失败: " + assetPath);
             var d = new Dictionary<string, object>();
-            d["opened"] = opened.path;
+            d["opened"] = string.IsNullOrEmpty(opened.path) ? assetPath : opened.path;
+            d["assetPath"] = assetPath;
+            d["mode"] = modeText;
             d["sceneCount"] = (long)UnityEngine.SceneManagement.SceneManager.sceneCount;
             return d;
         }
@@ -600,18 +919,42 @@ namespace DSHBridge
         {
             var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
             if (!scene.IsValid()) throw new KnownError("invalid_state", "没有有效场景");
+            if (EditorApplication.isPlaying) throw new KnownError("invalid_state", "Play Mode 下不能保存场景");
             var target = GetString(args, "path");
-            if (string.IsNullOrEmpty(target) && string.IsNullOrEmpty(scene.path))
+            string savedPath;
+            if (string.IsNullOrEmpty(target))
             {
-                // 未保存过的新场景调 SaveScene 会弹出「另存为」模态框并阻塞编辑器，必须显式给 path。
-                throw new KnownError("scene_not_saved", "当前场景尚未保存到磁盘；请用 path 参数指定目标路径后再保存");
+                if (string.IsNullOrEmpty(scene.path))
+                {
+                    // 未保存过的新场景调 SaveScene 会弹出「另存为」模态框并阻塞编辑器，必须显式给 path。
+                    throw new KnownError("scene_not_saved", "当前场景尚未保存到磁盘；请用 path 参数指定目标路径后再保存");
+                }
+                // 覆盖当前场景：路径同样过闸门，失败时给出明确错误码。
+                savedPath = ResolveAssetPath(scene.path, "path");
+            }
+            else
+            {
+                savedPath = ResolveAssetPath(target, "path");
+            }
+            // P1-2：场景保存也是写路径，不允许写进探针自身源码目录。
+            EnsureWritableAssetPath(savedPath, "path");
+            if (!savedPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("invalid_argument", "scene path 必须以 .unity 结尾: " + savedPath);
+            var full = ResolveProjectPath(savedPath, "path");
+            if (!string.IsNullOrEmpty(target))
+            {
+                var dir = System.IO.Path.GetDirectoryName(full);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    throw new KnownError("not_found", "目标目录不存在: " + ToProjectRelative(dir));
             }
             var ok = string.IsNullOrEmpty(target)
                 ? UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene)
-                : UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene, target);
+                : UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene, savedPath);
+            // P1-3：保存失败必须抛错，不能返回 saved:false 让外层信封 ok:true。
+            if (!ok) throw new KnownError("io_error", "保存场景失败: " + savedPath);
             var d = new Dictionary<string, object>();
-            d["saved"] = ok;
-            d["path"] = string.IsNullOrEmpty(target) ? scene.path : target;
+            d["saved"] = true;
+            d["path"] = savedPath;
             return d;
         }
 
@@ -628,6 +971,8 @@ namespace DSHBridge
             }
             else if (!string.IsNullOrEmpty(assetPath))
             {
+                // AA-OPT-002：选择资产同样先归一化到工程内相对路径。
+                assetPath = ResolveAssetPath(assetPath, "asset");
                 target = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
                 if (target == null) throw new KnownError("asset_not_found", "找不到资产: " + assetPath);
             }

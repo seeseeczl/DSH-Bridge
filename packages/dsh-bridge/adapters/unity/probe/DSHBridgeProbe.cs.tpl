@@ -30,13 +30,29 @@ namespace DSHBridge
         const double ScanInterval = 0.1;
         const double HeartbeatInterval = 2.0;
         const int LogCapacity = 400;
+        // 请求文件大小上限（AUD-CODE-001 P2）：inbox 是外部可写的，读取前先限大小，
+        // 避免超大 JSON 把主线程长时间占住（MiniJson 的深度/字节上限是第二道防线）。
+        const long MaxRequestBytes = 4L * 1024 * 1024;
+        // instance.json 大小上限（P2）：该文件同样可被外部改写，解析前先限大小。
+        const long MaxIdentityBytes = 1L * 1024 * 1024;
+        // 陈旧通道目录的年龄阈值（P2）：目录内最近一次写入超过该秒数才视为「明显陈旧」。
+        const double StaleBootDirMinAgeSeconds = 10 * 60;
+        // Init 失败后由 Tick 看门狗重试的间隔（秒）。
+        const double InitRetryInterval = 30.0;
 
         // ===== 安全边界（AA-OPT-001/002/003）=====
-        // 与 DSH 侧 DEFAULT_DANGEROUS 保持一致：这些能力不写入宿主目录、不提供常驻反射面，
-        // 因此即使请求绕过 DSH 直接写进 inbox，探针也会拒绝。真正的用户授权在 DSH 侧。
-        // 可授权的反射执行面：需要授权快照（源码注入）里出现该能力名才放行。
+        // 与 DSH 侧 safety/policy.mjs 的 DEFAULT_DANGEROUS 保持**完全一致**（13 项）：
+        // 它们要么能改变宿主状态（资产破坏/导入设置/包依赖/菜单执行/强制刷新），
+        // 要么提供常驻反射执行面，因此即使请求绕过 DSH 直接写进 inbox，探针也会拒绝。
+        // 真正的用户授权在 DSH 侧；探针只认安装时渲染进 _grantedCapabilities 的源码快照，
+        // 或 argv 整机旁路，运行期无法通过写 Library 下的文件自行提权。
+        // 曾经这里只有 4 个反射能力，注释却宣称与 DEFAULT_DANGEROUS 一致，导致
+        // asset.delete / importer.set / menu.execute 等危险能力在探针侧无闸门（AUD-CODE-001 P1-5）。
         static readonly string[] _reflectCapabilities = new string[] {
-            "unity.reflect.invoke", "unity.api.invoke", "unity.api.members", "unity.api.batch"
+            "unity.reflect.invoke", "unity.api.invoke", "unity.api.members", "unity.api.batch",
+            "unity.asset.refresh", "unity.asset.delete", "unity.asset.move", "unity.asset.rename",
+            "unity.asset.duplicate", "unity.importer.set", "unity.menu.execute",
+            "unity.package.add", "unity.package.remove"
         };
         // 探针侧永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
         // 用户决策（2026-11-18）：能力与自由优先，unity.menu.execute 从永久封禁降级为
@@ -85,7 +101,12 @@ namespace DSHBridge
         static long _eventSeq;
         static double _nextScan;
         static double _nextHeartbeat;
-        static bool _scanning;
+        // 初始化状态：Init 失败后由 Tick 看门狗重试，避免「静态构造函数吞异常 → 探针静默失效」（P2）。
+        static bool _initCompleted;
+        static bool _handlersSubscribed;
+        static double _nextInitRetry;
+        static double _nextTickLog;
+        static bool _chmodUnavailable;
         static readonly List<Dictionary<string, object>> _log = new List<Dictionary<string, object>>();
         static readonly string[] _capabilities = new string[] {
             "unity.editor.status", "unity.console.read", "unity.hierarchy.list", "unity.asset.find",
@@ -129,8 +150,35 @@ namespace DSHBridge
 
         static DSHBridgeProbe()
         {
+            // P2：**先订阅 Tick 再初始化**。静态构造函数里的异常会被 Unity 吞掉，
+            // 探针从此静默失效（心跳不写、inbox 不再被扫描），而 EditorApplication.update
+            // 是失败后唯一还能让探针自愈的入口。
+            try { EditorApplication.update += Tick; }
+            catch (Exception) { }
             try { Init(); }
-            catch (Exception e) { UnityEngine.Debug.LogError("[DSHBridge] init failed: " + e); }
+            catch (Exception e) { ReportInitFailure(e); }
+        }
+
+        /// <summary>
+        /// Init 失败必须可见且可自愈（P2）：写通道诊断（独立队列，不污染 code.execute 诊断）、
+        /// 尝试补一条 init_failed 事件、并在控制台留错误；随后由 Tick 看门狗按节流间隔重试。
+        /// </summary>
+        static void ReportInitFailure(Exception e)
+        {
+            var errorType = e == null ? "unknown" : e.GetType().Name;
+            var message = e == null ? "" : (e.Message ?? "");
+            try { UnityEngine.Debug.LogError("[DSHBridge] init failed: " + errorType + ": " + message); }
+            catch (Exception) { }
+            AddChannelDiagnosticSafe("init-failed:" + errorType + ": " + message);
+            try
+            {
+                PushEvent("init_failed", new Dictionary<string, object>
+                {
+                    { "errorType", errorType },
+                    { "message", message.Length > 500 ? message.Substring(0, 500) : message },
+                });
+            }
+            catch (Exception) { }
         }
 
         static void Init()
@@ -154,10 +202,17 @@ namespace DSHBridge
             _progressDir = Path.Combine(_rootDir, _bootId, "in-progress");
             // 目录创建失败必须显式上报：这里曾静默抛出并被静态构造函数的 catch 吞掉，
             // 结果心跳照常写、指向的目录却不存在，故障对调用方完全不可见（BUG-001）。
+            // 现在改为抛出 → 静态构造函数上报诊断，Tick 看门狗每 30s 重试一次（P2 自愈）。
             if (!EnsureBootDirs())
             {
                 UnityEngine.Debug.LogError("[DSHBridge] 通道目录创建失败，bootId=" + _bootId + "，调用将不可用");
+                throw new KnownError("io_error", "通道目录创建失败，bootId=" + _bootId);
             }
+
+            // P1-7：instance.json 的 eventSeq 只在心跳里每 2 秒落盘一次，域重载前最后一批
+            // 事件可能已写进 events/ 却还没进心跳。直接沿用 instance.json 会让 probe_ready
+            // 与旧事件同号覆盖（编译事件丢失窗口 0~2s），这里以 events/ 目录里的最大序号兜底。
+            RecoverEventSeqFromChannel();
 
             // AA-OPT-010：清理本地历史运行留下的通道目录，避免 Library 随重启线性膨胀。
             SweepStaleBootDirs();
@@ -168,14 +223,26 @@ namespace DSHBridge
             RecoverInterruptedJobs();
 
             WriteHeartbeat();
+            // P1-4：instance.json 由 WriteAtomic 写出（0600 由 WriteAtomic 统一收紧），
+            // 这里再显式收紧一次，保证启动窗口内第一个心跳落盘的文件也不会是 0644。
+            TryFixPermissions(Path.Combine(_rootDir, "instance.json"), false);
 
-            EditorApplication.update += Tick;
+            // Tick 已在静态构造函数里订阅；其余事件只订阅一次（Init 可能被看门狗重试）。
+            SubscribeHandlers();
+
+            _initCompleted = true;
+            PushEvent("probe_ready", null);
+            UnityEngine.Debug.Log("[DSHBridge] probe " + ProbeVersion + " ready, bootId=" + _bootId);
+        }
+
+        /// <summary>编译完成/播放模式/日志回调只订阅一次：Init 被看门狗重试时不能重复注册。</summary>
+        static void SubscribeHandlers()
+        {
+            if (_handlersSubscribed) return;
+            _handlersSubscribed = true;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
             Application.logMessageReceivedThreaded += OnLog;
-
-            PushEvent("probe_ready", null);
-            UnityEngine.Debug.Log("[DSHBridge] probe " + ProbeVersion + " ready, bootId=" + _bootId);
         }
 
         /// <summary>
@@ -225,23 +292,34 @@ namespace DSHBridge
             {
                 if (File.Exists(instanceFile))
                 {
-                    var existing = MiniJson.Parse(File.ReadAllText(instanceFile, Encoding.UTF8)) as Dictionary<string, object>;
-                    if (existing != null
-                        && ToLong(existing, "pid") == _pid
-                        && ToLong(existing, "startTicks") == _startTicks
-                        && GetString(existing, "bootId") != null
-                        && GetString(existing, "nonce") != null)
+                    // P2：instance.json 是磁盘上可被任意进程改写的文件，解析前先限制大小，
+                    // 防止超大文件把启动/域重载路径变成主线程长时间阻塞（MiniJson 另有深度上限）。
+                    var instanceLength = new FileInfo(instanceFile).Length;
+                    if (instanceLength <= MaxIdentityBytes)
                     {
-                        var reused = GetString(existing, "bootId");
-                        if (BootDirsComplete(reused))
+                        var existing = MiniJson.Parse(File.ReadAllText(instanceFile, Encoding.UTF8)) as Dictionary<string, object>;
+                        if (existing != null
+                            && ToLong(existing, "pid") == _pid
+                            && ToLong(existing, "startTicks") == _startTicks
+                            && GetString(existing, "bootId") != null
+                            && GetString(existing, "nonce") != null)
                         {
-                            _bootId = reused;
-                            _nonce = GetString(existing, "nonce");
-                            _eventSeq = ToLong(existing, "eventSeq");
-                            return;
+                            var reused = GetString(existing, "bootId");
+                            if (BootDirsComplete(reused))
+                            {
+                                _bootId = reused;
+                                _nonce = GetString(existing, "nonce");
+                                _eventSeq = ToLong(existing, "eventSeq");
+                                return;
+                            }
+                            UnityEngine.Debug.LogWarning(
+                                "[DSHBridge] bootId " + reused + " 的通道目录不完整，换用新的 bootId（原 instance.json 指向的目录不存在）");
                         }
+                    }
+                    else
+                    {
                         UnityEngine.Debug.LogWarning(
-                            "[DSHBridge] bootId " + reused + " 的通道目录不完整，换用新的 bootId（原 instance.json 指向的目录不存在）");
+                            "[DSHBridge] instance.json 超过 " + MaxIdentityBytes + " 字节，忽略并重建通道身份");
                     }
                 }
             }
@@ -269,6 +347,14 @@ namespace DSHBridge
                 Directory.CreateDirectory(_eventsDir);
                 Directory.CreateDirectory(_doneDir);
                 Directory.CreateDirectory(_progressDir);
+                // P1-4：通道目录（含根目录）0700。心跳每 2s 都会走到这里，
+                // 因此外部把目录重建/权限改宽后也能在一拍内自愈。
+                TryFixPermissions(_rootDir, true);
+                TryFixPermissions(_inboxDir, true);
+                TryFixPermissions(_outboxDir, true);
+                TryFixPermissions(_eventsDir, true);
+                TryFixPermissions(_doneDir, true);
+                TryFixPermissions(_progressDir, true);
                 return true;
             }
             catch (Exception e)
@@ -278,9 +364,89 @@ namespace DSHBridge
             }
         }
 
+        // ===== 通道权限（AUD-CODE-001 P1-4）=====
+        // 文档（security-data-governance / DETAIL）承诺通道根目录 0700、通道文件 0600，
+        // 但目录/文件实际权限由进程 umask 决定（macOS 默认 022 → 目录 0755、文件 0644），
+        // 同机其他用户因此可读 nonce、pid、工程路径与事件。这里在创建/写入后显式收紧；
+        // 失败静默降级为「受 umask 影响」，不影响探针可用性。
+        const uint ModeDirPrivate = 448;  // 0700（C# 没有八进制字面量）
+        const uint ModeFilePrivate = 384; // 0600
+
+        [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, ExactSpelling = true)]
+        static extern int chmod(string path, uint mode);
+
         /// <summary>
-        /// AA-OPT-010：除当前通道目录外，只保留 mtime 最新的一个历史目录，其余删除。
-        /// 只处理本进程以外的目录；删除失败（被占用）时忽略，下次启动再试。
+        /// 把通道目录/文件权限收紧为 0700/0600（macOS/Linux）。Windows 没有 POSIX 权限位，直接跳过。
+        /// 只 P/Invoke libc 一个符号：不引入依赖、不启动外部进程，符合探针「零端口/零第三方」约束。
+        /// 失败静默（路径消失、只读挂载、权限不足都退化为受 umask 影响）。
+        /// 供 MonoCompiler 的 WriteAtomic 对本文件写出的文件调用（跨文件契约）。
+        /// </summary>
+        static void TryFixPermissions(string path, bool isDirectory)
+        {
+            if (_chmodUnavailable || string.IsNullOrEmpty(path)) return;
+            if (Application.platform != RuntimePlatform.OSXEditor && Application.platform != RuntimePlatform.LinuxEditor) return;
+            try { chmod(path, isDirectory ? ModeDirPrivate : ModeFilePrivate); }
+            catch (DllNotFoundException) { _chmodUnavailable = true; }
+            catch (EntryPointNotFoundException) { _chmodUnavailable = true; }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// AddChannelDiagnostic 定义在 MonoCompiler partial（跨文件契约），本文件只调用不定义。
+        /// 包一层的原因：初始化早期/发布失败时通道本身可能不可用，诊断路径绝不能反过来抛异常
+        /// （否则会把「一次失败」升级成「静态构造函数崩溃且没有任何诊断」）。
+        /// </summary>
+        static void AddChannelDiagnosticSafe(string message)
+        {
+            try { AddChannelDiagnostic(message); }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// P1-7：把事件序号恢复到 max(instance.json 里记录的 seq, events/ 目录里的最大 seq)。
+        /// 心跳只每 2 秒落盘一次 eventSeq，域重载前最后一批事件可能已写入 events/ 但还没进心跳；
+        /// 只沿用 instance.json 会让 probe_ready 与旧事件同号，写同一文件名从而覆盖旧事件。
+        /// 事件文件名契约（DSH 侧 mailbox/maintenance 只解析 evt_ + 纯数字 + .json）：
+        /// 形如 evt_0000000123.json；不符合契约的文件名一律忽略，不参与 max 计算。
+        /// </summary>
+        static void RecoverEventSeqFromChannel()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_eventsDir) || !Directory.Exists(_eventsDir)) return;
+                foreach (var file in Directory.GetFiles(_eventsDir, "evt_*.json"))
+                {
+                    var name = Path.GetFileName(file);
+                    if (string.IsNullOrEmpty(name)) continue;
+                    if (!name.StartsWith("evt_", StringComparison.Ordinal)) continue;
+                    if (!name.EndsWith(".json", StringComparison.Ordinal)) continue;
+                    // 去掉 "evt_" 前缀与 ".json" 后缀，剩余部分必须全是十进制数字。
+                    var digits = name.Substring(4, name.Length - 4 - 5);
+                    if (digits.Length == 0 || digits.Length > 18) continue;
+                    var seq = 0L;
+                    var valid = true;
+                    for (var i = 0; i < digits.Length; i++)
+                    {
+                        var c = digits[i];
+                        if (c < '0' || c > '9') { valid = false; break; }
+                        seq = seq * 10 + (c - '0');
+                    }
+                    if (!valid) continue;
+                    if (seq > _eventSeq) _eventSeq = seq;
+                }
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// AA-OPT-010：清理本机历史运行留下的通道目录，避免 Library 随重启线性膨胀。
+        /// 除当前通道目录外，只保留 mtime 最新的一个历史目录，其余在明确陈旧时删除。
+        ///
+        /// 安全约束（AUD-CODE-001 P2）：
+        ///   1) 只删「明显陈旧」的目录——目录内最近一次写入超过 StaleBootDirMinAgeSeconds（10 分钟），
+        ///      避免按目录 mtime 误删另一个仍在使用的通道（编辑器重启窗口、短暂多域窗口）。
+        ///   2) 跳过符号链接目录：递归删除对符号链接可能跟随到工程外。
+        ///   3) 当前 bootId 目录永不处理；保留最新一个历史目录作为排障现场；删除失败忽略，下次再试。
         /// </summary>
         static void SweepStaleBootDirs()
         {
@@ -299,35 +465,102 @@ namespace DSHBridge
                 dirs.Sort(delegate (string a, string b) { return Directory.GetLastWriteTimeUtc(b).CompareTo(Directory.GetLastWriteTimeUtc(a)); });
                 for (var i = 1; i < dirs.Count; i++)
                 {
+                    if (!IsObviouslyStaleBootDir(dirs[i])) continue;
                     try { Directory.Delete(dirs[i], true); }
-                    catch { }
+                    catch (Exception) { }
                 }
             }
-            catch { }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 目录是否「明显陈旧」：非符号链接，且目录及其 5 个通道子目录里最近一次写入
+        /// 已超过 StaleBootDirMinAgeSeconds。任何读取失败都返回 false（宁可不删，不能误删活跃通道）。
+        /// 只看固定子目录、不做递归遍历：避免被植入的嵌套符号链接把遍历带出工程外。
+        /// </summary>
+        static bool IsObviouslyStaleBootDir(string dir)
+        {
+            try
+            {
+                var info = new DirectoryInfo(dir);
+                if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                var latest = info.LastWriteTimeUtc;
+                foreach (var sub in new[] { "inbox", "outbox", "events", "done", "in-progress" })
+                {
+                    var subDir = Path.Combine(dir, sub);
+                    if (!Directory.Exists(subDir)) continue;
+                    var subInfo = new DirectoryInfo(subDir);
+                    if ((subInfo.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    if (subInfo.LastWriteTimeUtc > latest) latest = subInfo.LastWriteTimeUtc;
+                    foreach (var file in Directory.GetFiles(subDir, "*"))
+                    {
+                        var mtime = File.GetLastWriteTimeUtc(file);
+                        if (mtime > latest) latest = mtime;
+                    }
+                }
+                return (DateTime.UtcNow - latest).TotalSeconds > StaleBootDirMinAgeSeconds;
+            }
+            catch (Exception) { return false; }
         }
 
         static void Tick()
         {
+            // P2：Init 失败后不再静默失效——Tick 是 Init 之后唯一还会被调用的入口，
+            // 由它按 InitRetryInterval 节流重试 Init（成功即恢复正常通道），并上报失败原因。
+            if (!_initCompleted)
+            {
+                TickInitRecovery();
+                return;
+            }
+            var now = EditorApplication.timeSinceStartup;
+            // P2：心跳/清扫/作业/测试/请求扫描各自独立 try/catch。旧实现共用一个 try，
+            // 任何一段持续抛异常（例如作业列表损坏）都会让后面的 Poll 永不执行，
+            // 表现为「探针在线但永远不处理请求」。
+            if (now >= _nextHeartbeat)
+            {
+                _nextHeartbeat = now + HeartbeatInterval;
+                try { WriteHeartbeat(); }
+                catch (Exception e) { LogTickFailure("heartbeat", e); }
+            }
+            if (now >= _nextOutboxSweep)
+            {
+                _nextOutboxSweep = now + OutboxSweepInterval;
+                try { SweepStaleOutbox(); }
+                catch (Exception e) { LogTickFailure("outbox-sweep", e); }
+            }
+            try { JobTick(); }
+            catch (Exception e) { LogTickFailure("job-tick", e); }
+            try { PollTestJobs(); }
+            catch (Exception e) { LogTickFailure("test-poll", e); }
+            if (now < _nextScan) return;
+            _nextScan = now + ScanInterval;
+            try { Poll(); }
+            catch (Exception e) { LogTickFailure("poll", e); }
+        }
+
+        static void TickInitRecovery()
+        {
             try
             {
                 var now = EditorApplication.timeSinceStartup;
-                if (now >= _nextHeartbeat)
-                {
-                    _nextHeartbeat = now + HeartbeatInterval;
-                    WriteHeartbeat();
-                }
-                if (now >= _nextOutboxSweep)
-                {
-                    _nextOutboxSweep = now + OutboxSweepInterval;
-                    SweepStaleOutbox();
-                }
-                JobTick();
-                PollTestJobs();
-                if (_scanning || now < _nextScan) return;
-                _nextScan = now + ScanInterval;
-                Poll();
+                if (now < _nextInitRetry) return;
+                _nextInitRetry = now + InitRetryInterval;
+                Init();
+                UnityEngine.Debug.Log("[DSHBridge] init recovered by watchdog, bootId=" + _bootId);
             }
-            catch (Exception e) { UnityEngine.Debug.LogWarning("[DSHBridge] tick: " + e.Message); }
+            catch (Exception e) { ReportInitFailure(e); }
+        }
+
+        /// <summary>单段 Tick 失败：写通道诊断（有界队列），控制台日志按 10s 节流，避免刷屏。</summary>
+        static void LogTickFailure(string stage, Exception e)
+        {
+            var message = e == null ? "unknown" : (e.GetType().Name + ": " + (e.Message ?? ""));
+            AddChannelDiagnosticSafe("tick-" + stage + ": " + message);
+            var now = EditorApplication.timeSinceStartup;
+            if (now < _nextTickLog) return;
+            _nextTickLog = now + 10;
+            try { UnityEngine.Debug.LogWarning("[DSHBridge] tick " + stage + ": " + message); }
+            catch (Exception) { }
         }
 
         /// <summary>一次扫描内最多丢弃多少个无效文件（防止单个坏批次长时间占用主线程）。</summary>
@@ -422,29 +655,33 @@ namespace DSHBridge
             if (files.Length == 0) return;
             Array.Sort(files, StringComparer.Ordinal);
 
-            _scanning = true;
-            try
+            // 约束不变：一次扫描**只执行一个**有效请求，避免阻塞主线程过久。
+            // 但无效文件（半写 JSON、别的实例的残留）允许在本次扫描内连续丢弃——
+            // 否则 inbox 里残留 N 个坏文件时，每个正常请求都要多等 N 个扫描周期。
+            //
+            // 旧的 `_scanning` 重入标志已删除：Poll 只由 Tick 在主线程调用，
+            // 重入不可能发生，保留它属于死代码（AUD-CODE-001 P2）；异常由 Tick 的分段
+            // try/catch 兜住，不会把「扫描中」状态永久卡住。
+            var discarded = 0;
+            for (var i = 0; i < files.Length; i++)
             {
-                // 约束不变：一次扫描**只执行一个**有效请求，避免阻塞主线程过久。
-                // 但无效文件（半写 JSON、别的实例的残留）允许在本次扫描内连续丢弃——
-                // 否则 inbox 里残留 N 个坏文件时，每个正常请求都要多等 N 个扫描周期。
-                var discarded = 0;
-                for (var i = 0; i < files.Length; i++)
-                {
-                    if (discarded >= MaxDiscardsPerScan) break;
-                    var outcome = HandleFile(files[i]);
-                    if (outcome == HandleOutcome.Absent) break;
-                    if (outcome == HandleOutcome.Consumed) break;
-                    discarded += 1;
-                }
+                if (discarded >= MaxDiscardsPerScan) break;
+                var outcome = HandleFile(files[i]);
+                if (outcome == HandleOutcome.Absent) break;
+                if (outcome == HandleOutcome.Consumed) break;
+                discarded += 1;
             }
-            finally { _scanning = false; }
         }
 
         /// <summary>
-        /// 回收上一次会话遗留的 in-progress 请求：这些请求在 Execute 期间被域重载或进程退出打断，
+        /// 回收上一次执行遗留的 in-progress 请求：这些请求在 Execute 期间被域重载或进程退出打断，
         /// 调用方超时后无从判断「到底执行了没有」。这里补写一条 executionState="unknown" 的响应，
         /// 让「不确定」变成一个**可机器读取**的结论，而不是靠人读日志。
+        ///
+        /// 实现范围（与实现保持一致，AUD-CODE-001 P2）：**只处理当前 bootId 的 in-progress/**。
+        /// 域重载时 pid/startTicks 不变 → bootId 复用，因此「域重载打断」这一主场景能被正确覆盖；
+        /// 编辑器进程重启会换新 bootId，旧通道目录不再补写 unknown（调用方对旧实例已不可达），
+        /// 由 SweepStaleBootDirs 按年龄回收。
         /// </summary>
         static void RecoverInterruptedRequests()
         {
@@ -456,8 +693,14 @@ namespace DSHBridge
                     var id = Path.GetFileNameWithoutExtension(file);
                     if (string.IsNullOrEmpty(id)) continue;
 
+                    // P2：与 inbox 请求同样先限大小再读。in-progress 里的文件来自上一轮 inbox，
+                    // 可能是被中途替换/追加的超大文件，不能无条件整文件读入。
                     string text = null;
-                    try { text = File.ReadAllText(file, Encoding.UTF8); } catch { }
+                    try
+                    {
+                        if (new FileInfo(file).Length <= MaxRequestBytes) text = File.ReadAllText(file, Encoding.UTF8);
+                    }
+                    catch (Exception) { }
                     Dictionary<string, object> req = null;
                     try { req = text == null ? null : MiniJson.Parse(text) as Dictionary<string, object>; }
                     catch { }
@@ -525,6 +768,25 @@ namespace DSHBridge
 
         static HandleOutcome HandleFile(string path)
         {
+            var fileName = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(fileName)) return HandleOutcome.Absent;
+            var progressPath = Path.Combine(_progressDir, fileName);
+            var donePath = Path.Combine(_doneDir, fileName);
+
+            // P2：先看大小再读文件。请求是外部写进来的，不设上限就等于把「读多少字节」
+            // 交给对方决定；超限按无效请求归档（Discarded）+ 通道诊断，绝不整文件读入。
+            try
+            {
+                var info = new FileInfo(path);
+                if (info.Exists && info.Length > MaxRequestBytes)
+                {
+                    AddChannelDiagnosticSafe("oversized-request:" + info.Length.ToString(CultureInfo.InvariantCulture));
+                    Finish(path, donePath);
+                    return HandleOutcome.Discarded;
+                }
+            }
+            catch { return HandleOutcome.Absent; }
+
             string text;
             byte[] rawBytes;
             try
@@ -537,9 +799,15 @@ namespace DSHBridge
             }
             catch { return HandleOutcome.Absent; }
 
-            var fileName = Path.GetFileName(path);
-            var progressPath = Path.Combine(_progressDir, fileName);
-            var donePath = Path.Combine(_doneDir, fileName);
+            // TOCTOU 兜底：上面的 Length 检查和这里的读取之间文件可能被替换/追加，
+            // 读到的字节仍要再过一次上限，超限同样只归档不解析。
+            if (rawBytes.Length > MaxRequestBytes)
+            {
+                AddChannelDiagnosticSafe("oversized-request-race:" + rawBytes.Length.ToString(CultureInfo.InvariantCulture));
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+
             try
             {
                 if (File.Exists(progressPath)) File.Delete(progressPath);
@@ -621,6 +889,18 @@ namespace DSHBridge
             }
 
             var cap = GetString(req, "cap");
+            // P2：args 必须是 JSON object。数组/字符串/数字直接以 invalid_argument 拒绝，
+            // 不能静默降级成空字典——那会让「参数写错的请求」以默认参数执行（破坏性默认值
+            // 例如 playmode.set 缺 playing、setActive 缺 active），语义完全不可预期。
+            // JSON null 与缺省同义，按空对象处理。
+            if (req.ContainsKey("args") && req["args"] != null && !(req["args"] is Dictionary<string, object>))
+            {
+                resp["ok"] = false;
+                resp["error"] = Error("invalid_argument", "args 必须是 JSON object", null);
+                resp["elapsedMs"] = 0L;
+                PublishResponse(id, resp, progressPath, donePath);
+                return HandleOutcome.Consumed;
+            }
             var args = req.ContainsKey("args") ? req["args"] as Dictionary<string, object> : null;
             if (args == null) args = new Dictionary<string, object>();
 
@@ -650,8 +930,19 @@ namespace DSHBridge
 
         static void PublishResponse(string id, Dictionary<string, object> resp, string progressPath, string donePath)
         {
-            try { WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp)); }
-            catch { }
+            try
+            {
+                WriteAtomic(Path.Combine(_outboxDir, id + ".json"), MiniJson.Serialize(resp));
+            }
+            catch (Exception e)
+            {
+                // P1-6：写响应失败时**绝不能归档 progress**。归档会让调用方的 isInProgress=false，
+                // 但它从未收到结论 → 可能按「未执行」安全重试，破坏性操作就会重复执行。
+                // 保留 in-progress 语义：调用方看到 in_flight，超时后按 unknown 处理；
+                // 下一次域重载/启动的 RecoverInterruptedRequests 会补写 executionState="unknown" 的响应。
+                AddChannelDiagnosticSafe("publish-failed:" + id + ": " + e.GetType().Name + ": " + (e.Message ?? ""));
+                return;
+            }
             Finish(progressPath, donePath);
         }
 
@@ -684,57 +975,22 @@ namespace DSHBridge
             return donePath;
         }
 
-        /// <summary>危险能力在探针侧默认关闭；只有授权快照或 argv 授权出现时才放行。</summary>
-        static void EnsureCapabilityAllowed(string cap)
-        {
-            if (string.IsNullOrEmpty(cap)) throw new KnownError("invalid_argument", "缺少 cap");
-            for (var i = 0; i < _deniedCapabilities.Length; i++)
-            {
-                if (_deniedCapabilities[i] != cap) continue;
-                throw new KnownError("capability_denied", "能力 " + cap + " 被插件配置显式禁止（bridge.denied），任何授权都无法开启");
-            }
-            for (var i = 0; i < _blockedCapabilities.Length; i++)
-            {
-                if (_blockedCapabilities[i] != cap) continue;
-                throw new KnownError("capability_denied", "能力 " + cap + " 在探针侧永久关闭（该能力被永久封禁，任何配置都无法开启）");
-            }
-            for (var i = 0; i < _reflectCapabilities.Length; i++)
-            {
-                if (_reflectCapabilities[i] != cap) continue;
-                if (Granted(cap)) return;
-                throw new KnownError(
-                    "capability_denied",
-                    "能力 " + cap + " 未授权；请在插件配置 bridge.allowDangerous 中加入该能力并重装探针（源码快照随之更新）");
-            }
-        }
-
-        /// <summary>按能力判定授权：argv 整机旁路，或安装时注入的源码快照。</summary>
-        static bool Granted(string cap)
-        {
-            if (ReflectAuthorized()) return true;
-            for (var i = 0; i < _grantedCapabilities.Length; i++)
-            {
-                if (_grantedCapabilities[i] == cap) return true;
-            }
-            return false;
-        }
-
+        /// <summary>
+        /// 按能力判定授权：argv 整机旁路，或安装时注入的源码快照。
+        /// 授权闸门本体（EnsureCapabilityAllowed / Granted / DangerousCapabilitiesForTest）
+        /// 与路径边界一起放在 DSHBridgeProbe.Security.cs.tpl，按域拆分只影响可读性，partial 内互相可见。
+        /// </summary>
         static bool ReflectAuthorized()
         {
             return _reflectEnabled.HasValue ? _reflectEnabled.Value : AuthorizedByArgv();
-        }
-
-        /// <summary>诊断用：本次安装在源码快照里实际授予了哪些能力。</summary>
-        public static string[] GrantedCapabilitiesForTest()
-        {
-            return (string[])_grantedCapabilities.Clone();
         }
 
         /// <summary>越权尝试要留下事件，否则注入攻击在事件流里完全不可见（AA-OBS-001）。</summary>
         static void RecordRejection(string id, string cap, string code, string message)
         {
             if (code != "capability_denied" && code != "path_escape" && code != "member_not_public"
-                && code != "member_denied" && code != "type_denied" && code != "editor_busy") return;
+                && code != "member_denied" && code != "type_denied" && code != "editor_busy"
+                && code != "path_denied" && code != "already_exists") return;
             var payload = new Dictionary<string, object>
             {
                 { "requestId", id ?? "" },
@@ -778,6 +1034,11 @@ namespace DSHBridge
             if (e is TargetInvocationException && e.InnerException != null) return CodeOf(e.InnerException);
             if (e is FileNotFoundException) return "not_found";
             if (e is ArgumentException) return "invalid_argument";
+            // 跨文件契约：CodeOfExtended 定义在 MonoCompiler.cs.tpl，负责把
+            // IOException/UnauthorizedAccess、Format/InvalidCast/Overflow、UnityException
+            // 等「更像环境/输入问题而非探针 bug」的异常映射成稳定错误码，未识别返回 null。
+            var extended = CodeOfExtended(e);
+            if (extended != null) return extended;
             return "probe_error";
         }
 
@@ -798,7 +1059,7 @@ namespace DSHBridge
             public KnownError(string code, string message, string detail) : base(message) { Code = code; Detail = detail; }
         }
 
-        /// <summary>argv 里出现 -dshBridgeAuthorize 时，反射执行面才解锁（对应插件配置 allowDangerous）。</summary>
+        /// <summary>argv 里出现 -dshBridgeAuthorize 时，危险能力执行面（13 项）才解锁（对应插件配置 allowDangerous）。</summary>
         static bool AuthorizedByArgv()
         {
             try
@@ -811,14 +1072,6 @@ namespace DSHBridge
             }
             catch { }
             return false;
-        }
-
-        /// <summary>探针在本地关闭/需授权的能力清单，供诊断与测试断言。</summary>
-        public static string[] DangerousCapabilitiesForTest()
-        {
-            var list = new List<string>(_blockedCapabilities);
-            list.AddRange(_reflectCapabilities);
-            return list.ToArray();
         }
     }
 }

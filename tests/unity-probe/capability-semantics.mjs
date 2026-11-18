@@ -70,10 +70,10 @@ public static class Harness
             Args(new object[] { "query", "root", "folders", List("/etc"), "extensions", List(".passwd") }));
         Run(results, "search.content-budget", "unity.search.content",
             Args(new object[] { "query", "x", "limit", 5L }));
-        Run(results, "menu.execute", "unity.menu.execute", Args(new object[] { "path", "Assets/Reimport All" }));
-        Run(results, "asset.delete-inside", "unity.asset.delete", Args(new object[] { "path", "Assets/Thing.prefab" }));
-        ExpectEscape(true); Run(results, "asset.delete-outside-real", "unity.asset.delete", Args(new object[] { "path", "Thing.prefab" }));
-        ExpectEscape(true); Run(results, "asset.delete-outside", "unity.asset.delete", Args(new object[] { "path", "../Outside.prefab" }));
+        RunAuthorized(results, "menu.execute", "unity.menu.execute", Args(new object[] { "path", "Assets/Reimport All" }));
+        RunAuthorized(results, "asset.delete-inside", "unity.asset.delete", Args(new object[] { "path", "Assets/Thing.prefab" }));
+        ExpectEscape(true); RunAuthorized(results, "asset.delete-outside-real", "unity.asset.delete", Args(new object[] { "path", "Thing.prefab" }));
+        ExpectEscape(true); RunAuthorized(results, "asset.delete-outside", "unity.asset.delete", Args(new object[] { "path", "../Outside.prefab" }));
         Run(results, "reflect.invoke-unauthorized", "unity.reflect.invoke",
             Args(new object[] { "type", "System.String", "method", "IsNullOrEmpty", "args", List("x") }));
         RunAuthorized(results, "reflect.invoke-static", "unity.reflect.invoke",
@@ -82,9 +82,9 @@ public static class Harness
             Args(new object[] { "type", "UnityEditor.EditorApplication", "member", "ExecuteMenuItem", "args", List("Assets/Reimport All") }));
         RunAuthorized(results, "api.invoke-private-member", "unity.api.invoke",
             Args(new object[] { "type", "System.Diagnostics.Process", "member", "GetCurrentProcess" }));
-        ExpectEscape(true); Run(results, "importer.set-outside", "unity.importer.set", ImporterSetArgs());
+        ExpectEscape(true); RunAuthorized(results, "importer.set-outside", "unity.importer.set", ImporterSetArgs());
 
-        Run(results, "asset.refresh-while-compiling", "unity.asset.refresh",
+        RunAuthorized(results, "asset.refresh-while-compiling", "unity.asset.refresh",
             Args(new object[] { "force", true }), delegate { DSHBridgeStub.IsCompiling = true; });
 
         // ===== 新增能力语义：反射成员访问 / 批量事务 / 代码执行 =====
@@ -357,6 +357,11 @@ public static class Harness
     static void RunAuthorized(List<Dictionary<string, object>> sink, string name, string cap, Dictionary<string, object> args)
     {
         Run(sink, name, cap, args, true);
+    }
+
+    static void RunAuthorized(List<Dictionary<string, object>> sink, string name, string cap, Dictionary<string, object> args, Action setup)
+    {
+        Run(sink, name, cap, args, true, setup);
     }
 
     /// <summary>setup 在 Reset() 之后执行，用于设置那些 Reset 会清掉的 stub 状态。</summary>

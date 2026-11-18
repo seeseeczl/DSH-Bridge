@@ -43,6 +43,9 @@ namespace DSHBridge
             d["current"] = (long)QualitySettings.GetQualityLevel();
             if (args.ContainsKey("level"))
             {
+                var rawLevel = args["level"];
+                if (!(rawLevel is long || rawLevel is int || rawLevel is short || rawLevel is double || rawLevel is float || rawLevel is decimal))
+                    throw new KnownError("invalid_argument", "level 必须是数字（0.." + (names.Length - 1) + "）");
                 var level = (int)ToLong(args, "level", 0);
                 if (level < 0 || level >= names.Length) throw new KnownError("invalid_argument", "质量等级越界: " + level);
                 QualitySettings.SetQualityLevel(level, true);
@@ -55,17 +58,44 @@ namespace DSHBridge
         static Dictionary<string, object> GraphicsRenderSettings(Dictionary<string, object> args)
         {
             var changes = args.ContainsKey("changes") ? args["changes"] as Dictionary<string, object> : null;
+            var applied = new List<object>();
+            var ignored = new List<object>();
             if (changes != null)
             {
+                var known = new HashSet<string>(StringComparer.Ordinal) { "ambientMode", "ambientLight", "fog", "fogColor", "fogDensity" };
+                foreach (var key in changes.Keys)
+                {
+                    if (!known.Contains(key)) ignored.Add(key);
+                }
                 if (changes.ContainsKey("ambientMode"))
-                    RenderSettings.ambientMode = (UnityEngine.Rendering.AmbientMode)Enum.Parse(typeof(UnityEngine.Rendering.AmbientMode), Convert.ToString(changes["ambientMode"], CultureInfo.InvariantCulture), true);
+                {
+                    var rawMode = changes["ambientMode"];
+                    if (rawMode is long || rawMode is int || rawMode is double || rawMode is float || rawMode is decimal)
+                        throw new KnownError("invalid_argument", "ambientMode 需要枚举名（Skybox/Trilight/Flat/Custom），不接受数字");
+                    var modeText = System.Convert.ToString(rawMode, CultureInfo.InvariantCulture) ?? "";
+                    UnityEngine.Rendering.AmbientMode mode;
+                    if (!Enum.TryParse<UnityEngine.Rendering.AmbientMode>(modeText, true, out mode)
+                        || !Enum.IsDefined(typeof(UnityEngine.Rendering.AmbientMode), mode))
+                        throw new KnownError("invalid_argument", "未知 ambientMode: " + modeText);
+                    RenderSettings.ambientMode = mode;
+                    applied.Add("ambientMode");
+                }
                 if (changes.ContainsKey("ambientLight"))
+                {
                     RenderSettings.ambientLight = (Color)CoerceValue(changes["ambientLight"], typeof(Color));
-                if (changes.ContainsKey("fog")) RenderSettings.fog = ToBoolValue(changes["fog"]);
+                    applied.Add("ambientLight");
+                }
+                if (changes.ContainsKey("fog")) { RenderSettings.fog = ToBoolValue(changes["fog"]); applied.Add("fog"); }
                 if (changes.ContainsKey("fogColor"))
+                {
                     RenderSettings.fogColor = (Color)CoerceValue(changes["fogColor"], typeof(Color));
+                    applied.Add("fogColor");
+                }
                 if (changes.ContainsKey("fogDensity"))
+                {
                     RenderSettings.fogDensity = (float)Convert.ToDouble(changes["fogDensity"], CultureInfo.InvariantCulture);
+                    applied.Add("fogDensity");
+                }
             }
             var d = new Dictionary<string, object>();
             d["ambientMode"] = RenderSettings.ambientMode.ToString();
@@ -74,7 +104,7 @@ namespace DSHBridge
             d["fogColor"] = ColorList(RenderSettings.fogColor);
             d["fogDensity"] = (double)RenderSettings.fogDensity;
             d["skybox"] = RenderSettings.skybox != null ? RenderSettings.skybox.name : null;
-            if (changes != null) d["applied"] = true;
+            if (changes != null) { d["applied"] = applied; if (ignored.Count > 0) d["ignored"] = ignored; }
             return d;
         }
 
@@ -116,21 +146,40 @@ namespace DSHBridge
         static Dictionary<string, object> PhysicsSettings(Dictionary<string, object> args)
         {
             var changes = args.ContainsKey("changes") ? args["changes"] as Dictionary<string, object> : null;
+            var applied = new List<object>();
+            var ignored = new List<object>();
             if (changes != null)
             {
+                var known = new HashSet<string>(StringComparer.Ordinal) { "gravity", "solverIterations", "queriesHitTriggers" };
+                foreach (var key in changes.Keys)
+                {
+                    if (!known.Contains(key)) ignored.Add(key);
+                }
                 if (changes.ContainsKey("gravity"))
+                {
                     Physics.gravity = (Vector3)CoerceValue(changes["gravity"], typeof(Vector3));
+                    applied.Add("gravity");
+                }
                 if (changes.ContainsKey("solverIterations"))
-                    Physics.defaultSolverIterations = (int)ToLong(changes, "solverIterations", Physics.defaultSolverIterations);
+                {
+                    var iterations = (int)ToLong(changes, "solverIterations", Physics.defaultSolverIterations);
+                    if (iterations < 1 || iterations > 255)
+                        throw new KnownError("invalid_argument", "solverIterations 必须在 1..255 之间: " + iterations);
+                    Physics.defaultSolverIterations = iterations;
+                    applied.Add("solverIterations");
+                }
                 if (changes.ContainsKey("queriesHitTriggers"))
+                {
                     Physics.queriesHitTriggers = ToBoolValue(changes["queriesHitTriggers"]);
+                    applied.Add("queriesHitTriggers");
+                }
             }
             var d = new Dictionary<string, object>();
             d["gravity"] = Vector3List(Physics.gravity);
             d["solverIterations"] = (long)Physics.defaultSolverIterations;
             d["queriesHitTriggers"] = Physics.queriesHitTriggers;
             d["bounceThreshold"] = (double)Physics.bounceThreshold;
-            if (changes != null) d["applied"] = true;
+            if (changes != null) { d["applied"] = applied; if (ignored.Count > 0) d["ignored"] = ignored; }
             return d;
         }
 
@@ -222,9 +271,11 @@ namespace DSHBridge
                     var values = changes["parameters"] as Dictionary<string, object>;
                     if (values != null)
                     {
+                        // 先全量校验，避免「前几个参数已写入、后面报错」的部分应用（审计 P2）。
+                        var pending = new List<KeyValuePair<string, object>>();
+                        var declared = animator.parameters;
                         foreach (var pair in values)
                         {
-                            var declared = animator.parameters;
                             var type = AnimatorControllerParameterType.Float;
                             var found = false;
                             for (var i = 0; i < declared.Length; i++)
@@ -232,11 +283,31 @@ namespace DSHBridge
                                 if (declared[i].name == pair.Key) { type = declared[i].type; found = true; break; }
                             }
                             if (!found) throw new KnownError("parameter_not_found", "Animator 没有参数: " + pair.Key);
-                            if (type == AnimatorControllerParameterType.Float) animator.SetFloat(pair.Key, (float)Convert.ToDouble(pair.Value, CultureInfo.InvariantCulture));
-                            else if (type == AnimatorControllerParameterType.Int) animator.SetInteger(pair.Key, (int)Convert.ToInt64(pair.Value, CultureInfo.InvariantCulture));
-                            else if (type == AnimatorControllerParameterType.Bool) animator.SetBool(pair.Key, ToBoolValue(pair.Value));
-                            else animator.SetTrigger(pair.Key);
-                            applied.Add(pair.Key);
+                            if (type == AnimatorControllerParameterType.Float)
+                            {
+                                double probe;
+                                if (!double.TryParse(System.Convert.ToString(pair.Value, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out probe))
+                                    throw new KnownError("invalid_argument", "Animator 参数 " + pair.Key + " 需要数字");
+                            }
+                            else if (type == AnimatorControllerParameterType.Int)
+                            {
+                                long probe;
+                                if (!long.TryParse(System.Convert.ToString(pair.Value, CultureInfo.InvariantCulture), NumberStyles.Integer, CultureInfo.InvariantCulture, out probe))
+                                    throw new KnownError("invalid_argument", "Animator 参数 " + pair.Key + " 需要整数");
+                            }
+                            pending.Add(new KeyValuePair<string, object>(pair.Key, type));
+                            pending[pending.Count - 1] = new KeyValuePair<string, object>(pair.Key, new object[] { type, pair.Value });
+                        }
+                        foreach (var item in pending)
+                        {
+                            var tuple = (object[])item.Value;
+                            var type = (AnimatorControllerParameterType)tuple[0];
+                            var value = tuple[1];
+                            if (type == AnimatorControllerParameterType.Float) animator.SetFloat(item.Key, (float)Convert.ToDouble(value, CultureInfo.InvariantCulture));
+                            else if (type == AnimatorControllerParameterType.Int) animator.SetInteger(item.Key, (int)Convert.ToInt64(value, CultureInfo.InvariantCulture));
+                            else if (type == AnimatorControllerParameterType.Bool) animator.SetBool(item.Key, ToBoolValue(value));
+                            else animator.SetTrigger(item.Key);
+                            applied.Add(item.Key);
                         }
                     }
                 }
@@ -304,6 +375,7 @@ namespace DSHBridge
             }
             var d = new Dictionary<string, object>();
             d["count"] = (long)canvases.Length;
+            d["total"] = (long)canvases.Length;
             d["canvases"] = rows;
             return d;
         }
@@ -322,10 +394,14 @@ namespace DSHBridge
                 d["selectedIsProBuilderMesh"] = component != null;
                 if (component != null)
                 {
-                    var vertexCount = pbType.GetProperty("vertexCount");
-                    if (vertexCount != null) d["vertexCount"] = (long)System.Convert.ToInt64(vertexCount.GetValue(component, null), CultureInfo.InvariantCulture);
-                    var faceCount = pbType.GetProperty("faceCount");
-                    if (faceCount != null) d["faceCount"] = (long)System.Convert.ToInt64(faceCount.GetValue(component, null), CultureInfo.InvariantCulture);
+                    try
+                    {
+                        var vertexCount = pbType.GetProperty("vertexCount");
+                        if (vertexCount != null) d["vertexCount"] = (long)System.Convert.ToInt64(vertexCount.GetValue(component, null), CultureInfo.InvariantCulture);
+                        var faceCount = pbType.GetProperty("faceCount");
+                        if (faceCount != null) d["faceCount"] = (long)System.Convert.ToInt64(faceCount.GetValue(component, null), CultureInfo.InvariantCulture);
+                    }
+                    catch (Exception) { /* ProBuilder 组件状态异常时不要拖垮整个调用（审计 P2）。 */ }
                 }
             }
             return d;
@@ -336,11 +412,13 @@ namespace DSHBridge
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var assetPath = ResolveAssetPath(path, "path");
+            var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
+            if (asset == null) throw new KnownError("asset_not_found", "找不到资产: " + assetPath);
             var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (importer == null) throw new KnownError("not_texture", "不是纹理资产: " + assetPath);
             var d = new Dictionary<string, object>();
             d["assetPath"] = assetPath;
-            d["importer"] = importer != null ? importer.GetType().Name : null;
-            if (importer != null)
+            d["importer"] = importer.GetType().Name;
             {
                 d["spriteImportMode"] = importer.spriteImportMode.ToString();
                 d["spritePixelsPerUnit"] = (double)importer.spritePixelsPerUnit;
@@ -374,11 +452,15 @@ namespace DSHBridge
             if (!assetPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
                 throw new KnownError("invalid_argument", "纹理路径必须以 .png 结尾");
             var kind = (GetString(args, "kind") ?? "checker").ToLowerInvariant();
+            if (kind != "checker" && kind != "stripes" && kind != "gradient" && kind != "solid")
+                throw new KnownError("unsupported_kind", "不支持的 texture kind: " + kind + "（checker/stripes/gradient/solid）");
             var width = (int)Math.Max(1, Math.Min(4096, ToLong(args, "width", 256)));
             var height = (int)Math.Max(1, Math.Min(4096, ToLong(args, "height", 256)));
             var cell = (int)Math.Max(1, ToLong(args, "cell", 16));
             var colorA = args.ContainsKey("colorA") ? (Color)CoerceValue(args["colorA"], typeof(Color)) : new Color(1f, 1f, 1f, 1f);
             var colorB = args.ContainsKey("colorB") ? (Color)CoerceValue(args["colorB"], typeof(Color)) : new Color(0f, 0f, 0f, 1f);
+            var full = System.IO.Path.Combine(_projectRoot, assetPath.Replace('/', System.IO.Path.DirectorySeparatorChar));
+            var overwritten = System.IO.File.Exists(full);
             var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
             try
             {
@@ -399,15 +481,13 @@ namespace DSHBridge
                                 colorA.b + (colorB.b - colorA.b) * ratio,
                                 colorA.a + (colorB.a - colorA.a) * ratio);
                         }
-                        else if (kind == "solid") color = colorA;
-                        else throw new KnownError("unsupported_kind", "不支持的 texture kind: " + kind + "（checker/stripes/gradient/solid）");
+                        else color = colorA;
                         pixels[y * width + x] = color;
                     }
                 }
                 tex.SetPixels(pixels);
                 tex.Apply();
                 var png = tex.EncodeToPNG();
-                var full = System.IO.Path.Combine(_projectRoot, assetPath.Replace('/', System.IO.Path.DirectorySeparatorChar));
                 var parent = System.IO.Path.GetDirectoryName(full);
                 if (!string.IsNullOrEmpty(parent)) System.IO.Directory.CreateDirectory(parent);
                 System.IO.File.WriteAllBytes(full, png);
@@ -431,6 +511,14 @@ namespace DSHBridge
                 d["kind"] = kind;
                 d["bytes"] = (long)png.Length;
                 d["importer"] = importer != null ? importer.GetType().Name : null;
+                d["overwritten"] = overwritten;
+                var hasSprite = false;
+                var subAssets = AssetDatabase.LoadAllAssetsAtPath(assetPath);
+                for (var i = 0; i < subAssets.Length; i++)
+                {
+                    if (subAssets[i] is Sprite) { hasSprite = true; break; }
+                }
+                d["spriteCreated"] = hasSprite;
                 return d;
             }
             finally
@@ -463,6 +551,8 @@ namespace DSHBridge
             }
             var d = new Dictionary<string, object>();
             d["count"] = (long)windows.Length;
+            d["total"] = (long)windows.Length;
+            if (windows.Length > rows.Count) d["truncated"] = true;
             d["windows"] = rows;
             d["focused"] = EditorWindow.focusedWindow != null ? EditorWindow.focusedWindow.GetType().Name : null;
             return d;
@@ -477,8 +567,9 @@ namespace DSHBridge
                 var name = window.GetType().Name;
                 var fullName = window.GetType().FullName;
                 var windowTitle = window.titleContent != null ? window.titleContent.text : null;
-                if (!string.IsNullOrEmpty(typeName) && (name == typeName || fullName == typeName)) return window;
-                if (!string.IsNullOrEmpty(title) && windowTitle == title) return window;
+                var typeOk = string.IsNullOrEmpty(typeName) || name == typeName || fullName == typeName;
+                var titleOk = string.IsNullOrEmpty(title) || windowTitle == title;
+                if (typeOk && titleOk && (!string.IsNullOrEmpty(typeName) || !string.IsNullOrEmpty(title))) return window;
             }
             return null;
         }
@@ -500,12 +591,31 @@ namespace DSHBridge
             return d;
         }
 
-        static Event NewKeyEvent(EventType type, KeyCode keyCode)
+        static Event NewKeyEvent(EventType type, KeyCode keyCode, char character, EventModifiers modifiers)
         {
             var evt = new Event();
             evt.type = type;
             evt.keyCode = keyCode;
+            evt.character = character;
+            evt.modifiers = modifiers;
             return evt;
+        }
+
+        static EventModifiers ParseModifiers(object raw)
+        {
+            var result = EventModifiers.None;
+            var list = raw as List<object>;
+            if (list == null) return result;
+            foreach (var item in list)
+            {
+                var text = (System.Convert.ToString(item, CultureInfo.InvariantCulture) ?? "").ToLowerInvariant();
+                if (text == "shift") result |= EventModifiers.Shift;
+                else if (text == "ctrl" || text == "control") result |= EventModifiers.Control;
+                else if (text == "alt" || text == "option") result |= EventModifiers.Alt;
+                else if (text == "cmd" || text == "command") result |= EventModifiers.Command;
+                else throw new KnownError("invalid_argument", "未知 modifiers: " + text + "（shift/ctrl/alt/cmd）");
+            }
+            return result;
         }
 
         static Dictionary<string, object> InputSend(Dictionary<string, object> args)
@@ -525,11 +635,14 @@ namespace DSHBridge
             }
             if (target == null) throw new KnownError("no_focused_window", "没有焦点窗口；请用 window 参数指定（如 SceneView）");
             var applied = new List<object>();
+            var deliveredCount = 0;
+            var requestedCount = 0;
             for (var i = 0; i < events.Count; i++)
             {
                 var raw = events[i] as Dictionary<string, object>;
-                if (raw == null) continue;
+                if (raw == null) throw new KnownError("invalid_argument", "events[" + i + "] 不是对象");
                 var type = (GetString(raw, "type") ?? "key").ToLowerInvariant();
+                requestedCount += 1;
                 if (type == "key")
                 {
                     var keyName = GetString(raw, "key");
@@ -537,47 +650,60 @@ namespace DSHBridge
                     KeyCode keyCode;
                     if (!Enum.TryParse<KeyCode>(keyName, true, out keyCode))
                         throw new KnownError("invalid_argument", "未知按键: " + keyName);
+                    var character = '\0';
+                    var characterText = GetString(raw, "character");
+                    if (!string.IsNullOrEmpty(characterText)) character = characterText[0];
+                    var modifiers = ParseModifiers(raw.ContainsKey("modifiers") ? raw["modifiers"] : null);
                     var action = (GetString(raw, "action") ?? "press").ToLowerInvariant();
-                    if (action == "down") target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode));
-                    else if (action == "up") target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode));
+                    var delivered = true;
+                    if (action == "down") delivered &= target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode, character, modifiers));
+                    else if (action == "up") delivered &= target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode, character, modifiers));
                     else
                     {
-                        target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode));
-                        target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode));
+                        delivered &= target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode, character, modifiers));
+                        delivered &= target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode, character, modifiers));
                         action = "press";
                     }
+                    if (delivered) deliveredCount += 1;
                     var row = new Dictionary<string, object>();
                     row["type"] = "key";
                     row["key"] = keyName;
                     row["action"] = action;
+                    row["delivered"] = delivered;
                     applied.Add(row);
                 }
                 else if (type == "mouse")
                 {
                     var action = (GetString(raw, "action") ?? "click").ToLowerInvariant();
                     var button = (int)ToLong(raw, "button", 0);
+                    var clickCount = (int)ToLong(raw, "clickCount", 1);
                     var x = (float)System.Convert.ToDouble(raw.ContainsKey("x") ? raw["x"] : (object)0, CultureInfo.InvariantCulture);
                     var y = (float)System.Convert.ToDouble(raw.ContainsKey("y") ? raw["y"] : (object)0, CultureInfo.InvariantCulture);
                     var down = new Event();
                     down.type = EventType.MouseDown;
                     down.button = button;
+                    down.clickCount = clickCount;
                     down.mousePosition = new Vector2(x, y);
                     var up = new Event();
                     up.type = EventType.MouseUp;
                     up.button = button;
+                    up.clickCount = clickCount;
                     up.mousePosition = new Vector2(x, y);
-                    if (action == "down") target.SendEvent(down);
-                    else if (action == "up") target.SendEvent(up);
+                    var delivered = true;
+                    if (action == "down") delivered &= target.SendEvent(down);
+                    else if (action == "up") delivered &= target.SendEvent(up);
                     else
                     {
-                        target.SendEvent(down);
-                        target.SendEvent(up);
+                        delivered &= target.SendEvent(down);
+                        delivered &= target.SendEvent(up);
                         action = "click";
                     }
+                    if (delivered) deliveredCount += 1;
                     var row = new Dictionary<string, object>();
                     row["type"] = "mouse";
                     row["button"] = (long)button;
                     row["action"] = action;
+                    row["delivered"] = delivered;
                     applied.Add(row);
                 }
                 else if (type == "scroll")
@@ -587,10 +713,15 @@ namespace DSHBridge
                     evt.delta = new Vector2(
                         (float)System.Convert.ToDouble(raw.ContainsKey("x") ? raw["x"] : (object)0, CultureInfo.InvariantCulture),
                         (float)System.Convert.ToDouble(raw.ContainsKey("y") ? raw["y"] : (object)0, CultureInfo.InvariantCulture));
-                    target.SendEvent(evt);
+                    evt.mousePosition = new Vector2(
+                        (float)System.Convert.ToDouble(raw.ContainsKey("mx") ? raw["mx"] : (object)0, CultureInfo.InvariantCulture),
+                        (float)System.Convert.ToDouble(raw.ContainsKey("my") ? raw["my"] : (object)0, CultureInfo.InvariantCulture));
+                    var delivered = target.SendEvent(evt);
+                    if (delivered) deliveredCount += 1;
                     var row = new Dictionary<string, object>();
                     row["type"] = "scroll";
                     row["delta"] = new List<object> { (double)evt.delta.x, (double)evt.delta.y };
+                    row["delivered"] = delivered;
                     applied.Add(row);
                 }
                 else throw new KnownError("invalid_argument", "未知事件 type: " + type + "（key/mouse/scroll）");
@@ -598,12 +729,15 @@ namespace DSHBridge
             target.Repaint();
             var d = new Dictionary<string, object>();
             d["window"] = target.GetType().Name;
+            d["requested"] = (long)requestedCount;
+            d["delivered"] = (long)deliveredCount;
             d["applied"] = applied;
             return d;
         }
 
         static Dictionary<string, object> PlaymodeSet(Dictionary<string, object> args)
         {
+            if (!args.ContainsKey("playing")) throw new KnownError("invalid_argument", "缺少 playing（布尔）；不要依赖默认值以免误停 Play Mode");
             var before = EditorApplication.isPlaying;
             var target = ToBool(args, "playing");
             if (target != before) EditorApplication.isPlaying = target;

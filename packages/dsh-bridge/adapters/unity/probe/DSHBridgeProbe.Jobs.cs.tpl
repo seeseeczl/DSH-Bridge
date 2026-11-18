@@ -24,9 +24,15 @@ namespace DSHBridge
     {
         // ===== 长任务作业体系（能力补全第 6 项）=====
         // 作业记录持久化到 Library/DSHBridge/jobs/<id>.json：域重载/重启后仍可查询，
-        // 运行中的作业被标记为 interrupted（编辑器主线程任务随域重载丢失，不能假装还在跑）。
+        // 运行中的作业会被标记为 interrupted（编辑器主线程任务随域重载丢失，不能假装还在跑）。
+        // 几个不变量：
+        // 1) jobId 只接受 job- + 16 位小写十六进制，拼路径后再做目录前缀校验（防止 ../ 逃逸读任意 .json）；
+        // 2) 持久化统一走 WriteAtomic，且作业文件按 mtime 保留最近 MaxRetainedJobs 条；
+        // 3) 状态机 pending → running → done/failed/cancelled/interrupted；取消先置 cancelling，真正停止后才 cancelled。
         static readonly Dictionary<string, Dictionary<string, object>> _jobs = new Dictionary<string, Dictionary<string, object>>();
         static readonly List<JobRunner> _jobRunners = new List<JobRunner>();
+        // 活跃 test-run 作业集合：PollTestJobs 只遍历这里，避免历史作业越多、每帧遍历越慢（O(活跃)）。
+        static readonly List<Dictionary<string, object>> _activeTestJobs = new List<Dictionary<string, object>>();
 
         class JobRunner
         {
@@ -34,52 +40,233 @@ namespace DSHBridge
             public Func<bool> Advance;
         }
 
+        /// <summary>作业文件保留条数（按最后写入时间保留最近的）。</summary>
+        const int MaxRetainedJobs = 500;
+        /// <summary>创建作业时触发清理的最短间隔（秒）：清理要枚举目录，不能每个作业都扫一遍。</summary>
+        const double JobPruneIntervalSeconds = 60.0;
+        /// <summary>测试结果轮询节流（秒）：避免每帧读盘，同时保证取消/完成反馈在 0.25s 量级。</summary>
+        const double TestPollIntervalSeconds = 0.25;
+        /// <summary>test-run 作业的总超时（秒）：无回调时用它兜底，避免永久 pending。</summary>
+        const double TestJobTimeoutSeconds = 60.0 * 60.0;
+        /// <summary>结果文件可读但字段不足时允许的重试次数（0.25s 一次，约 2.5s 后判损坏）。</summary>
+        const int TestResultCorruptRetryLimit = 10;
+        /// <summary>取消光照烘焙后等待引擎真正停下的上限（秒）。</summary>
+        const double LightingCancelSettleSeconds = 15.0;
+        /// <summary>BakeAsync 返回 true 后等待 isRunning 置位的观察窗口（秒）：避免帧级时序造成「假成功」。</summary>
+        const double BakeRunningGraceSeconds = 1.5;
+        /// <summary>构建失败详情里最多保留的字符数。</summary>
+        const int BuildFailureDetailLimit = 600;
+
+        static double _nextTestPoll;
+        static double _nextJobPrune;
+
         static string JobsDir()
         {
             return Path.Combine(_rootDir, "jobs");
         }
 
-        static string JobFile(string id)
+        // ---- jobId 校验：格式 + 目录前缀双保险（审计 P1-3 / P2-5）----
+
+        /// <summary>jobId 严格格式：job- 加 16 位小写十六进制（与 Guid("N").Substring(0,16) 一致）。</summary>
+        static bool IsValidJobId(string jobId)
         {
-            return Path.Combine(JobsDir(), id + ".json");
+            if (string.IsNullOrEmpty(jobId)) return false;
+            if (jobId.Length != 20) return false;
+            if (jobId[0] != 'j' || jobId[1] != 'o' || jobId[2] != 'b' || jobId[3] != '-') return false;
+            for (var i = 4; i < jobId.Length; i++)
+            {
+                var c = jobId[i];
+                var isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                if (!isHex) return false;
+            }
+            return true;
         }
+
+        /// <summary>fullPath 等于 directory 或位于其下（大小写不敏感，兼容 macOS/Windows 文件系统）。</summary>
+        static bool IsSameOrInsideDirectory(string fullPath, string directory)
+        {
+            if (string.IsNullOrEmpty(fullPath) || string.IsNullOrEmpty(directory)) return false;
+            string full;
+            string dir;
+            try
+            {
+                full = Path.GetFullPath(fullPath);
+                dir = Path.GetFullPath(directory);
+            }
+            catch (Exception) { return false; }
+            if (string.Equals(full, dir, StringComparison.OrdinalIgnoreCase)) return true;
+            if (!dir.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                dir = dir + Path.DirectorySeparatorChar;
+            return full.StartsWith(dir, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// jobId → 作业文件绝对路径。先做字符集校验，再校验 GetFullPath 之后仍在 jobs/ 内：
+        /// 即使将来放宽字符集，也不会出现 Path.Combine 逃逸（审计实测过 ../ 逃逸可读工程外文件）。
+        /// </summary>
+        static string JobFile(string jobId)
+        {
+            if (!IsValidJobId(jobId))
+                throw new KnownError("invalid_argument", "jobId 格式非法：只接受 job- 加 16 位小写十六进制（实际: " + (jobId ?? "null") + "）");
+            var dir = Path.GetFullPath(JobsDir());
+            var file = Path.GetFullPath(Path.Combine(dir, jobId + ".json"));
+            if (!IsSameOrInsideDirectory(file, dir))
+                throw new KnownError("invalid_argument", "jobId 解析后的路径不在作业目录内: " + jobId);
+            return file;
+        }
+
+        // ---- 作业持久化与查找 ----
 
         static void PersistJob(Dictionary<string, object> job)
         {
+            if (job == null) return;
+            var id = GetString(job, "id");
+            if (!IsValidJobId(id)) return;
             try
             {
                 Directory.CreateDirectory(JobsDir());
-                File.WriteAllText(JobFile(GetString(job, "id")), MiniJson.Serialize(job), new UTF8Encoding(false));
+                // P2：先写临时文件再替换，避免调用方读到半份 JSON（由 MonoCompiler 的 WriteAtomic 保证）。
+                WriteAtomic(JobFile(id), MiniJson.Serialize(job));
             }
             catch (Exception) { }
         }
 
         static Dictionary<string, object> FindJob(string jobId)
         {
-            if (string.IsNullOrEmpty(jobId)) return null;
+            // JobFile 会先校验 jobId 格式与目录前缀，非法直接 invalid_argument。
+            var file = JobFile(jobId);
             Dictionary<string, object> job;
             if (_jobs.TryGetValue(jobId, out job)) return job;
-            var file = JobFile(jobId);
             if (!File.Exists(file)) return null;
             try
             {
                 var parsed = MiniJson.Parse(File.ReadAllText(file)) as Dictionary<string, object>;
-                if (parsed != null) _jobs[jobId] = parsed;
+                if (parsed == null)
+                    throw new KnownError("job_corrupted", "作业记录损坏（不是 JSON 对象）: " + jobId);
+                _jobs[jobId] = parsed;
                 return parsed;
             }
-            catch (Exception) { return null; }
+            catch (KnownError) { throw; }
+            catch (Exception error)
+            {
+                // 文件存在但解析失败 = 损坏，而不是「找不到」：两者的处置方式完全不同。
+                throw new KnownError("job_corrupted", "作业记录损坏，无法解析: " + jobId,
+                    error.GetType().Name + ": " + error.Message);
+            }
         }
+
+        /// <summary>作业记录上限：按 mtime 保留最近 keep 条，更旧的作业文件与内存记录一起清掉（审计 P2-7）。</summary>
+        static void PruneOldJobs(int keep)
+        {
+            try
+            {
+                var dir = JobsDir();
+                if (!Directory.Exists(dir)) return;
+                var files = Directory.GetFiles(dir, "*.json");
+                if (files.Length <= keep) return;
+                var entries = new List<KeyValuePair<DateTime, string>>();
+                for (var i = 0; i < files.Length; i++)
+                {
+                    try { entries.Add(new KeyValuePair<DateTime, string>(File.GetLastWriteTimeUtc(files[i]), files[i])); }
+                    catch (Exception) { }
+                }
+                // 新 → 旧：只保留最近的；活跃作业无论多旧都不删（正在跑的 runner 还在引用它）。
+                entries.Sort(delegate (KeyValuePair<DateTime, string> a, KeyValuePair<DateTime, string> b)
+                {
+                    return b.Key.CompareTo(a.Key);
+                });
+                var kept = 0;
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    var file = entries[i].Value;
+                    var id = Path.GetFileNameWithoutExtension(file);
+                    Dictionary<string, object> job = null;
+                    _jobs.TryGetValue(id, out job);
+                    var active = job != null && JobStatusIsActive(GetString(job, "status"));
+                    if (active || kept < keep)
+                    {
+                        kept += 1;
+                        continue;
+                    }
+                    try { File.Delete(file); } catch (Exception) { }
+                    if (job != null) _jobs.Remove(id);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        static void PruneOldJobsIfDue()
+        {
+            var now = EditorApplication.timeSinceStartup;
+            if (now < _nextJobPrune) return;
+            _nextJobPrune = now + JobPruneIntervalSeconds;
+            PruneOldJobs(MaxRetainedJobs);
+        }
+
+        // ---- 状态机辅助 ----
+
+        static bool JobStatusIsTerminal(string status)
+        {
+            return status == "done" || status == "failed" || status == "cancelled" || status == "interrupted";
+        }
+
+        static bool JobStatusIsActive(string status)
+        {
+            return status == "pending" || status == "running" || status == "cancelling";
+        }
+
+        static DateTime ParseUtcTime(string raw, DateTime fallback)
+        {
+            DateTime parsed;
+            if (!string.IsNullOrEmpty(raw)
+                && DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed))
+                return parsed.ToUniversalTime();
+            return fallback;
+        }
+
+        static string UtcNowIso()
+        {
+            return DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+        }
+
+        static double GetJobProgress(Dictionary<string, object> job)
+        {
+            object value;
+            if (job == null || !job.TryGetValue("progress", out value) || value == null) return 0d;
+            try { return Math.Max(0d, Math.Min(1d, Convert.ToDouble(value, CultureInfo.InvariantCulture))); }
+            catch (Exception) { return 0d; }
+        }
+
+        /// <summary>更新进度并落盘；只有变化超过 0.1% 才写，避免逐帧写盘。</summary>
+        static void SetJobProgress(Dictionary<string, object> job, double progress)
+        {
+            if (job == null) return;
+            var next = Math.Max(0d, Math.Min(1d, progress));
+            if (Math.Abs(GetJobProgress(job) - next) < 0.001d) return;
+            job["progress"] = next;
+            PersistJob(job);
+        }
+
+        static Exception UnwrapError(Exception error)
+        {
+            var invocation = error as TargetInvocationException;
+            if (invocation != null && invocation.InnerException != null) return invocation.InnerException;
+            return error;
+        }
+
+        // ---- 作业生命周期 ----
 
         static Dictionary<string, object> CreateJob(string kind, string label, bool cancelable)
         {
+            PruneOldJobsIfDue();
             var job = new Dictionary<string, object>();
             job["id"] = "job-" + Guid.NewGuid().ToString("N").Substring(0, 16);
             job["kind"] = kind;
             job["label"] = label ?? kind;
             job["status"] = "pending";
             job["cancelable"] = cancelable;
-            job["startedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-            job["progress"] = 0L;
+            job["startedAt"] = UtcNowIso();
+            job["progress"] = 0d;
             _jobs[(string)job["id"]] = job;
             PersistJob(job);
             return job;
@@ -88,19 +275,63 @@ namespace DSHBridge
         static void CompleteJob(Dictionary<string, object> job, Dictionary<string, object> result)
         {
             job["status"] = "done";
-            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-            job["progress"] = 1L;
+            job["finishedAt"] = UtcNowIso();
+            job["progress"] = 1d;
+            job.Remove("cancelRequested");
             job["result"] = result;
             PersistJob(job);
         }
 
+        /// <summary>
+        /// 失败收尾。KnownError 的 code/detail 原样保留（调用方需要区分 test_timeout / build_failed 等），
+        /// 其它异常沿用「类型名: 消息」，并解包反射调用包装的 TargetInvocationException。
+        /// </summary>
         static void FailJob(Dictionary<string, object> job, Exception error)
         {
+            if (job == null) return;
             job["status"] = "failed";
-            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-            job["error"] = error == null ? "unknown error" : (error.GetType().Name + ": " + error.Message);
+            job["finishedAt"] = UtcNowIso();
+            var actual = UnwrapError(error);
+            var known = actual as KnownError;
+            if (known != null)
+            {
+                job["error"] = known.Message;
+                job["errorCode"] = known.Code;
+                if (!string.IsNullOrEmpty(known.Detail)) job["errorDetail"] = TruncateText(known.Detail, 1000);
+            }
+            else if (actual == null)
+            {
+                job["error"] = "unknown error";
+                job["errorCode"] = "probe_error";
+            }
+            else
+            {
+                job["error"] = actual.GetType().Name + ": " + actual.Message;
+                job["errorCode"] = "probe_error";
+            }
+            job.Remove("cancelRequested");
             PersistJob(job);
         }
+
+        /// <summary>取消终态：只有取消请求真正生效（或确认无法继续等待）后才调用。</summary>
+        static void CancelJob(Dictionary<string, object> job, string note, Dictionary<string, object> result)
+        {
+            if (job == null) return;
+            job["status"] = "cancelled";
+            job["finishedAt"] = UtcNowIso();
+            job.Remove("cancelRequested");
+            if (!string.IsNullOrEmpty(note)) job["cancelNote"] = note;
+            if (result != null) job["result"] = result;
+            PersistJob(job);
+        }
+
+        static string TruncateText(string text, int limit)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length <= limit) return text;
+            return text.Substring(0, limit) + "…";
+        }
+
+        // ---- 域重载恢复 ----
 
         static void RecoverInterruptedJobs()
         {
@@ -115,20 +346,205 @@ namespace DSHBridge
                     {
                         var job = MiniJson.Parse(File.ReadAllText(files[i])) as Dictionary<string, object>;
                         if (job == null) continue;
+                        var id = GetString(job, "id");
+                        if (!IsValidJobId(id)) continue;
                         var status = GetString(job, "status");
-                        if (status == "pending" || status == "running")
+                        if (JobStatusIsActive(status))
                         {
-                            job["status"] = "interrupted";
-                            job["error"] = "编辑器域重载或重启，长任务未执行完";
-                            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-                            File.WriteAllText(files[i], MiniJson.Serialize(job), new UTF8Encoding(false));
+                            // 恢复前先尽量对账：包操作可能已经生效，test-run 的结果文件可能已经写好。
+                            ReconcileInterruptedJob(job);
+                            // P2：恢复写盘也走原子写，避免二次中断留下半份 JSON。
+                            WriteAtomic(files[i], MiniJson.Serialize(job));
                         }
-                        _jobs[GetString(job, "id")] = job;
+                        _jobs[id] = job;
                     }
                     catch (Exception) { }
                 }
+                // Init 时也执行一次保留策略（长时间积累的历史作业不会无限增长）。
+                PruneOldJobs(MaxRetainedJobs);
             }
             catch (Exception) { }
+        }
+
+        /// <summary>域重载后先把「已经实际完成」的长任务对账成终态，对不上的才标 interrupted。</summary>
+        static void ReconcileInterruptedJob(Dictionary<string, object> job)
+        {
+            var kind = GetString(job, "kind");
+            // 取消请求已发出的：按 cancelled 收尾（域重载已经取代了「真正停止」这一步）。
+            if (job.ContainsKey("cancelRequested"))
+            {
+                CancelJob(job, "取消请求在域重载前已发出，按 cancelled 收尾（底层编辑器操作可能已随域重载丢失）", null);
+                return;
+            }
+            if (kind == "package-add" || kind == "package-remove")
+            {
+                if (ReconcilePackageJob(job, kind)) return;
+            }
+            if (kind == "test-run" && TryRecoverTestJob(job)) return;
+            job["status"] = "interrupted";
+            job["errorCode"] = kind == "test-run" ? "test_interrupted" : "job_interrupted";
+            job["error"] = "编辑器域重载或重启，长任务未执行完";
+            job["finishedAt"] = UtcNowIso();
+        }
+
+        /// <summary>
+        /// package-add/remove 的域重载恢复对账：包操作是否成功不由回调决定，而是看目标包在不在注册表里。
+        /// 返回 false 表示无法对账（例如 git/url identifier、包管理器尚未就绪），由调用方保留 interrupted。
+        /// </summary>
+        static bool ReconcilePackageJob(Dictionary<string, object> job, string kind)
+        {
+            var target = GetString(job, "packageName");
+            if (string.IsNullOrEmpty(target)) return false;
+            var baseName = PackageBaseName(target);
+            if (string.IsNullOrEmpty(baseName)) return false;
+            bool registered;
+            try { registered = IsPackageRegistered(baseName); }
+            catch (Exception) { return false; }
+            var succeeded = kind == "package-add" ? registered : !registered;
+            var result = new Dictionary<string, object>();
+            result["name"] = baseName;
+            result["reconciled"] = true;
+            result["registered"] = registered;
+            if (kind == "package-add") result["installed"] = registered;
+            else result["removed"] = !registered;
+            job["progress"] = 1d;
+            job["finishedAt"] = UtcNowIso();
+            job["result"] = result;
+            if (succeeded)
+            {
+                job["status"] = "done";
+                job.Remove("error");
+                job.Remove("errorCode");
+                job.Remove("errorDetail");
+            }
+            else
+            {
+                job["status"] = "failed";
+                job["errorCode"] = kind == "package-add" ? "package_add_incomplete" : "package_remove_incomplete";
+                job["error"] = (kind == "package-add" ? "包添加" : "包移除")
+                    + "在编辑器域重载前未完成；按已注册包对账：" + baseName
+                    + (kind == "package-add" ? " 未注册" : " 仍注册");
+            }
+            PersistJob(job);
+            return true;
+        }
+
+        static string PackageBaseName(string identifier)
+        {
+            if (string.IsNullOrEmpty(identifier)) return null;
+            // git / 网络 / 本地路径形式的 identifier 没有稳定的注册名，无法安全对账。
+            if (identifier.IndexOf("://", StringComparison.Ordinal) >= 0) return null;
+            if (identifier.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return null;
+            if (Path.IsPathRooted(identifier)) return null;
+            var at = identifier.IndexOf('@');
+            var name = at > 0 ? identifier.Substring(0, at) : identifier;
+            return name.Length == 0 ? null : name;
+        }
+
+        static bool IsPackageRegistered(string name)
+        {
+            var infos = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages();
+            if (infos == null) return false;
+            for (var i = 0; i < infos.Length; i++)
+            {
+                var info = infos[i];
+                if (info == null || string.IsNullOrEmpty(info.name)) continue;
+                if (string.Equals(info.name, name, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        // ---- 作业推进 ----
+
+        static void JobTick()
+        {
+            if (_jobRunners.Count == 0) return;
+            for (var i = _jobRunners.Count - 1; i >= 0; i--)
+            {
+                var runner = _jobRunners[i];
+                var job = runner.Job;
+                if (job.ContainsKey("cancelRequested") || GetString(job, "status") == "cancelling")
+                {
+                    if (!FinalizeRunnerCancellation(job)) continue;
+                    _jobRunners.RemoveAt(i);
+                    continue;
+                }
+                try
+                {
+                    // P2：runner 第一次被推进才从 pending 转 running，并落盘（调用方能看到状态推进）。
+                    if (GetString(job, "status") == "pending")
+                    {
+                        job["status"] = "running";
+                        PersistJob(job);
+                    }
+                    if (runner.Advance()) _jobRunners.RemoveAt(i);
+                }
+                catch (Exception error)
+                {
+                    FailJob(job, error);
+                    _jobRunners.RemoveAt(i);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 取消一个 runner 作业：只有确认「确实停下来了」才置 cancelled。
+        /// 返回 true 表示终态已写入、本次可以从 runner 列表移除。
+        /// </summary>
+        static bool FinalizeRunnerCancellation(Dictionary<string, object> job)
+        {
+            if (!job.ContainsKey("cancelRequested")) job["cancelRequested"] = true;
+            if (GetString(job, "status") != "cancelling")
+            {
+                job["status"] = "cancelling";
+                PersistJob(job);
+            }
+            if (GetString(job, "kind") == "bake-lighting")
+            {
+                // 只有本作业确实启动了烘焙才允许调用 Lightmapping.Cancel()：否则会误杀别人启动的烘焙（P1-10）。
+                var ownsBake = ToBoolValue(job.ContainsKey("startedByJob") ? job["startedByJob"] : null);
+                if (!ownsBake)
+                {
+                    CancelJob(job, "无法确认烘焙由本作业启动，未调用 Lightmapping.Cancel()；仅将作业标记为 cancelled", null);
+                    return true;
+                }
+                if (!job.ContainsKey("cancelIssued"))
+                {
+                    job["cancelIssued"] = true;
+                    job["cancelDeadlineAt"] = DateTime.UtcNow.AddSeconds(LightingCancelSettleSeconds)
+                        .ToString("o", CultureInfo.InvariantCulture);
+                    PersistJob(job);
+                    try { if (Lightmapping.isRunning) Lightmapping.Cancel(); } catch (Exception) { }
+                }
+                if (Lightmapping.isRunning)
+                {
+                    var deadline = ParseUtcTime(GetString(job, "cancelDeadlineAt"), DateTime.UtcNow.AddSeconds(LightingCancelSettleSeconds));
+                    if (DateTime.UtcNow >= deadline)
+                        CancelJob(job, "取消请求已发出，但引擎在 " + (long)LightingCancelSettleSeconds + "s 内仍未停止烘焙；作业按 cancelled 收尾", null);
+                    else
+                        return false;
+                    return true;
+                }
+                if (!ToBoolValue(job.ContainsKey("bakeObservedRunning") ? job["bakeObservedRunning"] : null))
+                {
+                    // 还没观测到 isRunning=true：烘焙可能仍在「已受理、尚未开始」的窗口里，
+                    // 再等完观察窗口，避免作业先 cancelled、引擎随后才开始烘焙（无人回收）。
+                    var waitUntil = ParseUtcTime(GetString(job, "bakeWaitUntil"), DateTime.UtcNow);
+                    if (DateTime.UtcNow < waitUntil) return false;
+                }
+                CancelJob(job, null, null);
+                return true;
+            }
+            CancelJob(job, "已停止推进该作业；底层编辑器操作可能仍在执行", null);
+            return true;
+        }
+
+        static void QueueJob(Dictionary<string, object> job, Func<bool> advance)
+        {
+            var runner = new JobRunner();
+            runner.Job = job;
+            runner.Advance = advance;
+            _jobRunners.Add(runner);
         }
 
         static bool ToBoolValue(object value)
@@ -140,42 +556,7 @@ namespace DSHBridge
             return bool.TryParse(text, out parsed) && parsed;
         }
 
-        static void JobTick()
-        {
-            if (_jobRunners.Count == 0) return;
-            for (var i = _jobRunners.Count - 1; i >= 0; i--)
-            {
-                var runner = _jobRunners[i];
-                var job = runner.Job;
-                if (job.ContainsKey("cancelRequested"))
-                {
-                    try { if (Lightmapping.isRunning) Lightmapping.Cancel(); } catch (Exception) { }
-                    job["status"] = "cancelled";
-                    job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-                    PersistJob(job);
-                    _jobRunners.RemoveAt(i);
-                    continue;
-                }
-                try
-                {
-                    job["status"] = "running";
-                    if (runner.Advance()) _jobRunners.RemoveAt(i);
-                }
-                catch (Exception error)
-                {
-                    FailJob(job, error);
-                    _jobRunners.RemoveAt(i);
-                }
-            }
-        }
-
-        static void QueueJob(Dictionary<string, object> job, Func<bool> advance)
-        {
-            var runner = new JobRunner();
-            runner.Job = job;
-            runner.Advance = advance;
-            _jobRunners.Add(runner);
-        }
+        // ---- 作业查询/取消 ----
 
         /**
          * 作业视图。cancelable/progress 在 domain reload 后可能缺字段（旧文件），
@@ -188,11 +569,15 @@ namespace DSHBridge
             d["kind"] = job.ContainsKey("kind") ? job["kind"] : null;
             d["label"] = job.ContainsKey("label") ? job["label"] : null;
             d["status"] = job.ContainsKey("status") ? job["status"] : null;
-            d["progress"] = job.ContainsKey("progress") ? job["progress"] : (object)0L;
+            d["progress"] = job.ContainsKey("progress") ? job["progress"] : (object)0d;
             d["startedAt"] = job.ContainsKey("startedAt") ? job["startedAt"] : null;
             if (job.ContainsKey("finishedAt")) d["finishedAt"] = job["finishedAt"];
             if (job.ContainsKey("cancelable")) d["cancelable"] = job["cancelable"];
+            if (job.ContainsKey("deadlineAt")) d["deadlineAt"] = job["deadlineAt"];
             if (job.ContainsKey("error")) d["error"] = job["error"];
+            if (job.ContainsKey("errorCode")) d["errorCode"] = job["errorCode"];
+            if (job.ContainsKey("errorDetail")) d["errorDetail"] = job["errorDetail"];
+            if (job.ContainsKey("cancelNote")) d["cancelNote"] = job["cancelNote"];
             if (job.ContainsKey("result")) d["result"] = job["result"];
             return d;
         }
@@ -231,24 +616,57 @@ namespace DSHBridge
             if (string.IsNullOrEmpty(jobId)) throw new KnownError("invalid_argument", "缺少 jobId");
             var job = FindJob(jobId);
             if (job == null) throw new KnownError("job_not_found", "找不到作业: " + jobId);
+            var status = GetString(job, "status");
             var d = new Dictionary<string, object>();
+            d["jobId"] = jobId;
+            // P2：不校验终态就返回 cancelled=true 会骗调用方；已结束的作业如实返回真实状态。
+            if (JobStatusIsTerminal(status))
+            {
+                d["cancelled"] = false;
+                d["status"] = status;
+                d["reason"] = "作业已结束（" + status + "），不能再取消";
+                return d;
+            }
+            if (job.ContainsKey("cancelRequested") || status == "cancelling")
+            {
+                d["cancelled"] = true;
+                d["status"] = "cancelling";
+                d["reason"] = "取消请求已发出，等待作业真正停止";
+                return d;
+            }
+            if (!JobStatusIsActive(status))
+            {
+                d["cancelled"] = false;
+                d["status"] = status;
+                d["reason"] = "作业状态为 " + (status ?? "unknown") + "，不是可取消的活动作业";
+                return d;
+            }
             if (!ToBoolValue(job.ContainsKey("cancelable") ? job["cancelable"] : null))
             {
                 d["cancelled"] = false;
+                d["status"] = status;
                 d["reason"] = "该作业不支持取消（构建/包操作不可中断）";
                 return d;
             }
+            // 两阶段取消：先置 cancelling 并落盘，由 JobTick/PollTestJobs 在真正停止后置 cancelled。
             job["cancelRequested"] = true;
+            job["status"] = "cancelling";
+            PersistJob(job);
             d["cancelled"] = true;
-            d["jobId"] = jobId;
+            d["status"] = "cancelling";
+            d["reason"] = "已发出取消请求；作业在真正停止后变为 cancelled";
             return d;
         }
 
         // ===== 测试运行（能力补全第 3 项补全，等价 MCP run_tests/get_test_job）=====
         // 约束：探针编译在预定义程序集内，无法直接引用 test-framework 的 asmdef（实测 CS0234）。
         // 方案：运行时定位 Library/ScriptAssemblies/UnityEditor.TestRunner.dll，动态编译一段
-        // 实现 ICallbacks 的桥接代码（显式 references），反射启动 TestRunnerApi；
-        // 回调把结果写成一行文本，由 PollTestJobs 轮询完成 job（域重载时 job 标 interrupted）。
+        // 实现 ICallbacks/IErrorCallbacks 的桥接代码（显式 references），反射启动 TestRunnerApi；
+        // 回调把结论写成一行文本，由 PollTestJobs 轮询完成 job（域重载时 job 标 interrupted）。
+        //
+        // PlayMode 测试会触发域重载 → 动态编译的桥接回调（内存程序集）随域消失，结果永远拿不到。
+        // 因此 unity.test.run 对 mode=playmode 显式返回 playmode_unsupported（P1-8 方案 A），
+        // 引导调用方用 Test Runner 窗口或编辑器 CLI -runTests。
         static string FindTestRunnerAssembly()
         {
             var direct = Path.Combine(_projectRoot, "Library", "ScriptAssemblies", "UnityEditor.TestRunner.dll");
@@ -266,6 +684,11 @@ namespace DSHBridge
             return null;
         }
 
+        /// <summary>
+        /// 动态编译的桥接源码。结果文件协议（每次原子覆盖整行）：
+        /// progress|percent|total → 进度；done|passed|failed|skipped|inconclusive|duration|status → 完成；
+        /// error|message → 运行失败（test-framework 1.1.33 的 IErrorCallbacks.OnError(string)）。
+        /// </summary>
         static string TestBridgeSource()
         {
             return @"using System;
@@ -276,33 +699,97 @@ using UnityEditor.TestTools.TestRunner.Api;
 
 public static class DshTestBridge
 {
-    public class Callbacks : ICallbacks
+    // test-framework 1.1.33：IErrorCallbacks : ICallbacks，额外要求 OnError(string)。
+    // 构建错误 / IPrebuildSetup 失败时 RunFinished 不会触发，只能靠 OnError 回传结论，
+    // 否则探针只能等超时（P1-11）。注册仍走 RegisterCallbacks(ICallbacks)。
+    public class Callbacks : IErrorCallbacks
     {
         readonly string resultPath;
+        int total;
+        int finished;
+        int lastPercent;
+
         public Callbacks(string resultPath) { this.resultPath = resultPath; }
-        public void RunStarted(ITestAdaptor testsToRun) { }
+
+        public void RunStarted(ITestAdaptor testsToRun)
+        {
+            try
+            {
+                total = testsToRun != null ? testsToRun.TestCaseCount : 0;
+                WriteLine(""progress|0|"" + total);
+            }
+            catch (Exception) { }
+        }
+
+        public void TestStarted(ITestAdaptor test) { }
+
+        public void TestFinished(ITestResultAdaptor result)
+        {
+            try
+            {
+                if (result == null || result.HasChildren) return;
+                finished += 1;
+                if (total <= 0) total = finished;
+                var step = total > 20 ? Math.Max(1, total / 20) : 1;
+                if (finished % step != 0) return;
+                var percent = finished * 100 / total;
+                if (percent <= lastPercent) return;
+                lastPercent = percent;
+                WriteLine(""progress|"" + percent + ""|"" + total);
+            }
+            catch (Exception) { }
+        }
+
         public void RunFinished(ITestResultAdaptor result)
         {
             try
             {
-                var dir = Path.GetDirectoryName(resultPath);
-                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                var line = (result != null ? result.PassCount : 0) + ""|"" + (result != null ? result.FailCount : 0)
-                    + ""|"" + (result != null ? result.SkipCount : 0) + ""|"" + (result != null ? result.InconclusiveCount : 0)
+                var line = ""done|"" + (result != null ? result.PassCount : 0)
+                    + ""|"" + (result != null ? result.FailCount : 0)
+                    + ""|"" + (result != null ? result.SkipCount : 0)
+                    + ""|"" + (result != null ? result.InconclusiveCount : 0)
                     + ""|"" + (result != null ? result.Duration.ToString(System.Globalization.CultureInfo.InvariantCulture) : ""0"")
                     + ""|"" + (result != null ? result.TestStatus.ToString() : ""None"");
-                File.WriteAllText(resultPath, line);
+                WriteLine(line);
             }
             catch (Exception) { }
         }
-        public void TestStarted(ITestAdaptor test) { }
-        public void TestFinished(ITestResultAdaptor result) { }
+
+        public void OnError(string message)
+        {
+            try
+            {
+                var safe = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Replace('|', '/');
+                if (safe.Length > 2000) safe = safe.Substring(0, 2000);
+                WriteLine(""error|"" + safe);
+            }
+            catch (Exception) { }
+        }
+
+        void WriteLine(string line)
+        {
+            // 探针随时可能轮询这份结果：先写同目录临时文件再替换，不能让它读到半行。
+            var tmp = resultPath + "".tmp-"" + Guid.NewGuid().ToString(""N"").Substring(0, 8);
+            try
+            {
+                var dir = Path.GetDirectoryName(resultPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(tmp, line);
+                if (File.Exists(resultPath)) File.Delete(resultPath);
+                File.Move(tmp, resultPath);
+            }
+            catch (Exception)
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch (Exception) { }
+            }
+        }
     }
 
     public static string Start(string resultPath, string mode, string[] testNames)
     {
         var filter = new Filter();
-        filter.testMode = mode == ""playmode"" ? TestMode.PlayMode : TestMode.EditMode;
+        // PlayMode 已被探针侧显式拒绝（域重载会丢回调），这里固定 EditMode。
+        filter.testMode = TestMode.EditMode;
         if (testNames != null && testNames.Length > 0) filter.testNames = testNames;
         var settings = new ExecutionSettings();
         settings.filters = new Filter[] { filter };
@@ -387,32 +874,79 @@ public static class DshTestBridge
             if (bridgeType == null) throw new KnownError("test_bridge_compile_failed", "编译产物中找不到 DshTestBridge");
             var start = bridgeType.GetMethod("Start", BindingFlags.Public | BindingFlags.Static);
             if (start == null) throw new KnownError("test_bridge_compile_failed", "DshTestBridge 缺少 Start 方法");
-            var returned = start.Invoke(null, new object[] { resultPath, mode, names.ToArray() });
-            return System.Convert.ToString(returned, CultureInfo.InvariantCulture);
+            // P2：反射调用异常的 InnerException 才有意义（例如 TestRunnerApi 抛「已有测试在跑」），
+            // 同时截断堆栈，避免把整份堆栈塞进错误响应。
+            try
+            {
+                var returned = start.Invoke(null, new object[] { resultPath, mode, names.ToArray() });
+                return System.Convert.ToString(returned, CultureInfo.InvariantCulture);
+            }
+            catch (TargetInvocationException invocation)
+            {
+                var inner = invocation.InnerException ?? invocation;
+                throw new KnownError("test_start_failed", "启动测试失败: " + inner.Message,
+                    TruncateText(inner.StackTrace, 500));
+            }
         }
 
-        static void PickTestResult(Dictionary<string, object> job, string resultPath)
+        // ---- 测试结果轮询 ----
+
+        /// <summary>结果文件只能落在 Library/DSHBridge/test/ 下：job 文件可被改写，删/读前必须校验路径。</summary>
+        static bool IsSafeTestResultPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            return IsSameOrInsideDirectory(path, Path.Combine(_rootDir, "test"));
+        }
+
+        /// <summary>清理一天前的测试结果残留（测试桥接回调在域内会一直存活，可能为已结束作业重建结果文件）。</summary>
+        static void SweepStaleTestResults()
         {
             try
             {
-                if (!File.Exists(resultPath)) return;
-                var line = File.ReadAllText(resultPath).Trim();
-                if (line.Length == 0) return;
-                var parts = line.Split('|');
-                var result = new Dictionary<string, object>();
-                if (parts.Length >= 6)
+                var dir = Path.Combine(_rootDir, "test");
+                if (!Directory.Exists(dir)) return;
+                var cutoff = DateTime.UtcNow.AddHours(-24);
+                var files = Directory.GetFiles(dir, "result-*.txt");
+                for (var i = 0; i < files.Length; i++)
                 {
-                    result["passed"] = ToLongValue(parts[0]);
-                    result["failed"] = ToLongValue(parts[1]);
-                    result["skipped"] = ToLongValue(parts[2]);
-                    result["inconclusive"] = ToLongValue(parts[3]);
-                    result["durationSeconds"] = ToDoubleValue(parts[4]);
-                    result["status"] = parts[5];
+                    try { if (File.GetLastWriteTimeUtc(files[i]) < cutoff) File.Delete(files[i]); }
+                    catch (Exception) { }
                 }
-                CompleteJob(job, result);
-                try { File.Delete(resultPath); } catch (Exception) { }
             }
             catch (Exception) { }
+        }
+
+        static void CleanupTestResultFile(Dictionary<string, object> job)
+        {
+            var path = GetString(job, "resultPath");
+            if (!IsSafeTestResultPath(path)) return;
+            try { if (File.Exists(path)) File.Delete(path); } catch (Exception) { }
+            try
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+                var temps = Directory.GetFiles(dir, Path.GetFileName(path) + ".tmp-*");
+                for (var i = 0; i < temps.Length; i++)
+                {
+                    try { File.Delete(temps[i]); } catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
+        }
+
+        static bool TryCompleteFromDoneLine(Dictionary<string, object> job, string line)
+        {
+            var parts = line.Split('|');
+            if (parts.Length < 7) return false;
+            var result = new Dictionary<string, object>();
+            result["passed"] = ToLongValue(parts[1]);
+            result["failed"] = ToLongValue(parts[2]);
+            result["skipped"] = ToLongValue(parts[3]);
+            result["inconclusive"] = ToLongValue(parts[4]);
+            result["durationSeconds"] = ToDoubleValue(parts[5]);
+            result["status"] = parts[6];
+            CompleteJob(job, result);
+            return true;
         }
 
         static long ToLongValue(string raw)
@@ -427,21 +961,163 @@ public static class DshTestBridge
             return double.TryParse(raw ?? "", NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ? parsed : 0d;
         }
 
+        static void MarkTestResultCorrupt(Dictionary<string, object> job, string reason)
+        {
+            var count = ToLong(job, "resultCorruptCount", 0) + 1;
+            job["resultCorruptCount"] = count;
+            if (count < TestResultCorruptRetryLimit) return;
+            // P2：段数不足/无法识别时不能 done + 空结果——先重试，超限才判损坏。
+            FailJob(job, new KnownError("test_result_corrupt",
+                "测试结果文件损坏（连续 " + count + " 次无法解析）：" + reason));
+            CleanupTestResultFile(job);
+        }
+
+        /// <summary>
+        /// 每条轮询最多消费一行结果：
+        /// progress（更新进度，不完成）/ done（完成）/ error（失败）/ 其它（计入损坏重试）。
+        /// 文件读失败（桥接正在原子替换）不算失败，交给下一次轮询与超时兜底。
+        /// </summary>
+        static void PickTestResult(Dictionary<string, object> job, string resultPath)
+        {
+            try
+            {
+                if (!IsSafeTestResultPath(resultPath)) return;
+                if (!File.Exists(resultPath)) return;
+                var line = File.ReadAllText(resultPath).Trim();
+                if (line.Length == 0) return;
+                var separator = line.IndexOf('|');
+                var tag = separator < 0 ? line : line.Substring(0, separator);
+                if (tag == "progress")
+                {
+                    var parts = line.Split('|');
+                    long percent;
+                    if (parts.Length >= 2 && long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out percent))
+                        SetJobProgress(job, percent / 100d * 0.95d);
+                    job["resultCorruptCount"] = 0L;
+                    return;
+                }
+                if (tag == "error")
+                {
+                    var message = separator < 0 ? string.Empty : line.Substring(separator + 1).Trim();
+                    if (message.Length == 0) message = "test-framework 未提供错误详情";
+                    FailJob(job, new KnownError("test_error", "测试运行失败: " + message));
+                    CleanupTestResultFile(job);
+                    return;
+                }
+                if (tag == "done")
+                {
+                    if (TryCompleteFromDoneLine(job, line))
+                    {
+                        CleanupTestResultFile(job);
+                        return;
+                    }
+                    MarkTestResultCorrupt(job, "done 行字段不足（期望 done + 6 段）");
+                    return;
+                }
+                MarkTestResultCorrupt(job, "无法识别的结果行: " + TruncateText(tag, 40));
+            }
+            catch (Exception) { }
+        }
+
+        static bool TestJobExpired(Dictionary<string, object> job)
+        {
+            var startedAt = ParseUtcTime(GetString(job, "startedAt"), DateTime.UtcNow);
+            var fallback = startedAt.AddSeconds(TestJobTimeoutSeconds);
+            var deadline = ParseUtcTime(GetString(job, "deadlineAt"), fallback);
+            return DateTime.UtcNow >= deadline;
+        }
+
+        static void RemoveActiveTestJob(Dictionary<string, object> job)
+        {
+            for (var i = _activeTestJobs.Count - 1; i >= 0; i--)
+            {
+                if (ReferenceEquals(_activeTestJobs[i], job)) _activeTestJobs.RemoveAt(i);
+            }
+        }
+
+        static bool HasActiveTestJob()
+        {
+            for (var i = _activeTestJobs.Count - 1; i >= 0; i--)
+            {
+                var status = GetString(_activeTestJobs[i], "status");
+                if (JobStatusIsActive(status)) return true;
+                if (JobStatusIsTerminal(status)) _activeTestJobs.RemoveAt(i);
+            }
+            return false;
+        }
+
+        /// <summary>test-run 作业推进：状态机、超时、取消、结果文件消费（只遍历活跃集合）。</summary>
         static void PollTestJobs()
         {
-            if (_jobs.Count == 0) return;
-            var rows = new List<Dictionary<string, object>>();
-            foreach (var pair in _jobs) rows.Add(pair.Value);
-            for (var i = 0; i < rows.Count; i++)
+            if (_activeTestJobs.Count == 0) return;
+            var now = EditorApplication.timeSinceStartup;
+            if (now < _nextTestPoll) return;
+            _nextTestPoll = now + TestPollIntervalSeconds;
+            for (var i = _activeTestJobs.Count - 1; i >= 0; i--)
             {
-                var job = rows[i];
-                if (GetString(job, "kind") != "test-run") continue;
+                var job = _activeTestJobs[i];
                 var status = GetString(job, "status");
-                if (status != "pending" && status != "running") continue;
+                if (JobStatusIsTerminal(status))
+                {
+                    _activeTestJobs.RemoveAt(i);
+                    continue;
+                }
+                if (job.ContainsKey("cancelRequested") || status == "cancelling")
+                {
+                    // test-framework 1.1.33 没有公开的 CancelTestRun：探针侧只能终止作业语义并清理结果文件，
+                    // 底层运行可能仍在编辑器内继续（如实写进 cancelNote）。
+                    CleanupTestResultFile(job);
+                    CancelJob(job, "测试作业已取消；探针无法注销 TestRunnerApi 回调，底层运行可能仍在编辑器内继续", null);
+                    _activeTestJobs.RemoveAt(i);
+                    continue;
+                }
+                if (TestJobExpired(job))
+                {
+                    CleanupTestResultFile(job);
+                    FailJob(job, new KnownError("test_timeout",
+                        "测试作业超过 " + (long)(TestJobTimeoutSeconds / 60d) + " 分钟仍未完成，已判定超时（deadlineAt="
+                        + (GetString(job, "deadlineAt") ?? "unknown") + "）"));
+                    _activeTestJobs.RemoveAt(i);
+                    continue;
+                }
+                if (status == "pending")
+                {
+                    // 状态推进落盘：调用方在编译桥接/启动 TestRunner 期间能观察到 running。
+                    job["status"] = "running";
+                    if (!job.ContainsKey("deadlineAt"))
+                        job["deadlineAt"] = DateTime.UtcNow.AddSeconds(TestJobTimeoutSeconds).ToString("o", CultureInfo.InvariantCulture);
+                    PersistJob(job);
+                }
                 var resultPath = GetString(job, "resultPath");
                 if (string.IsNullOrEmpty(resultPath)) continue;
                 PickTestResult(job, resultPath);
+                if (JobStatusIsTerminal(GetString(job, "status"))) _activeTestJobs.RemoveAt(i);
             }
+        }
+
+        /// <summary>域重载恢复时尝试直接读结果文件收尾：测试可能已经跑完，只是回调随域丢了。</summary>
+        static bool TryRecoverTestJob(Dictionary<string, object> job)
+        {
+            var resultPath = GetString(job, "resultPath");
+            if (!IsSafeTestResultPath(resultPath) || !File.Exists(resultPath)) return false;
+            string line;
+            try { line = File.ReadAllText(resultPath).Trim(); }
+            catch (Exception) { return false; }
+            if (line.Length == 0) return false;
+            if (line.StartsWith("error|", StringComparison.Ordinal))
+            {
+                var message = line.Substring(6).Trim();
+                FailJob(job, new KnownError("test_error",
+                    "测试运行失败（域重载后从结果文件恢复）: " + (message.Length == 0 ? "unknown" : message)));
+                CleanupTestResultFile(job);
+                return true;
+            }
+            if (line.StartsWith("done|", StringComparison.Ordinal) && TryCompleteFromDoneLine(job, line))
+            {
+                CleanupTestResultFile(job);
+                return true;
+            }
+            return false;
         }
 
         static Dictionary<string, object> TestRun(Dictionary<string, object> args)
@@ -449,42 +1125,162 @@ public static class DshTestBridge
             var mode = (GetString(args, "mode") ?? "editmode").ToLowerInvariant();
             if (mode != "editmode" && mode != "playmode")
                 throw new KnownError("invalid_argument", "mode 只能是 editmode 或 playmode");
+            // P1-8 方案 A：PlayMode 触发域重载，动态编译的桥接回调无法跨域存活 → 结果必然拿不到。
+            // 与其返回一个注定 interrupted 的作业，不如显式拒绝并指向可用的替代路径。
+            if (mode == "playmode")
+                throw new KnownError("playmode_unsupported",
+                    "PlayMode 测试会触发域重载，桥接回调无法跨域存活；请用 Test Runner 窗口或编辑器 CLI -runTests");
+            // P2：同一时刻只允许一个 test-run 作业（并发两个会互相抢 TestRunnerApi 的全局回调）。
+            if (HasActiveTestJob())
+                throw new KnownError("test_run_busy", "已有测试作业在运行；请等待其结束或先 unity.job.cancel");
             var names = GetStringList(args, "tests");
             var testRunnerDll = FindTestRunnerAssembly();
             if (testRunnerDll == null)
                 throw new KnownError("test_framework_missing", "工程未安装 test-framework（找不到 Library/ScriptAssemblies/UnityEditor.TestRunner.dll）；请先 unity.package.add com.unity.test-framework 并等待编译完成");
-            var job = CreateJob("test-run", "TestRunner " + mode, false);
-            var resultDir = Path.Combine(_projectRoot, "Library", "DSHBridge", "test");
-            Directory.CreateDirectory(resultDir);
-            var resultPath = Path.Combine(resultDir, "result-" + GetString(job, "id") + ".txt");
+            // CreateJob 之前的失败不产生作业；之后的所有步骤都包 try/catch，避免异常后留下永久 pending（P2-10）。
+            var resultDir = Path.Combine(_rootDir, "test");
             try
             {
+                Directory.CreateDirectory(resultDir);
+                SweepStaleTestResults();
+            }
+            catch (Exception error)
+            {
+                throw new KnownError("test_start_failed", "创建测试结果目录失败: " + error.Message, error.GetType().Name);
+            }
+            var job = CreateJob("test-run", "TestRunner " + mode, true);
+            var jobRef = job;
+            try
+            {
+                var resultPath = Path.Combine(resultDir, "result-" + GetString(job, "id") + ".txt");
                 job["resultPath"] = resultPath;
+                job["mode"] = mode;
+                job["deadlineAt"] = DateTime.UtcNow.AddSeconds(TestJobTimeoutSeconds).ToString("o", CultureInfo.InvariantCulture);
+                PersistJob(job);
+                _activeTestJobs.Add(job);
                 var started = CompileAndStartTestBridge(testRunnerDll, resultPath, mode, names);
                 job["bridgeStart"] = started;
+                job["status"] = "running";
+                job["progress"] = 0.05d;
                 PersistJob(job);
                 PickTestResult(job, resultPath);
+                if (JobStatusIsTerminal(GetString(job, "status"))) RemoveActiveTestJob(job);
             }
             catch (KnownError known)
             {
                 // 保留内部诊断（例如桥接代码编译失败的逐条错误），不要用外层错误覆盖。
-                FailJob(job, known);
+                FailJob(jobRef, known);
+                RemoveActiveTestJob(jobRef);
                 throw;
             }
             catch (Exception error)
             {
-                FailJob(job, error);
+                FailJob(jobRef, error);
+                RemoveActiveTestJob(jobRef);
                 throw new KnownError("test_start_failed", "启动测试失败: " + error.Message, error.GetType().Name);
             }
             var d = new Dictionary<string, object>();
             d["jobId"] = job["id"];
             d["mode"] = mode;
             d["tests"] = (long)names.Count;
+            d["cancelable"] = true;
             d["testRunnerAssembly"] = "Library/ScriptAssemblies/UnityEditor.TestRunner.dll";
             return d;
         }
 
         // ---- 生产管线：构建 / 包管理 / 烘焙（能力补全第 3 项）----
+
+        /// <summary>构建产物探测：优先引擎回传的 outputPath（summary.outputPath，Unity 2022 可用），
+        /// 再依次尝试入参路径与各平台自动补的扩展名。</summary>
+        static string FindBuildArtifact(string outputPath, string reportedOutputPath)
+        {
+            var candidates = new List<string>();
+            if (!string.IsNullOrEmpty(reportedOutputPath)) candidates.Add(reportedOutputPath);
+            if (!string.IsNullOrEmpty(outputPath))
+            {
+                candidates.Add(outputPath);
+                candidates.Add(outputPath + ".app");
+                candidates.Add(outputPath + ".exe");
+                candidates.Add(outputPath + ".apk");
+                candidates.Add(outputPath + ".aab");
+            }
+            for (var i = 0; i < candidates.Count; i++)
+            {
+                var candidate = ResolveArtifactPath(candidates[i]);
+                if (string.IsNullOrEmpty(candidate)) continue;
+                try
+                {
+                    if (File.Exists(candidate) || Directory.Exists(candidate)) return candidate;
+                }
+                catch (Exception) { }
+            }
+            return ResolveArtifactPath(!string.IsNullOrEmpty(reportedOutputPath) ? reportedOutputPath : outputPath);
+        }
+
+        /// <summary>产物路径可能是引擎回传的相对路径：按 _projectRoot 解析，避免依赖进程 CWD。</summary>
+        static string ResolveArtifactPath(string candidate)
+        {
+            if (string.IsNullOrEmpty(candidate)) return candidate;
+            try
+            {
+                return Path.GetFullPath(Path.IsPathRooted(candidate) ? candidate : Path.Combine(_projectRoot, candidate));
+            }
+            catch (Exception) { return candidate; }
+        }
+
+        static long? ReadLongProperty(object target, string name)
+        {
+            var value = GetProperty(target, name);
+            if (value == null) return null;
+            try { return Convert.ToInt64(value, CultureInfo.InvariantCulture); }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>构建失败详情：totalErrors + 失败步骤/错误消息摘要（通过反射读 BuildReport.steps，避免 stub 依赖）。</summary>
+        static string DescribeBuildFailure(object report)
+        {
+            var parts = new List<string>();
+            try
+            {
+                var summary = GetProperty(report, "summary");
+                if (summary != null)
+                {
+                    var totalErrors = ReadLongProperty(summary, "totalErrors");
+                    if (totalErrors.HasValue) parts.Add("totalErrors=" + totalErrors.Value);
+                }
+                var steps = GetProperty(report, "steps") as IEnumerable;
+                if (steps != null)
+                {
+                    var scannedSteps = 0;
+                    foreach (var step in steps)
+                    {
+                        if (step == null || scannedSteps >= 20) break;
+                        scannedSteps += 1;
+                        var stepName = Convert.ToString(GetProperty(step, "name"), CultureInfo.InvariantCulture);
+                        var messages = GetProperty(step, "messages") as IEnumerable;
+                        if (messages == null) continue;
+                        foreach (var message in messages)
+                        {
+                            if (message == null) continue;
+                            var typeName = Convert.ToString(GetProperty(message, "type"), CultureInfo.InvariantCulture) ?? string.Empty;
+                            var isFailure = typeName.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0
+                                || typeName.IndexOf("Exception", StringComparison.OrdinalIgnoreCase) >= 0
+                                || typeName.IndexOf("Assert", StringComparison.OrdinalIgnoreCase) >= 0;
+                            if (!isFailure) continue;
+                            var content = Convert.ToString(GetProperty(message, "content"), CultureInfo.InvariantCulture) ?? string.Empty;
+                            content = content.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                            if (content.Length > 160) content = content.Substring(0, 160) + "…";
+                            parts.Add((string.IsNullOrEmpty(stepName) ? "step" : stepName) + ": " + content);
+                            if (parts.Count >= 6) break;
+                        }
+                        if (parts.Count >= 6) break;
+                    }
+                }
+            }
+            catch (Exception) { }
+            return TruncateText(string.Join("; ", parts.ToArray()), BuildFailureDetailLimit);
+        }
+
         static Dictionary<string, object> BuildStart(Dictionary<string, object> args)
         {
             var scenesArg = GetStringList(args, "scenes");
@@ -494,7 +1290,8 @@ public static class DshTestBridge
             var target = currentTarget;
             if (!string.IsNullOrEmpty(targetArg))
             {
-                target = (BuildTarget)Enum.Parse(typeof(BuildTarget), targetArg, true);
+                try { target = (BuildTarget)Enum.Parse(typeof(BuildTarget), targetArg, true); }
+                catch (Exception) { throw new KnownError("invalid_argument", "target 非法: " + targetArg); }
                 if (target != currentTarget)
                     throw new KnownError("build_target_mismatch", "当前活动构建目标为 " + currentTarget + "；本能力不自动切换平台（会触发全量重编译），请先在编辑器切换");
             }
@@ -517,48 +1314,94 @@ public static class DshTestBridge
                 var extension = target == BuildTarget.StandaloneWindows64 ? ".exe" : "";
                 outputPath = Path.Combine(_projectRoot, "Builds", Application.productName + "-" + target + extension);
             }
+            // P2：相对路径一律按工程根解析（不依赖编辑器进程 CWD），再比较是否落在 Library 内；
+            // 比较用 OrdinalIgnoreCase，避免 "library/" 之类的写法绕过。
+            var requestedOutputPath = outputPath;
+            string outputFull;
+            try
+            {
+                outputFull = Path.GetFullPath(Path.IsPathRooted(outputPath)
+                    ? outputPath
+                    : Path.Combine(_projectRoot, outputPath));
+            }
+            catch (Exception error)
+            {
+                throw new KnownError("invalid_output_path", "构建输出路径无法解析: " + error.Message);
+            }
+            if (!Path.IsPathRooted(requestedOutputPath)
+                && !IsSameOrInsideDirectory(outputFull, _projectRoot))
+            {
+                // 相对路径逃出工程根一律拒绝；显式绝对路径不在 Library 内时仍允许（历史用法）。
+                throw new KnownError("path_escape", "构建输出相对路径落在工程之外，已拒绝：" + requestedOutputPath);
+            }
             // Unity 禁止把构建产物写进 Library（引擎内部工作目录）：提前拒绝，避免引擎内部吞掉异常只返回 null。
-            var outputFull = Path.GetFullPath(outputPath);
             var libraryRoot = Path.Combine(_projectRoot, "Library");
-            if (outputFull == libraryRoot || outputFull.StartsWith(libraryRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            if (IsSameOrInsideDirectory(outputFull, libraryRoot))
                 throw new KnownError("invalid_output_path", "构建输出不能在 Library 目录内（Unity 内部工作目录），请换到工程内其他目录");
             var job = CreateJob("build", "BuildPlayer " + target, false);
             var jobRef = job;
             var sceneArray = sceneList.ToArray();
-            QueueJob(job, delegate
+            try
             {
-                var options = new BuildPlayerOptions();
-                options.scenes = sceneArray;
-                options.locationPathName = outputPath;
-                options.target = target;
-                options.options = BuildOptions.None;
-                var report = BuildPipeline.BuildPlayer(options);
-                // Unity 会把 BuildPlayer 内部异常写进 Editor.log 后返回 null；不能当成成功。
-                if (report == null) throw new Exception("BuildPlayer 返回 null：构建未成功（详情见编辑器日志）");
-                var result = new Dictionary<string, object>();
-                result["target"] = target.ToString();
-                result["outputPath"] = outputPath;
-                result["scenes"] = (long)sceneArray.Length;
-                result["result"] = report.summary.result.ToString();
-                result["totalSize"] = (long)report.summary.totalSize;
-                result["totalTimeMs"] = (long)report.summary.totalTime.TotalMilliseconds;
-                // macOS 的构建产物是 .app 目录（引擎自动补扩展名），Windows 是 .exe；
-                // 回传真实存在的产物路径，调用方不用自己猜扩展名。
-                var artifact = outputPath;
-                var candidates = new string[] { outputPath, outputPath + ".app", outputPath + ".exe" };
-                for (var i = 0; i < candidates.Length; i++)
+                QueueJob(job, delegate
                 {
-                    if (System.IO.File.Exists(candidates[i]) || System.IO.Directory.Exists(candidates[i])) { artifact = candidates[i]; break; }
-                }
-                result["artifact"] = artifact;
-                result["artifactExists"] = System.IO.File.Exists(artifact) || System.IO.Directory.Exists(artifact);
-                CompleteJob(jobRef, result);
-                return true;
-            });
+                    var options = new BuildPlayerOptions();
+                    options.scenes = sceneArray;
+                    options.locationPathName = outputFull;
+                    options.target = target;
+                    options.options = BuildOptions.None;
+                    var report = BuildPipeline.BuildPlayer(options);
+                    // Unity 会把 BuildPlayer 内部异常写进 Editor.log 后返回 null；不能当成成功。
+                    if (report == null) throw new Exception("BuildPlayer 返回 null：构建未成功（详情见编辑器日志）");
+                    var summary = report.summary;
+                    var buildResult = summary.result;
+                    var result = new Dictionary<string, object>();
+                    result["target"] = target.ToString();
+                    result["outputPath"] = outputFull;
+                    if (!string.Equals(requestedOutputPath, outputFull, StringComparison.Ordinal))
+                        result["requestedOutputPath"] = requestedOutputPath;
+                    result["scenes"] = (long)sceneArray.Length;
+                    result["result"] = buildResult.ToString();
+                    result["totalSize"] = (long)summary.totalSize;
+                    result["totalTimeMs"] = (long)summary.totalTime.TotalMilliseconds;
+                    // summary.outputPath 是引擎最终写产物的位置（可能被补扩展名/重写），优先用它定位产物。
+                    var reportedOutputPath = Convert.ToString(GetProperty(summary, "outputPath"), CultureInfo.InvariantCulture);
+                    if (!string.IsNullOrEmpty(reportedOutputPath)) result["reportedOutputPath"] = reportedOutputPath;
+                    var artifact = FindBuildArtifact(outputFull, reportedOutputPath);
+                    var artifactExists = !string.IsNullOrEmpty(artifact) && (File.Exists(artifact) || Directory.Exists(artifact));
+                    result["artifact"] = artifact;
+                    result["artifactExists"] = artifactExists;
+                    // P1-9：done 只表达成功。失败/取消必须分流成 failed/cancelled。
+                    if (buildResult == UnityEditor.Build.Reporting.BuildResult.Succeeded)
+                    {
+                        if (!artifactExists)
+                        {
+                            result["artifactDiagnostic"] = "构建报告为 Succeeded，但未能定位产物文件；请检查 outputPath 与构建日志，或使用 reportedOutputPath";
+                        }
+                        CompleteJob(jobRef, result);
+                        return true;
+                    }
+                    jobRef["result"] = result;
+                    if (buildResult == UnityEditor.Build.Reporting.BuildResult.Cancelled)
+                    {
+                        CancelJob(jobRef, "构建报告返回 Cancelled（构建被取消或中断）", null);
+                        return true;
+                    }
+                    var detail = DescribeBuildFailure(report);
+                    FailJob(jobRef, new KnownError("build_failed",
+                        "构建失败（" + buildResult + "）" + (string.IsNullOrEmpty(detail) ? "" : "：" + detail), detail));
+                    return true;
+                });
+            }
+            catch (Exception error)
+            {
+                FailJob(jobRef, error);
+                throw new KnownError("build_start_failed", "启动构建作业失败: " + error.Message, error.GetType().Name);
+            }
             var d = new Dictionary<string, object>();
             d["jobId"] = job["id"];
             d["target"] = target.ToString();
-            d["outputPath"] = outputPath;
+            d["outputPath"] = outputFull;
             d["scenes"] = (long)sceneArray.Length;
             return d;
         }
@@ -593,24 +1436,36 @@ public static class DshTestBridge
             if (string.IsNullOrEmpty(identifier)) throw new KnownError("invalid_argument", "缺少 name（包名或 identifier）");
             var job = CreateJob("package-add", "Add " + identifier, false);
             var jobRef = job;
-            var request = UnityEditor.PackageManager.Client.Add(identifier);
-            QueueJob(job, delegate
+            // P2：CreateJob 之后 Client.Add 可能抛异常（包名非法/包管理器忙）；必须 FailJob，不能留下永久 pending。
+            try
             {
-                if (!request.IsCompleted) return false;
-                if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                job["packageName"] = identifier;
+                PersistJob(job);
+                var request = UnityEditor.PackageManager.Client.Add(identifier);
+                QueueJob(job, delegate
                 {
-                    var result = new Dictionary<string, object>();
-                    result["name"] = request.Result != null ? request.Result.name : identifier;
-                    result["version"] = request.Result != null ? request.Result.version : null;
-                    result["displayName"] = request.Result != null ? request.Result.displayName : null;
-                    CompleteJob(jobRef, result);
-                }
-                else
-                {
-                    FailJob(jobRef, new Exception("包添加失败: " + (request.Error != null ? request.Error.message : "unknown")));
-                }
-                return true;
-            });
+                    if (!request.IsCompleted) return false;
+                    if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                    {
+                        var result = new Dictionary<string, object>();
+                        result["name"] = request.Result != null ? request.Result.name : identifier;
+                        result["version"] = request.Result != null ? request.Result.version : null;
+                        result["displayName"] = request.Result != null ? request.Result.displayName : null;
+                        CompleteJob(jobRef, result);
+                    }
+                    else
+                    {
+                        FailJob(jobRef, new KnownError("package_add_failed",
+                            "包添加失败: " + (request.Error != null ? request.Error.message : "unknown")));
+                    }
+                    return true;
+                });
+            }
+            catch (Exception error)
+            {
+                FailJob(jobRef, error);
+                throw new KnownError("package_add_failed", "启动包添加失败: " + error.Message, error.GetType().Name);
+            }
             var d = new Dictionary<string, object>();
             d["jobId"] = job["id"];
             d["name"] = identifier;
@@ -623,55 +1478,137 @@ public static class DshTestBridge
             if (string.IsNullOrEmpty(name)) throw new KnownError("invalid_argument", "缺少 name");
             var job = CreateJob("package-remove", "Remove " + name, false);
             var jobRef = job;
-            var request = UnityEditor.PackageManager.Client.Remove(name);
-            QueueJob(job, delegate
+            try
             {
-                if (!request.IsCompleted) return false;
-                if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                job["packageName"] = name;
+                PersistJob(job);
+                var request = UnityEditor.PackageManager.Client.Remove(name);
+                QueueJob(job, delegate
                 {
-                    var result = new Dictionary<string, object>();
-                    result["name"] = name;
-                    result["removed"] = true;
-                    CompleteJob(jobRef, result);
-                }
-                else
-                {
-                    FailJob(jobRef, new Exception("包移除失败: " + (request.Error != null ? request.Error.message : "unknown")));
-                }
-                return true;
-            });
+                    if (!request.IsCompleted) return false;
+                    if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                    {
+                        var result = new Dictionary<string, object>();
+                        result["name"] = name;
+                        result["removed"] = true;
+                        CompleteJob(jobRef, result);
+                    }
+                    else
+                    {
+                        FailJob(jobRef, new KnownError("package_remove_failed",
+                            "包移除失败: " + (request.Error != null ? request.Error.message : "unknown")));
+                    }
+                    return true;
+                });
+            }
+            catch (Exception error)
+            {
+                FailJob(jobRef, error);
+                throw new KnownError("package_remove_failed", "启动包移除失败: " + error.Message, error.GetType().Name);
+            }
             var d = new Dictionary<string, object>();
             d["jobId"] = job["id"];
             d["name"] = name;
             return d;
         }
 
+        /// <summary>
+        /// P2：NavMesh 烘焙作业化。NavMeshBuilder.BuildNavMesh() 是同步调用，
+        /// 放进 runner 的 advance 里一次性执行并 CompleteJob，避免阻塞请求处理路径太久；
+        /// 响应仍保留 kind/baked 字段结构，job.result 里的载荷与旧同步返回值一致。
+        /// </summary>
         static Dictionary<string, object> BakeNavmesh(Dictionary<string, object> args)
         {
-            UnityEditor.AI.NavMeshBuilder.BuildNavMesh();
+            var job = CreateJob("bake-navmesh", "NavMeshBuilder.BuildNavMesh", false);
+            var jobRef = job;
+            try
+            {
+                QueueJob(job, delegate
+                {
+                    UnityEditor.AI.NavMeshBuilder.BuildNavMesh();
+                    var result = new Dictionary<string, object>();
+                    result["baked"] = true;
+                    result["kind"] = "navmesh";
+                    CompleteJob(jobRef, result);
+                    return true;
+                });
+            }
+            catch (Exception error)
+            {
+                FailJob(jobRef, error);
+                throw new KnownError("navmesh_bake_failed", "启动 NavMesh 烘焙失败: " + error.Message, error.GetType().Name);
+            }
             var d = new Dictionary<string, object>();
-            d["baked"] = true;
+            d["jobId"] = job["id"];
             d["kind"] = "navmesh";
+            d["baked"] = false;
             return d;
         }
 
         static Dictionary<string, object> BakeLighting(Dictionary<string, object> args)
         {
-            var started = Lightmapping.BakeAsync();
-            var job = CreateJob("bake-lighting", "Lightmapping.BakeAsync", true);
-            var jobRef = job;
-            QueueJob(job, delegate
+            // P1-10：BakeAsync() 返回 false 表示已有烘焙在跑。此时绝不能建作业：
+            // 否则会把别人的烘焙记成本作业的结果，取消时还会误杀别人的烘焙。
+            bool started;
+            try { started = Lightmapping.BakeAsync(); }
+            catch (Exception error)
             {
-                if (Lightmapping.isRunning) return false;
-                var result = new Dictionary<string, object>();
-                result["baked"] = true;
-                result["kind"] = "lighting";
-                CompleteJob(jobRef, result);
-                return true;
-            });
+                throw new KnownError("lighting_start_failed", "启动光照烘焙失败: " + error.Message, error.GetType().Name);
+            }
+            if (!started)
+                throw new KnownError("lighting_already_running", "已有光照烘焙在运行；请等待其结束或在 Lighting 窗口取消后再试");
+            Dictionary<string, object> job;
+            try { job = CreateJob("bake-lighting", "Lightmapping.BakeAsync", true); }
+            catch (Exception error)
+            {
+                // 烘焙已经开始但作业没建起来：本函数是启动者，回收掉，避免留下无人管理的烘焙。
+                try { if (Lightmapping.isRunning) Lightmapping.Cancel(); } catch (Exception) { }
+                throw new KnownError("lighting_start_failed", "光照烘焙作业创建失败: " + error.Message, error.GetType().Name);
+            }
+            var jobRef = job;
+            try
+            {
+                // 记录启动归属：只有 startedByJob=true 的作业在取消时才允许调用 Lightmapping.Cancel()。
+                job["started"] = true;
+                job["startedByJob"] = true;
+                job["bakeStartedAt"] = GetString(job, "startedAt");
+                job["bakeWaitUntil"] = DateTime.UtcNow.AddSeconds(BakeRunningGraceSeconds).ToString("o", CultureInfo.InvariantCulture);
+                PersistJob(job);
+                QueueJob(job, delegate
+                {
+                    var observedRunning = ToBoolValue(jobRef.ContainsKey("bakeObservedRunning") ? jobRef["bakeObservedRunning"] : null);
+                    if (Lightmapping.isRunning)
+                    {
+                        jobRef["bakeObservedRunning"] = true;
+                        return false;
+                    }
+                    if (!observedRunning)
+                    {
+                        // BakeAsync 返回 true 后 isRunning 可能要下一帧才置位：给一个很短的观察窗口。
+                        var waitUntil = ParseUtcTime(GetString(jobRef, "bakeWaitUntil"), DateTime.UtcNow);
+                        if (DateTime.UtcNow < waitUntil) return false;
+                    }
+                    var result = new Dictionary<string, object>();
+                    result["baked"] = true;
+                    result["kind"] = "lighting";
+                    result["observedRunning"] = observedRunning;
+                    if (!observedRunning)
+                        result["warning"] = "未观测到 Lightmapping.isRunning=true（可能场景极小已完成，或引擎报告失败；详情见编辑器日志）";
+                    CompleteJob(jobRef, result);
+                    return true;
+                });
+            }
+            catch (Exception error)
+            {
+                // 作业登记/入队失败但烘焙已经启动：本作业是启动者，回收掉，避免留下无人管理的烘焙。
+                try { if (Lightmapping.isRunning) Lightmapping.Cancel(); } catch (Exception) { }
+                FailJob(jobRef, error);
+                throw new KnownError("lighting_start_failed", "光照烘焙作业启动失败: " + error.Message, error.GetType().Name);
+            }
             var d = new Dictionary<string, object>();
             d["jobId"] = job["id"];
-            d["started"] = started;
+            d["started"] = true;
+            d["kind"] = "lighting";
             return d;
         }
     }

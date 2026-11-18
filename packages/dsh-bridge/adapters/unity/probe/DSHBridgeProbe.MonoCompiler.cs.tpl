@@ -54,6 +54,40 @@ namespace DSHBridge
             _scriptingDiagnostics.Add(text);
         }
 
+        // 通道维护类诊断（心跳/原子写/事件推送/权限修正）单独一个环形队列。
+        //
+        // 不能复用 _scriptingDiagnostics：那是 code.execute 编译/执行失败的 detail 来源，
+        // 每次调用开头会清空；心跳这类每 2 秒触发的维护日志混进去，会把「本次真正的
+        // 编译/执行失败原因」挤出截断窗口。通道诊断面向排障，不参与响应 detail 组装。
+        // 有界 + 加锁：日志回调来自任意线程，通道故障（磁盘满/权限）可能连续发生。
+        const int MaxChannelDiagnostics = 64;
+        static readonly object _channelDiagnosticsLock = new object();
+        static readonly List<string> _channelDiagnostics = new List<string>();
+
+        /// <summary>记录一条通道/协议维护类诊断（主文件在安全边界/协议异常处调用）。</summary>
+        static void AddChannelDiagnostic(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return;
+            try
+            {
+                lock (_channelDiagnosticsLock)
+                {
+                    if (_channelDiagnostics.Count >= MaxChannelDiagnostics) _channelDiagnostics.RemoveAt(0);
+                    _channelDiagnostics.Add(message);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>通道诊断快照（心跳/排障输出用；不进入 code.execute 的错误 detail）。</summary>
+        static string ChannelDiagnosticsText()
+        {
+            lock (_channelDiagnosticsLock)
+            {
+                return string.Join(" ;; ", _channelDiagnostics.ToArray());
+            }
+        }
+
         static void EnsureScripting()
         {
             lock (_scriptingLock)
@@ -171,11 +205,18 @@ namespace DSHBridge
 
             if (explicitReferences != null)
             {
+                var missing = new List<string>();
                 foreach (var item in explicitReferences)
                 {
                     var trimmed = (item ?? string.Empty).Trim();
                     if (trimmed.Length == 0) continue;
-                    if (!File.Exists(trimmed)) continue;
+                    // 显式引用不存在时不能静默跳过：调用方以为「按我给的引用集编译」，
+                    // 实际少了一部分引用，排障结论会被带偏（常见于路径拼错/程序集未构建）。
+                    if (!File.Exists(trimmed))
+                    {
+                        missing.Add(trimmed);
+                        continue;
+                    }
                     // 与 asset.read/create 的策略保持一致：只接受「工程内」或「引擎安装目录」的引用，
                     // 否则等于开放任意本地文件的读取/元数据解析通道（实测过 /etc/hosts 被接受）。
                     var full = Path.GetFullPath(trimmed);
@@ -184,6 +225,16 @@ namespace DSHBridge
                             "path_escape",
                             "references 只允许工程内或引擎安装目录下的程序集，已拒绝：" + trimmed);
                     if (seenPaths.Add(full)) paths.Add(full);
+                }
+                if (missing.Count > 0)
+                {
+                    var preview = missing.Count <= 10
+                        ? string.Join(", ", missing.ToArray())
+                        : string.Join(", ", missing.GetRange(0, 10).ToArray()) + " ...";
+                    throw new KnownError(
+                        "reference_not_found",
+                        "references 中有 " + missing.Count + " 个路径不存在：" + preview,
+                        Trim(string.Join("\n", missing.ToArray()), 4000));
                 }
                 return paths;
             }
@@ -695,11 +746,9 @@ namespace DSHBridge
 
             var assembly = GetProperty(results, "CompiledAssembly");
             if (assembly == null) throw new KnownError("compile_error", "编译没有产出程序集", MiniJson.Serialize(diagnostics));
-            var scriptType = ((Type)null);
             var compiledType = (assembly as System.Reflection.Assembly).GetType("__DshScript", false);
             if (compiledType == null) throw new KnownError("compile_error", "编译产物中找不到 __DshScript");
-            scriptType = compiledType;
-            var execute = scriptType.GetMethod("Execute", BindingFlags.Public | BindingFlags.Static);
+            var execute = compiledType.GetMethod("Execute", BindingFlags.Public | BindingFlags.Static);
             object value;
             try
             {
@@ -757,13 +806,16 @@ namespace DSHBridge
             // references 显式覆盖默认引用集：排障用（二分定位是哪个程序集让编译器走不通）。
             var explicitReferences = GetStringList(args, "references");
             var backend = GetString(args, "backend") ?? "auto";
-            var referencePaths = CollectReferencePaths(args.ContainsKey("references") ? explicitReferences : null);
+            // 只有显式给了 references 才收集/校验：CollectReferencePaths(null) 会枚举整套
+            // Unity 编译管线引用集，给每次 code.execute 增加无谓的主线程开销。
+            var hasExplicitReferences = args.ContainsKey("references");
+            var referencePaths = hasExplicitReferences ? CollectReferencePaths(explicitReferences) : null;
 
             if (backend == "auto" || backend == "mono-mcs" || backend == "mcs")
             {
                 try
                 {
-                    return CodeExecuteViaMonoCompiler(code, args, args.ContainsKey("references") ? referencePaths : null);
+                    return CodeExecuteViaMonoCompiler(code, args, hasExplicitReferences ? referencePaths : null);
                 }
                 catch (KnownError monoError)
                 {
@@ -839,7 +891,11 @@ namespace DSHBridge
                     if (item == null) continue;
                     var row = DescribeDiagnostic(item);
                     diagnostics.Add(row);
-                    if (GetString(row, "severity") == "error") hasErrors = true;
+                    var severity = GetString(row, "severity");
+                    if (severity == "error") hasErrors = true;
+                    // Roslyn 分支此前没有 warningCount：与 mono-mcs 分支的响应字段不一致，
+                    // 调用方无法统一判断「编译有警告」。警告也计入 diagnostics，只是不阻断执行。
+                    else if (severity == "warning") warningCount += 1;
                     if (diagnostics.Count >= 200) break;
                 }
             }
@@ -891,6 +947,9 @@ namespace DSHBridge
             ReportSlowCodeExecute(code, clock.ElapsedMilliseconds, "roslyn");
             response["roslynDirectory"] = _scriptingDirectory;
             response["explicitReferences"] = explicitReferences.Count;
+            // 与 mono-mcs 分支保持输出一致：调用方可以统一读 backend / warningCount。
+            response["backend"] = "roslyn";
+            response["warningCount"] = (long)warningCount;
             return response;
         }
 
@@ -925,6 +984,31 @@ namespace DSHBridge
         {
             if (string.IsNullOrEmpty(value)) return string.Empty;
             return value.Length <= max ? value : value.Substring(0, max);
+        }
+
+        /// <summary>
+        /// 错误码扩展映射（P2：异常→错误码过窄，IO/Format/InvalidCast 都落成 probe_error）。
+        ///
+        /// 返回 null 表示「本表不认识」，由主文件 CodeOf 继续走既有逻辑并回退 probe_error；
+        /// 主文件 CodeOf 的集成点在 KnownError / TargetInvocationException 解包之后：
+        ///   var extended = CodeOfExtended(e);
+        ///   if (extended != null) return extended;
+        /// 这里自行解包 TargetInvocationException，保证反射调用里的真实异常也能映射正确。
+        /// </summary>
+        static string CodeOfExtended(Exception e)
+        {
+            if (e == null) return null;
+            var known = e as KnownError;
+            if (known != null) return known.Code;
+            if (e is TargetInvocationException && e.InnerException != null) return CodeOfExtended(e.InnerException);
+            // FileNotFound 派生自 IOException，DirectoryNotFound 同理：先判具体类型再判 IO。
+            if (e is FileNotFoundException || e is DirectoryNotFoundException) return "not_found";
+            if (e is UnityException) return "unity_error";
+            if (e is IOException || e is UnauthorizedAccessException) return "io_error";
+            if (e is FormatException || e is InvalidCastException || e is OverflowException
+                || e is ArgumentException)
+                return "invalid_argument";
+            return null;
         }
 
         static Dictionary<string, object> DescribeDiagnostic(object diagnostic)
@@ -1156,22 +1240,63 @@ namespace DSHBridge
                 new Dictionary<string, object> { { "change", change.ToString() }, { "isPlaying", EditorApplication.isPlaying } });
         }
 
+        // 事件序号自增与事件文件写入必须在同一把锁内：日志回调来自任意线程
+        // （Application.logMessageReceivedThreaded），旧实现 `_eventSeq += 1` 非原子，
+        // 两个线程可能拿到同一个序号并互相覆盖事件文件（P1-7）。
+        static readonly object _eventLock = new object();
+
         static void PushEvent(string kind, Dictionary<string, object> data)
         {
             try
             {
                 if (_eventsDir == null) return;
-                _eventSeq += 1;
-                var evt = new Dictionary<string, object>();
-                evt["seq"] = _eventSeq;
-                evt["kind"] = kind;
-                evt["at"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
-                evt["data"] = data ?? new Dictionary<string, object>();
-                evt["probeVersion"] = ProbeVersion;
-                var file = Path.Combine(_eventsDir, "evt_" + _eventSeq.ToString("D10") + ".json");
-                WriteAtomic(file, MiniJson.Serialize(evt));
+                lock (_eventLock)
+                {
+                    var file = NextEventFile();
+                    var evt = new Dictionary<string, object>();
+                    evt["seq"] = _eventSeq;
+                    evt["kind"] = kind;
+                    evt["at"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                    evt["data"] = data ?? new Dictionary<string, object>();
+                    evt["probeVersion"] = ProbeVersion;
+                    WriteAtomic(file, MiniJson.Serialize(evt));
+                }
             }
-            catch { }
+            catch (Exception e)
+            {
+                // 事件推送失败属于通道维护问题，进通道诊断队列，不污染 code.execute 的 detail。
+                AddChannelDiagnostic("push-event-failed:" + (kind ?? "?") + ":" + e.GetType().Name);
+            }
+        }
+
+        /// <summary>
+        /// 事件文件名：`evt_&lt;10 位纯数字 seq&gt;.json` 是对 DSH 侧的**文件名契约**
+        /// （transport/mailbox.mjs 用 `Number(name.replace(/^evt_/,'')...)` 解析 seq，
+        /// 非纯数字名会被静默跳过）。所以序号冲突时只能顺延序号，不能加文件名后缀。
+        /// 调用方必须持有 _eventLock。
+        /// </summary>
+        static string NextEventFile()
+        {
+            for (var attempt = 0; attempt < 4096; attempt++)
+            {
+                _eventSeq += 1;
+                var file = EventFilePath(_eventSeq);
+                // 域重载后 _eventSeq 可能落后于 events/ 里已有序号（instance.json 由心跳落盘，
+                // 有 0~2s 延迟）：顺延到空序号而不是覆盖。事件是审计痕迹，覆盖会静默丢历史。
+                if (!File.Exists(file)) return file;
+            }
+            // 连续 4096 个序号都被占用（异常场景）：仍保证不覆盖已有事件。该文件名含后缀，
+            // 不会被 DSH 当成事件消费，但至少不破坏历史；正常路径不会走到这里。
+            AddChannelDiagnostic("event-seq-gap:" + _eventSeq);
+            return Path.Combine(
+                _eventsDir,
+                "evt_" + _eventSeq.ToString("D10", CultureInfo.InvariantCulture)
+                + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".json");
+        }
+
+        static string EventFilePath(long seq)
+        {
+            return Path.Combine(_eventsDir, "evt_" + seq.ToString("D10", CultureInfo.InvariantCulture) + ".json");
         }
 
         /// <summary>
@@ -1184,7 +1309,13 @@ namespace DSHBridge
             {
                 // 心跳是对外宣布「我的通道在 <bootId>/ 下」的唯一途径，因此发布之前
                 // 先保证该目录真的存在，避免把一份指向空目录的 instance.json 写出去。
-                EnsureBootDirs();
+                // 创建失败时必须**停止写心跳**（与 Init 的行为一致）：继续写只会让调用方
+                // 持续命中一个空通道，把「通道坏了」伪装成「实例在线」。
+                if (!EnsureBootDirs())
+                {
+                    AddChannelDiagnostic("heartbeat-skip:boot-dirs-unavailable");
+                    return;
+                }
                 var info = new Dictionary<string, object>();
                 // 通道信封版本（请求/响应四元组配对用）。
                 info["v"] = 1L;
@@ -1224,20 +1355,94 @@ namespace DSHBridge
                     "outboxSweep",
                 };
                 info["deniedCapabilities"] = _deniedCapabilities.Cast<object>().ToList();
-                Directory.CreateDirectory(_rootDir);
+                // 目录已由上面的 EnsureBootDirs() 保证存在（含 _rootDir），不再重复创建。
                 WriteAtomic(Path.Combine(_rootDir, "instance.json"), MiniJson.Serialize(info));
             }
             catch (Exception e) { UnityEngine.Debug.LogWarning("[DSHBridge] heartbeat: " + e.Message); }
         }
 
+        // 残留临时文件清理的节流状态：写入路径上不做全目录扫描（events/ 可达数千文件），
+        // 每个目录每分钟最多扫一次，且只删「10 分钟前」的 *.tmp（正在写的临时文件是刚创建的）。
+        static readonly object _tmpSweepLock = new object();
+        static readonly Dictionary<string, long> _nextTmpSweepTicks = new Dictionary<string, long>(StringComparer.Ordinal);
+        const long TmpSweepIntervalTicks = 60L * 1000L * 10000L;
+        const long TmpResidualAgeTicks = 10L * 60L * 1000L * 10000L;
+
+        /// <summary>
+        /// 原子写：先写同目录临时文件，再替换目标；目标要么是旧内容要么是新内容，
+        /// 不会出现被并发读者读到半份文件的窗口（P2：旧实现先 Delete 再 Move，有空窗）。
+        /// 写后把权限收紧到 0600（TryFixPermissions 由主文件提供；失败降级，不影响写入结果）。
+        /// </summary>
         static void WriteAtomic(string path, string content)
         {
             var dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            SweepResidualTemps(dir);
+
             var tmp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
-            File.WriteAllText(tmp, content, new UTF8Encoding(false));
-            if (File.Exists(path)) File.Delete(path);
-            File.Move(tmp, path);
+            try
+            {
+                File.WriteAllText(tmp, content, new UTF8Encoding(false));
+                if (File.Exists(path))
+                {
+                    try
+                    {
+                        // 同卷替换：尽量保留目标的权限/ACL，且不存在「目标短暂不存在」的窗口。
+                        File.Replace(tmp, path, null);
+                    }
+                    catch (Exception)
+                    {
+                        // 部分文件系统 / Mono 实现不支持 Replace 语义：退回「先删后移」，
+                        // 仍有最终一致性（单写者假设下可接受）。
+                        File.Delete(path);
+                        File.Move(tmp, path);
+                    }
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
+            }
+            finally
+            {
+                // 成功时 tmp 已被移走；失败时删掉自己的临时文件，避免残留。
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+            try { TryFixPermissions(path, false); }
+            catch (Exception e) { AddChannelDiagnostic("chmod-failed:" + Path.GetFileName(path) + ":" + e.GetType().Name); }
+        }
+
+        /// <summary>
+        /// 清理目录里因进程在「写临时文件」与「替换」之间被杀而残留的 *.tmp。
+        /// 只处理明显过时的文件，并按目录节流，避免给高频写入路径增加目录枚举开销。
+        /// </summary>
+        static void SweepResidualTemps(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return;
+            try
+            {
+                var now = DateTime.UtcNow.Ticks;
+                lock (_tmpSweepLock)
+                {
+                    long next;
+                    if (_nextTmpSweepTicks.TryGetValue(dir, out next) && now < next) return;
+                    _nextTmpSweepTicks[dir] = now + TmpSweepIntervalTicks;
+                }
+                var removed = 0;
+                foreach (var candidate in Directory.GetFiles(dir, "*.tmp"))
+                {
+                    try
+                    {
+                        var info = new FileInfo(candidate);
+                        if (now - info.LastWriteTimeUtc.Ticks < TmpResidualAgeTicks) continue;
+                        info.Delete();
+                        removed += 1;
+                    }
+                    catch (Exception) { }
+                }
+                if (removed > 0) AddChannelDiagnostic("tmp-swept:" + removed);
+            }
+            catch (Exception) { }
         }
 
         static string Sha1Short(string value)
@@ -1314,13 +1519,39 @@ namespace DSHBridge
     }
 
     // 极简 JSON：只覆盖本探针需要的对象/数组/标量，避免任何外部依赖。
+    //
+    // 解析器接的输入既有调用方写入的请求，也有**磁盘上任意进程可改写**的文件
+    // （instance.json / inbox / 作业文件）。因此必须把恶意/损坏输入变成可捕获的
+    // FormatException：递归深度无上限时，深嵌套 JSON 会触发 StackOverflowException，
+    // 而它在 .NET 里无法 catch，编辑器进程直接退出（P0-1）。
     public static class MiniJson
     {
+        /// <summary>嵌套深度上限（深度值，根值为 0）。正常协议报文远低于此值。</summary>
+        public const int MaxDepth = 64;
+        /// <summary>单次解析的节点预算：防止「扁平但海量」的数组/对象长时间占用主线程。</summary>
+        public const int MaxNodes = 200000;
+        /// <summary>单次解析的输入上限（UTF-8 字节）。调用方另有文件长度检查，这里是双保险。</summary>
+        public const int MaxInputBytes = 1024 * 1024;
+
+        /// <summary>解析状态：节点计数在整棵树范围内共享（引用传入，避免逐层复制）。</summary>
+        sealed class ParseState
+        {
+            public int Nodes;
+        }
+
         public static object Parse(string json)
         {
+            if (json == null) throw new FormatException("json is null");
+            // 先按字符数挡一次（字符数超限必然字节数超限），再按真实 UTF-8 字节数判定：
+            // 1M 个多字节字符的字符串字节数可能是上限的数倍。
+            if (json.Length > MaxInputBytes)
+                throw new FormatException("json input too large: " + json.Length + " chars (max " + MaxInputBytes + ")");
+            if (Encoding.UTF8.GetByteCount(json) > MaxInputBytes)
+                throw new FormatException("json input too large: > " + MaxInputBytes + " bytes");
             var index = 0;
-            var value = ParseValue(json, ref index);
+            var value = ParseValue(json, ref index, 0, new ParseState());
             SkipWhitespace(json, ref index);
+            if (index < json.Length) throw new FormatException("unexpected trailing content at " + index);
             return value;
         }
 
@@ -1329,13 +1560,17 @@ namespace DSHBridge
             while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
         }
 
-        static object ParseValue(string s, ref int i)
+        static object ParseValue(string s, ref int i, int depth, ParseState state)
         {
+            if (depth > MaxDepth) throw new FormatException("max depth " + MaxDepth + " exceeded at " + i);
+            state.Nodes += 1;
+            if (state.Nodes > MaxNodes) throw new FormatException("node budget " + MaxNodes + " exceeded at " + i);
             SkipWhitespace(s, ref i);
-            if (i >= s.Length) return null;
+            // 截断输入（"{"、"["、"{\"a\":" 等）必须抛 FormatException，而不是返回半截数据。
+            if (i >= s.Length) throw new FormatException("unexpected end of json at " + i);
             var c = s[i];
-            if (c == '{') return ParseObject(s, ref i);
-            if (c == '[') return ParseArray(s, ref i);
+            if (c == '{') return ParseObject(s, ref i, depth, state);
+            if (c == '[') return ParseArray(s, ref i, depth, state);
             if (c == '"') return ParseString(s, ref i);
             if (c == 't') { Expect(s, ref i, "true"); return true; }
             if (c == 'f') { Expect(s, ref i, "false"); return false; }
@@ -1345,52 +1580,74 @@ namespace DSHBridge
 
         static void Expect(string s, ref int i, string token)
         {
+            if (i + token.Length > s.Length) throw new FormatException("truncated token at " + i);
             if (string.CompareOrdinal(s, i, token, 0, token.Length) != 0) throw new FormatException("bad token at " + i);
             i += token.Length;
         }
 
-        static Dictionary<string, object> ParseObject(string s, ref int i)
+        static Dictionary<string, object> ParseObject(string s, ref int i, int depth, ParseState state)
         {
             var d = new Dictionary<string, object>();
             i++;
             SkipWhitespace(s, ref i);
             if (i < s.Length && s[i] == '}') { i++; return d; }
-            while (i < s.Length)
+            while (true)
             {
-                SkipWhitespace(s, ref i);
-                if (s[i] != '"') throw new FormatException("expected key at " + i);
+                // 键/冒号/值各处的越界检查都是必需的：旧实现直接 s[i]，
+                // 截断输入会抛 IndexOutOfRange 而不是可识别的 FormatException。
+                if (i >= s.Length) throw new FormatException("unterminated object at " + i);
+                if (s[i] != '"') throw new FormatException("expected object key at " + i);
                 var key = ParseString(s, ref i);
                 SkipWhitespace(s, ref i);
+                if (i >= s.Length) throw new FormatException("unexpected end of json at " + i);
                 if (s[i] != ':') throw new FormatException("expected ':' at " + i);
                 i++;
-                d[key] = ParseValue(s, ref i);
+                d[key] = ParseValue(s, ref i, depth + 1, state);
                 SkipWhitespace(s, ref i);
-                if (i < s.Length && s[i] == ',') { i++; continue; }
-                if (i < s.Length && s[i] == '}') { i++; return d; }
+                if (i >= s.Length) throw new FormatException("unterminated object at " + i);
+                if (s[i] == ',')
+                {
+                    i++;
+                    SkipWhitespace(s, ref i);
+                    // 尾逗号：`{"a":1,}` 必须报错，不能把后面的 '}' 当键继续解析。
+                    if (i < s.Length && s[i] == '}') throw new FormatException("trailing comma at " + i);
+                    continue;
+                }
+                if (s[i] == '}') { i++; return d; }
                 throw new FormatException("expected ',' or '}' at " + i);
             }
-            return d;
         }
 
-        static List<object> ParseArray(string s, ref int i)
+        static List<object> ParseArray(string s, ref int i, int depth, ParseState state)
         {
             var list = new List<object>();
             i++;
             SkipWhitespace(s, ref i);
             if (i < s.Length && s[i] == ']') { i++; return list; }
-            while (i < s.Length)
+            while (true)
             {
-                list.Add(ParseValue(s, ref i));
+                if (i >= s.Length) throw new FormatException("unterminated array at " + i);
+                // 旧实现会把 `[,1]` 解析成 [null,1]、`[1,]` 解析成 [1,null]；
+                // 归纳不出值的逗号一律视为格式错误。
+                if (s[i] == ',') throw new FormatException("unexpected ',' at " + i);
+                list.Add(ParseValue(s, ref i, depth + 1, state));
                 SkipWhitespace(s, ref i);
-                if (i < s.Length && s[i] == ',') { i++; continue; }
-                if (i < s.Length && s[i] == ']') { i++; return list; }
+                if (i >= s.Length) throw new FormatException("unterminated array at " + i);
+                if (s[i] == ',')
+                {
+                    i++;
+                    SkipWhitespace(s, ref i);
+                    if (i < s.Length && s[i] == ']') throw new FormatException("trailing comma at " + i);
+                    continue;
+                }
+                if (s[i] == ']') { i++; return list; }
                 throw new FormatException("expected ',' or ']' at " + i);
             }
-            return list;
         }
 
         static string ParseString(string s, ref int i)
         {
+            if (i >= s.Length || s[i] != '"') throw new FormatException("expected string at " + i);
             i++;
             var sb = new StringBuilder();
             while (i < s.Length)
@@ -1398,7 +1655,7 @@ namespace DSHBridge
                 var c = s[i++];
                 if (c == '"') return sb.ToString();
                 if (c != '\\') { sb.Append(c); continue; }
-                if (i >= s.Length) break;
+                if (i >= s.Length) throw new FormatException("truncated escape at " + i);
                 var e = s[i++];
                 if (e == 'n') sb.Append('\n');
                 else if (e == 'r') sb.Append('\r');
@@ -1407,27 +1664,31 @@ namespace DSHBridge
                 else if (e == 'f') sb.Append('\f');
                 else if (e == 'u')
                 {
-                    if (i + 4 <= s.Length)
-                    {
-                        sb.Append((char)System.Convert.ToInt32(s.Substring(i, 4), 16));
-                        i += 4;
-                    }
+                    if (i + 4 > s.Length) throw new FormatException("truncated \\u escape at " + i);
+                    int code;
+                    if (!int.TryParse(s.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out code))
+                        throw new FormatException("bad \\u escape at " + i);
+                    sb.Append((char)code);
+                    i += 4;
                 }
                 else sb.Append(e);
             }
-            return sb.ToString();
+            throw new FormatException("unterminated string");
         }
 
         static object ParseNumber(string s, ref int i)
         {
             var start = i;
             while (i < s.Length && (char.IsDigit(s[i]) || s[i] == '-' || s[i] == '+' || s[i] == '.' || s[i] == 'e' || s[i] == 'E')) i++;
+            // 归纳不出任何数字字符：输入位置上是非法字符，抛 FormatException（旧实现返回 null，
+            // 让调用方把「格式错误」误当成合法的 null 值）。
+            if (i == start) throw new FormatException("unexpected character at " + start);
             var text = s.Substring(start, i - start);
             long l;
             if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out l)) return l;
             double dbl;
             if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out dbl)) return dbl;
-            return null;
+            throw new FormatException("invalid number at " + start);
         }
 
         public static string Serialize(object value)
@@ -1443,9 +1704,23 @@ namespace DSHBridge
             var s = value as string;
             if (s != null) { WriteString(sb, s); return; }
             if (value is bool) { sb.Append((bool)value ? "true" : "false"); return; }
-            if (value is float) { sb.Append(((float)value).ToString("R", CultureInfo.InvariantCulture)); return; }
-            if (value is double) { sb.Append(((double)value).ToString("R", CultureInfo.InvariantCulture)); return; }
-            if (value is int || value is long || value is short || value is byte) { sb.Append(System.Convert.ToString(value, CultureInfo.InvariantCulture)); return; }
+            if (value is float)
+            {
+                // NaN/±Infinity 不是合法 JSON 字面量：直接输出会让整条响应被判 malformed。
+                // 按 JSON 惯例降级为 null（P2），比丢掉整条响应安全。
+                var f = (float)value;
+                sb.Append(float.IsNaN(f) || float.IsInfinity(f) ? "null" : f.ToString("R", CultureInfo.InvariantCulture));
+                return;
+            }
+            if (value is double)
+            {
+                var dbl = (double)value;
+                sb.Append(double.IsNaN(dbl) || double.IsInfinity(dbl) ? "null" : dbl.ToString("R", CultureInfo.InvariantCulture));
+                return;
+            }
+            if (value is int || value is long || value is short || value is byte
+                || value is sbyte || value is ushort || value is uint || value is ulong || value is decimal)
+            { sb.Append(System.Convert.ToString(value, CultureInfo.InvariantCulture)); return; }
             var d = value as Dictionary<string, object>;
             if (d != null)
             {

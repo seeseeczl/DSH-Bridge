@@ -36,13 +36,31 @@ namespace DSHBridge
             throw new KnownError("path_escape", what + " 落在工程之外，已拒绝：" + raw);
         }
 
+        /// <summary>
+        /// 路径前缀比较规则（P2）：Windows/macOS 的文件系统默认大小写不敏感，
+        /// 用 Ordinal 比较会把大小写不同的真实工程内路径误判成越界并拒绝；Linux 保持大小写敏感。
+        /// 优先用编译宏判定；离线编译检查/语义测试只定义 UNITY_EDITOR 时退回运行时平台判定。
+        /// </summary>
+        static readonly StringComparison PathComparison = DetectPathComparison();
+
+        static StringComparison DetectPathComparison()
+        {
+#if UNITY_EDITOR_WIN || UNITY_EDITOR_OSX
+            return StringComparison.OrdinalIgnoreCase;
+#else
+            return (Application.platform == RuntimePlatform.OSXEditor || Application.platform == RuntimePlatform.WindowsEditor)
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+#endif
+        }
+
         static bool IsInsideProject(string full)
         {
             var root = _projectRoot;
-            if (string.IsNullOrEmpty(root)) return false;
+            if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(full)) return false;
             if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
                 root = root + Path.DirectorySeparatorChar;
-            return full.StartsWith(root, StringComparison.Ordinal);
+            return full.StartsWith(root, PathComparison);
         }
 
         /// <summary>路径是否落在引擎安装目录（Contents）内：显式引用允许引用引擎自带的程序集。</summary>
@@ -55,16 +73,24 @@ namespace DSHBridge
             var root = contents;
             if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
                 root = root + Path.DirectorySeparatorChar;
-            return full.StartsWith(root, StringComparison.Ordinal);
+            return full.StartsWith(root, PathComparison);
         }
 
-        /// <summary>把工程内绝对路径还原成 Unity 用的相对路径（正斜杠）。</summary>
+        /// <summary>
+        /// 把工程内绝对路径还原成 Unity 用的相对路径（正斜杠）。
+        /// P2：越界必须是错误，不能兜底返回原绝对路径——Assets.cs.tpl 曾用 `ToProjectRelative` 的反向结果
+        /// 做展示/比较，绝对路径一旦流出就会被当作「工程内相对路径」传给 AssetDatabase。
+        /// </summary>
         static string ToProjectRelative(string full)
         {
             var root = _projectRoot;
+            if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(full))
+                throw new KnownError("path_escape", "路径为空或工程根未知，已拒绝：" + (full ?? ""));
             if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
                 root = root + Path.DirectorySeparatorChar;
-            var rel = full.StartsWith(root, StringComparison.Ordinal) ? full.Substring(root.Length) : full;
+            if (!full.StartsWith(root, PathComparison))
+                throw new KnownError("path_escape", "路径落在工程之外，已拒绝：" + full);
+            var rel = full.Substring(root.Length);
             return rel.Replace('\\', '/');
         }
 
@@ -80,6 +106,59 @@ namespace DSHBridge
             var ext = Path.GetExtension(full) ?? string.Empty;
             if (!_textableExtensions.Contains(ext))
                 throw new KnownError("invalid_argument", what + " 只允许文本类资产扩展名（" + ext + " 不受理）");
+        }
+
+        // ===== 授权闸门（AA-OPT-001 / AUD-CODE-001 P1-5）=====
+        // 与 DSH 侧 DEFAULT_DANGEROUS 完全一致的 13 项危险能力，在探针侧同样默认关闭：
+        // 只有「安装时注入的源码快照」或 argv 整机旁路能放行，绕过 DSH 直接写 inbox 也一样会被拒绝。
+        // 闸门必须发生在 Execute 之前：被拒绝的请求 executionState=not-started，调用方可安全重试。
+        //
+        // 顺序语义：bridge.denied（任何授权都无法开启）> 探针永久封禁（当前为空）> 危险能力授权快照。
+
+        /// <summary>危险能力在探针侧默认关闭；只有授权快照或 argv 授权出现时才放行。</summary>
+        static void EnsureCapabilityAllowed(string cap)
+        {
+            if (string.IsNullOrEmpty(cap)) throw new KnownError("invalid_argument", "缺少 cap");
+            for (var i = 0; i < _deniedCapabilities.Length; i++)
+            {
+                if (_deniedCapabilities[i] != cap) continue;
+                throw new KnownError("capability_denied", "能力 " + cap + " 被插件配置显式禁止（bridge.denied），任何授权都无法开启");
+            }
+            for (var i = 0; i < _blockedCapabilities.Length; i++)
+            {
+                if (_blockedCapabilities[i] != cap) continue;
+                throw new KnownError("capability_denied", "能力 " + cap + " 在探针侧永久关闭（该能力被永久封禁，任何配置都无法开启）");
+            }
+            for (var i = 0; i < _reflectCapabilities.Length; i++)
+            {
+                if (_reflectCapabilities[i] != cap) continue;
+                if (Granted(cap)) return;
+                throw new KnownError(
+                    "capability_denied",
+                    "能力 " + cap + " 未授权；请在插件配置 bridge.allowDangerous 中加入该能力并重装探针（源码快照随之更新）");
+            }
+        }
+
+        /// <summary>按能力判定授权：argv 整机旁路，或安装时注入的源码快照。</summary>
+        static bool Granted(string cap)
+        {
+            if (ReflectAuthorized()) return true;
+            for (var i = 0; i < _grantedCapabilities.Length; i++)
+            {
+                if (_grantedCapabilities[i] == cap) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 探针在本地关闭/需授权的能力清单（13 项 = _blockedCapabilities + _reflectCapabilities），
+        /// 供诊断与测试断言。命名为 ForTest 是历史原因；它描述的是真实闸门集合，不是测试专用清单。
+        /// </summary>
+        public static string[] DangerousCapabilitiesForTest()
+        {
+            var list = new List<string>(_blockedCapabilities);
+            list.AddRange(_reflectCapabilities);
+            return list.ToArray();
         }
 
         static object Execute(string cap, Dictionary<string, object> args)

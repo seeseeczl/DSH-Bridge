@@ -169,13 +169,24 @@ namespace DSHBridge
                 var parentArgs = new Dictionary<string, object>();
                 if (!string.IsNullOrEmpty(parentPath)) parentArgs["path"] = parentPath;
                 if (!string.IsNullOrEmpty(parentHandle)) parentArgs["handle"] = parentHandle;
-                var parentGo = ResolveGameObject(parentArgs);
+                GameObject parentGo;
+                try { parentGo = ResolveGameObject(parentArgs); }
+                catch { UnityEngine.Object.DestroyImmediate(go); throw; }
                 go.transform.SetParent(parentGo.transform, false);
             }
-            foreach (var compName in GetStringList(args, "components"))
+            try
             {
-                var t = FindType(compName);
-                if (t != null && go.GetComponent(t) == null) go.AddComponent(t);
+                foreach (var compName in GetStringList(args, "components"))
+                {
+                    var t = FindType(compName);
+                    if (t != null && go.GetComponent(t) == null) go.AddComponent(t);
+                }
+            }
+            catch
+            {
+                // 失败路径不留孤儿对象（审计 P2）。
+                UnityEngine.Object.DestroyImmediate(go);
+                throw;
             }
             Undo.RegisterCreatedObjectUndo(go, "DSH Create " + name);
             EditorUtility.SetDirty(go);
@@ -215,6 +226,7 @@ namespace DSHBridge
         static Dictionary<string, object> GameObjectSetActive(Dictionary<string, object> args)
         {
             var go = ResolveGameObject(args);
+            if (!args.ContainsKey("active")) throw new KnownError("invalid_argument", "缺少 active（布尔）；不要依赖默认值以免误禁用对象");
             var active = ToBool(args, "active");
             Undo.RecordObject(go, "DSH SetActive");
             go.SetActive(active);
@@ -230,6 +242,7 @@ namespace DSHBridge
             var parentPath = GetString(args, "parentPath");
             var parentHandle = GetString(args, "parentHandle");
             var worldPositionStays = ToBool(args, "worldPositionStays");
+            Undo.RecordObject(go.transform, "DSH SetParent");
             if (string.IsNullOrEmpty(parentPath) && string.IsNullOrEmpty(parentHandle))
             {
                 go.transform.SetParent(null, worldPositionStays);
@@ -344,6 +357,9 @@ namespace DSHBridge
             var go = ResolveGameObject(args);
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            path = ResolveAssetPath(path, "path");
+            if (AssetDatabase.LoadAssetAtPath<GameObject>(path) != null && !ToBool(args, "overwrite"))
+                throw new KnownError("already_exists", "Prefab 已存在；如需覆盖请显式传 overwrite:true: " + path);
             var prefab = PrefabUtility.SaveAsPrefabAssetAndConnect(go, path, InteractionMode.AutomatedAction);
             AssetDatabase.Refresh();
             return DescribeRef(prefab);
@@ -360,7 +376,12 @@ namespace DSHBridge
             if (!string.IsNullOrEmpty(parentPath))
             {
                 var t = FindTransformByPath(parentPath);
-                if (t != null) instance.transform.SetParent(t, false);
+                if (t == null)
+                {
+                    UnityEngine.Object.DestroyImmediate(instance);
+                    throw new KnownError("object_not_found", "parentPath 找不到对象: " + parentPath);
+                }
+                instance.transform.SetParent(t, false);
             }
             Undo.RegisterCreatedObjectUndo(instance, "DSH Instantiate");
             return DescribeRef(instance);
@@ -395,6 +416,11 @@ namespace DSHBridge
             var stage = UnityEditor.SceneManagement.PrefabStageUtility.GetCurrentPrefabStage();
             if (stage == null) return new Dictionary<string, object> { { "closed", false } };
             var path = stage.assetPath;
+            bool dirty;
+            try { dirty = stage.scene.isDirty; }
+            catch { dirty = false; }
+            if (dirty && !ToBool(args, "allowDiscard"))
+                throw new KnownError("prefab_dirty", "Prefab Stage 有未保存修改；先 prefab.save，或显式传 allowDiscard:true 丢弃");
             UnityEditor.SceneManagement.StageUtility.GoToMainStage();
             var d = new Dictionary<string, object>();
             d["closed"] = true;
@@ -430,6 +456,8 @@ namespace DSHBridge
             if (mat.shader != null)
             {
                 var count = mat.shader.GetPropertyCount();
+                d["truncated"] = count > 80;
+                d["total"] = (long)count;
                 for (var i = 0; i < count && i < 80; i++)
                 {
                     var name = mat.shader.GetPropertyName(i);
@@ -468,19 +496,22 @@ namespace DSHBridge
             if (values == null) throw new KnownError("invalid_argument", "缺少 values");
             Undo.RecordObject(mat, "DSH Material");
             var applied = new List<object>();
+            var ignored = new List<object>();
             foreach (var kv in values)
             {
-                if (!mat.HasProperty(kv.Key)) continue;
+                if (!mat.HasProperty(kv.Key)) { ignored.Add(kv.Key); continue; }
                 var type = mat.shader != null ? mat.shader.GetPropertyType(mat.shader.FindPropertyIndex(kv.Key)).ToString() : "";
                 if (type == "Color") mat.SetColor(kv.Key, (Color)CoerceValue(kv.Value, typeof(Color)));
                 else if (type == "Vector") mat.SetVector(kv.Key, (Vector4)CoerceValue(kv.Value, typeof(Vector4)));
                 else if (type == "Texture") mat.SetTexture(kv.Key, (Texture)CoerceValue(kv.Value, typeof(Texture)));
+                else if (type == "Int") mat.SetInt(kv.Key, (int)System.Convert.ToInt64(kv.Value, CultureInfo.InvariantCulture));
                 else mat.SetFloat(kv.Key, (float)System.Convert.ToDouble(kv.Value is Dictionary<string, object> ? 1 : kv.Value, CultureInfo.InvariantCulture));
                 applied.Add(kv.Key);
             }
             EditorUtility.SetDirty(mat);
             var d = new Dictionary<string, object>();
             d["applied"] = applied;
+            if (ignored.Count > 0) d["ignored"] = ignored;
             d["shader"] = mat.shader != null ? mat.shader.name : null;
             return d;
         }
@@ -493,7 +524,11 @@ namespace DSHBridge
             var target = GetString(args, "target");
             // rename 的 target 只是新名称；move/duplicate 的 target 是工程内目录或路径。
             if (!string.IsNullOrEmpty(target) && (op == "move" || op == "duplicate"))
+            {
                 target = ResolveAssetPath(target, "target");
+                EnsureWritableAssetPath(target, "target");
+            }
+            EnsureWritableAssetPath(path, "path");
             string result = null;
             if (op == "rename")
             {
@@ -517,11 +552,16 @@ namespace DSHBridge
                 result = ok ? "" : "copy_failed";
             }
             AssetDatabase.Refresh();
+            if (!string.IsNullOrEmpty(result))
+            {
+                var code = op == "delete" ? "delete_failed" : (op == "duplicate" ? "copy_failed" : "asset_op_failed");
+                throw new KnownError(code, op + " 失败: " + result);
+            }
             var d = new Dictionary<string, object>();
             d["operation"] = op;
             d["assetPath"] = path;
-            d["error"] = string.IsNullOrEmpty(result) ? null : result;
-            d["ok"] = string.IsNullOrEmpty(result);
+            d["error"] = null;
+            d["ok"] = true;
             return d;
         }
 
@@ -567,14 +607,17 @@ namespace DSHBridge
             var scene = SceneManager.GetActiveScene();
             var roots = scene.GetRootGameObjects();
             var list = new List<object>();
-            foreach (var go in roots) list.Add(SummarizeTransform(go.transform, 0));
+            var truncated = false;
+            foreach (var go in roots) list.Add(SummarizeTransform(go.transform, 0, ref truncated));
             var d = new Dictionary<string, object>();
             d["scene"] = scene.name;
+            d["total"] = (long)roots.Length;
+            if (truncated) d["truncated"] = true;
             d["roots"] = list;
             return d;
         }
 
-        static Dictionary<string, object> SummarizeTransform(Transform t, int depth)
+        static Dictionary<string, object> SummarizeTransform(Transform t, int depth, ref bool truncated)
         {
             var d = new Dictionary<string, object>();
             d["name"] = t.name;
@@ -584,9 +627,11 @@ namespace DSHBridge
             if (depth < 2)
             {
                 var children = new List<object>();
-                for (var i = 0; i < t.childCount && i < 64; i++) children.Add(SummarizeTransform(t.GetChild(i), depth + 1));
+                for (var i = 0; i < t.childCount && i < 64; i++) children.Add(SummarizeTransform(t.GetChild(i), depth + 1, ref truncated));
+                if (t.childCount > 64) truncated = true;
                 d["children"] = children;
             }
+            else if (t.childCount > 0) truncated = true;
             return d;
         }
 
@@ -596,12 +641,22 @@ namespace DSHBridge
             if (string.IsNullOrEmpty(filter)) filter = "";
             var folders = GetStringList(args, "folders");
             var limit = (int)Math.Max(1, Math.Min(500, ToLong(args, "limit", 50)));
+            var budgetMs = (int)Math.Max(50, Math.Min(5000, ToLong(args, "budgetMs", 1000)));
+            var sw = Stopwatch.StartNew();
             var guids = AssetDatabase.FindAssets(filter, folders.Count > 0 ? folders.ToArray() : null);
             var paths = new List<object>();
-            for (var i = 0; i < guids.Length && i < limit; i++) paths.Add(AssetDatabase.GUIDToAssetPath(guids[i]));
+            var truncated = false;
+            for (var i = 0; i < guids.Length; i++)
+            {
+                if (paths.Count >= limit || sw.ElapsedMilliseconds > budgetMs) { truncated = true; break; }
+                paths.Add(AssetDatabase.GUIDToAssetPath(guids[i]));
+            }
+            if (paths.Count < guids.Length) truncated = true;
             var d = new Dictionary<string, object>();
             d["total"] = (long)guids.Length;
             d["assets"] = paths;
+            d["elapsedMs"] = sw.ElapsedMilliseconds;
+            if (truncated) d["truncated"] = true;
             return d;
         }
 

@@ -106,3 +106,49 @@ test('探针声明的能力集合与 UNITY_CAPABILITIES 完全一致', async () 
   assert.deepEqual(probeCaps, adapterCaps, '探针与适配器能力清单漂移')
   assert.ok(adapterCaps.length >= 77, '能力面不应回退')
 })
+
+// 审计修复（AUD-CODE-001）：P0/P1/P2 关键机制必须在源码里可验证。
+test('审计修复：MiniJson 深度/大小上限与 NaN 序列化', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /MaxDepth/)
+  assert.match(source, /MaxInputBytes/)
+  assert.match(source, /IsNaN/)
+  assert.match(source, /IsInfinity/)
+})
+
+test('审计修复：事件序号加锁、原子写、权限与通道诊断', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /_eventLock/)
+  assert.match(source, /NextEventFile/)
+  assert.match(source, /File\.Replace/)
+  assert.match(source, /TryFixPermissions/)
+  assert.match(source, /AddChannelDiagnostic/)
+  assert.match(source, /CodeOfExtended/)
+})
+
+test('审计修复：截图预算/编码处理/validate 判定', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /plannedDurationMs/)
+  assert.match(source, /ScreenshotSequenceBudgetMs/)
+  assert.match(source, /invalid_encoding/)
+  assert.match(source, /HasErrors/)
+  assert.match(source, /CaptureScreenshotAsTexture/)
+})
+
+test('审计修复：写保护、输入注入交付标记与参数校验', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /delivered/)
+  assert.match(source, /ignored/)
+  assert.match(source, /EventModifiers/)
+})
+
+test('审计修复：危险能力闸门扩展到全部危险能力（13 项）', async () => {
+  const source = readProbeTemplateText()
+  for (const capability of [
+    'unity.menu.execute', 'unity.package.add', 'unity.package.remove',
+    'unity.asset.delete', 'unity.asset.move', 'unity.asset.rename', 'unity.asset.duplicate',
+    'unity.asset.refresh', 'unity.importer.set',
+  ]) {
+    assert.match(source, new RegExp(`_reflectCapabilities[\\s\\S]*${capability.replace(/\./g, '\\.')}`), `危险能力闸门缺少 ${capability}`)
+  }
+})

@@ -60,9 +60,12 @@ namespace DSHBridge
             var method = type.GetMethods(flags).FirstOrDefault(m => m.Name == methodName && m.GetParameters().Length == rawArgs.Count)
                          ?? type.GetMethods(flags).FirstOrDefault(m => m.Name == methodName);
             if (method == null) throw new KnownError("method_not_found", "找不到方法: " + typeName + "." + methodName);
+            EnsureMethodCallable(method);
             var converted = ConvertArgs(method.GetParameters(), rawArgs);
             var state = new DescribeState();
             var result = method.Invoke(null, converted);
+            // P1-1：返回值同样过黑名单，防止反射面把元编程句柄交给调用方继续链式调用。
+            EnsureValueTypeAllowed(result, "返回值");
             var d = new Dictionary<string, object>();
             d["type"] = typeName;
             d["method"] = methodName;
@@ -82,7 +85,8 @@ namespace DSHBridge
             Type staticType;
             var target = ResolveReflectTarget(args, out staticType);
             var type = ResolveBoundType(target, staticType);
-            EnsureTypeAllowed(type);
+            // P1-1：静态声明类型与实际对象类型都要过黑名单（只查解析出的 type 会漏掉实际对象是 MethodInfo 的情况）。
+            EnsureReflectionTargetAllowed(target, staticType);
 
             var names = CandidateNames(args);
             if (names.Count == 0) throw new KnownError("invalid_argument", "需要 member 或 candidates");
@@ -96,7 +100,10 @@ namespace DSHBridge
 
             foreach (var name in names)
             {
-                if (_deniedMembers.Contains(name)) { tried.Add(name + " (denied)"); continue; }
+                // P1-1：显式请求黑名单成员（GetType/GetMethod/Invoke…）必须硬拒绝。
+                // 此前这里是「跳过并继续尝试候选名」，会让错误码退化成 member_not_found。
+                if (_deniedMembers.Contains(name))
+                    throw new KnownError("member_denied", "成员 " + name + " 在硬拒绝清单内");
                 var hit = FindMember(type, name, flags, kindHint, rawArgs.Count, argTypes);
                 if (hit == null) { tried.Add(name); continue; }
                 var value = ReadOrInvoke(hit, target, staticType != null, hasValue, hasValue ? args["value"] : null, rawArgs, state);
@@ -283,6 +290,7 @@ namespace DSHBridge
         static object ReadOrInvoke(MemberHit hit, object target, bool isStatic, bool hasValue, object writeValue, List<object> rawArgs, DescribeState state)
         {
             var instance = isStatic ? null : target;
+            object value;
             if (hit.Kind == "property")
             {
                 if (hasValue)
@@ -291,16 +299,22 @@ namespace DSHBridge
                     hit.Property.SetValue(instance, CoerceValue(writeValue, hit.Property.PropertyType), null);
                 }
                 if (!hit.Property.CanRead) throw new KnownError("readonly_member", "属性不可读: " + hit.Name);
-                return DescribeEx(hit.Property.GetValue(instance, null), state, hit.Name);
+                value = hit.Property.GetValue(instance, null);
             }
-            if (hit.Kind == "field")
+            else if (hit.Kind == "field")
             {
                 if (hasValue) hit.Field.SetValue(instance, CoerceValue(writeValue, hit.Field.FieldType));
-                return DescribeEx(hit.Field.GetValue(instance), state, hit.Name);
+                value = hit.Field.GetValue(instance);
             }
-            EnsureMethodCallable(hit.Method);
-            var converted = ConvertArgs(hit.Method.GetParameters(), rawArgs);
-            return DescribeEx(hit.Method.Invoke(instance, converted), state, hit.Name);
+            else
+            {
+                EnsureMethodCallable(hit.Method);
+                var converted = ConvertArgs(hit.Method.GetParameters(), rawArgs);
+                value = hit.Method.Invoke(instance, converted);
+            }
+            // P1-1：属性/字段/方法返回值都过黑名单，元编程句柄不能作为可复用返回值流出。
+            EnsureValueTypeAllowed(value, "返回值");
+            return DescribeEx(value, state, hit.Name);
         }
 
         /// <summary>未命中时给出近似成员名：前缀匹配优先，其次子串匹配。</summary>
@@ -390,7 +404,10 @@ namespace DSHBridge
             if (value == null) return null;
             var text = value as string;
             if (text != null) return text;
-            if (value is bool || value is int || value is long || value is float || value is double || value is decimal) return value;
+            // P2：所有基元标量都必须直出，否则会被句柄化（short/byte/uint/char 曾变成 $handle，调用方拿不到值）。
+            if (value is bool || value is int || value is long || value is float || value is double || value is decimal
+                || value is short || value is byte || value is sbyte || value is ushort || value is uint || value is ulong
+                || value is char) return value;
             if (value is Enum) return value.ToString();
             // 这些值类型是「标量」而不是对象引用：返回文本，避免调用方拿到无意义的句柄。
             if (value is IntPtr || value is UIntPtr) return value.ToString();
@@ -483,6 +500,9 @@ namespace DSHBridge
             }
             // 未知复杂对象：不做属性枚举（会把整张对象图拖进响应），但必须回传可复用的句柄，
             // 否则「拿到对象 → 再对它调用方法」这条最常用的反射链会在第一步断掉。
+            // P1-1：句柄化前必须拒绝元编程类型——Type/MethodInfo 一旦成为句柄，
+            // 调用方就能继续 GetMethod → Invoke，绕过类型与成员黑名单。
+            EnsureValueTypeAllowed(value, "返回值");
             var handleRef = new Dictionary<string, object>();
             handleRef["$handle"] = PutHandle(value);
             handleRef["$type"] = value.GetType().FullName ?? value.GetType().Name;
@@ -491,6 +511,24 @@ namespace DSHBridge
         }
 
         // ===== 能力 2：批量调用 + 共享 Undo 事务边界 =====
+
+        /// <summary>
+        /// P1-1：api.batch 内嵌 code 必须做嵌套授权校验。否则 batch 本身被授权时，
+        /// 被 bridge.denied 禁用或未授权的 unity.code.execute 会借道 batch 执行（审计原绕过链）。
+        /// </summary>
+        static void EnsureNestedCodeExecuteAllowed()
+        {
+            try
+            {
+                EnsureCapabilityAllowed("unity.code.execute");
+            }
+            catch (KnownError e)
+            {
+                if (e.Code != "capability_denied") throw;
+                // 对外统一用 DSH 侧命名 capability_disabled，便于调用方区分「未授权」与普通拒绝。
+                throw new KnownError("capability_disabled", "api.batch 内嵌 code 需要 unity.code.execute 授权: " + e.Message, e.Detail);
+            }
+        }
 
         static Dictionary<string, object> ApiBatch(Dictionary<string, object> args)
         {
@@ -508,6 +546,7 @@ namespace DSHBridge
             try
             {
                 Undo.IncrementCurrentGroup();
+                // 保存本次批次专属的 Undo 组（结束时折叠成一个撤销步骤）。
                 undoGroup = Undo.GetCurrentGroup();
                 Undo.SetCurrentGroupName(groupName);
                 undoGroupOpened = true;
@@ -523,6 +562,7 @@ namespace DSHBridge
             var failures = new List<object>();
             var rolledBack = false;
             var compensationResults = new List<object>();
+            var compensationFailures = new List<object>();
 
             for (var i = 0; i < calls.Count; i++)
             {
@@ -547,8 +587,14 @@ namespace DSHBridge
                 {
                     // 单个 call 有两种形态：反射成员访问，或一段 C# 代码。
                     // 后者让 batch 能覆盖「建 staging 资产 → 操作 → 失败 → 补偿清理」这类事务，
-                    // 与 ASECLI 的 execute_code 事务语义对齐。
-                    var one = call.ContainsKey("code") ? CodeExecute(call) : ReflectInvoke(call);
+                    // 与 ASECLI 的 execute_code 事务语义对齐。内嵌 code 需要嵌套授权。
+                    Dictionary<string, object> one;
+                    if (call.ContainsKey("code"))
+                    {
+                        EnsureNestedCodeExecuteAllowed();
+                        one = CodeExecute(call);
+                    }
+                    else one = ReflectInvoke(call);
                     row["ok"] = true;
                     foreach (var pair in one) row[pair.Key] = pair.Value;
                     results.Add(row);
@@ -586,19 +632,34 @@ namespace DSHBridge
                         row["ok"] = false;
                         row["error"] = Error("invalid_argument", "onError[" + i.ToString(CultureInfo.InvariantCulture) + "] 不是对象", "");
                         compensationResults.Add(row);
+                        compensationFailures.Add(new Dictionary<string, object> {
+                            { "index", (long)i },
+                            { "code", "invalid_argument" },
+                            { "message", "补偿项不是对象" },
+                        });
                         continue;
                     }
                     try
                     {
                         row["ok"] = true;
-                        row["result"] = comp.ContainsKey("code")
-                            ? CodeExecute(comp)["result"]
-                            : ReflectInvoke(comp)["result"];
+                        if (comp.ContainsKey("code"))
+                        {
+                            // 内嵌 code 的补偿同样需要嵌套授权，不能借 batch 绕过 code.execute 闸门。
+                            EnsureNestedCodeExecuteAllowed();
+                            row["result"] = CodeExecute(comp)["result"];
+                        }
+                        else row["result"] = ReflectInvoke(comp)["result"];
                     }
                     catch (Exception e)
                     {
                         row["ok"] = false;
                         row["error"] = Error(CodeOf(e), MessageOf(e), DetailOf(e));
+                        // P2：补偿失败单独归集，避免和「Undo 是否回滚」混在同一个布尔里。
+                        compensationFailures.Add(new Dictionary<string, object> {
+                            { "index", (long)i },
+                            { "code", CodeOf(e) },
+                            { "message", MessageOf(e) },
+                        });
                     }
                     compensationResults.Add(row);
                 }
@@ -613,10 +674,30 @@ namespace DSHBridge
                 }
             }
 
+            // P2：批次结束（无论成功还是回滚）都要整理 Undo 组形态：
+            // 成功时把本批操作折叠成一个撤销单元；之后开新组，避免后续零散编辑被并入本批。
+            var undoCollapsed = false;
+            var undoGroupRestored = false;
+            if (undoGroupOpened)
+            {
+                if (!rolledBack)
+                {
+                    try { Undo.CollapseUndoOperations(undoGroup); undoCollapsed = true; }
+                    catch (Exception) { undoCollapsed = false; }
+                }
+                try { Undo.IncrementCurrentGroup(); undoGroupRestored = true; }
+                catch (Exception) { undoGroupRestored = false; }
+            }
+
             var response = new Dictionary<string, object>();
             response["results"] = results;
             response["failedAt"] = failedAt >= 0 ? (object)failedAt : null;
+            // P2：显式区分「Undo 是否已回滚」与「非 Undo 侧补偿失败明细」。
+            // rolledBack 为兼容旧调用方保留，undoReverted 为新命名（同值）。
             response["rolledBack"] = rolledBack;
+            response["undoReverted"] = rolledBack;
+            response["undoCollapsed"] = undoCollapsed;
+            response["undoGroupRestored"] = undoGroupRestored;
             response["undoGroupOpened"] = undoGroupOpened;
             response["undoGroup"] = undoGroup >= 0 ? (object)(long)undoGroup : null;
             response["stopOnError"] = stopOnError;
@@ -624,6 +705,7 @@ namespace DSHBridge
             if (failure != null) response["error"] = failure["error"];
             if (failures.Count > 0) response["failures"] = failures;
             if (compensationResults.Count > 0) response["compensations"] = compensationResults;
+            if (compensationFailures.Count > 0) response["compensationFailures"] = compensationFailures;
             response["resultTruncated"] = state.Truncated;
             if (state.Truncated) response["truncation"] = state.Describe();
             return response;
