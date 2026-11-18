@@ -88,3 +88,4 @@ evidence: []
 | 2026-11-18T23:22:00+08:00 | 能力补全-4 | 探针 v22：原生交互（窗口枚举/聚焦/输入注入）6/6 真机通过；能力面 44 → 74 项 | lead |  | docs/04-delivery/REL-0004.md |
 | 2026-11-18T23:30:00+08:00 | REL-0004 | 发布 v0.0.7：能力补全（FR-0014），138 项测试全绿 | lead |  | docs/04-delivery/REL-0004.md |
 | 2026-11-18T23:50:00+08:00 | 能力补全-5 | 探针 v24：unity.test.run 用运行期动态编译桥接绕过 asmdef 限制，EditMode 测试真机跑通（passed=1）；能力面 77 项 | lead |  | docs/04-delivery/REL-0004.md |
+| 2026-11-18T23:58:00+08:00 | CAP-0001 | 新增能力矩阵文档（77 项能力 × MCP/Codely 对标 + 已知边界）；EXC-0001 偿还条件触发登记 TASK-0031 | lead |  | docs/01-architecture/capability-matrix.md |

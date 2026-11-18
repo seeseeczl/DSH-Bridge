@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { renderProbe, PROBE_TEMPLATE_PATH } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
+import { UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
 
 // 探针源码形态检查（AA-OPT-013）。
 //
@@ -90,4 +91,15 @@ test('探针包含测试运行能力（动态编译桥接）', async () => {
   assert.match(source, /TestRunnerApi/)
   assert.match(source, /test_framework_missing/)
   assert.match(source, /PollTestJobs/)
+})
+
+// 双侧能力清单一致性（真实漂移风险：探针 _capabilities 与 adapter UNITY_CAPABILITIES 手动维护）。
+test('探针声明的能力集合与 UNITY_CAPABILITIES 完全一致', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  const match = source.match(/_capabilities = new string\[\] \{([\s\S]*?)\};/)
+  assert.ok(match, '找不到探针 _capabilities 数组')
+  const probeCaps = [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()
+  const adapterCaps = [...UNITY_CAPABILITIES].sort()
+  assert.deepEqual(probeCaps, adapterCaps, '探针与适配器能力清单漂移')
+  assert.ok(adapterCaps.length >= 77, '能力面不应回退')
 })

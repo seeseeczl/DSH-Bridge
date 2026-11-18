@@ -68,5 +68,5 @@ evidence: []
 
 | 任务 | 关联需求 | 状态 | 产物 | 验收（回归） |
 | --- | --- | --- | --- | --- |
-| TASK-0030 | FR-0014 | 完成 | 探针 v22：截图/脚本编辑/生产管线/垂直域/原生交互/作业化/菜单解禁 | REG-SHOT-001、REG-MENU-001、REG-SCRIPT-001、REG-PROD-001、REG-JOB-001、REG-NATIVE-001 |
-
+| TASK-0030 | FR-0014 | 完成 | 探针 v24：截图 + 帧序列/脚本编辑 + validate/生产管线（构建/测试/包管理/烘焙）/垂直域/原生交互/作业化/菜单解禁 | REG-SHOT-001/002、REG-MENU-001、REG-SCRIPT-001/002、REG-PROD-001、REG-JOB-001、REG-NATIVE-001 |
+| TASK-0031 | EXC-0001 | 待办 | 探针多文件拆分 + ADR-0002 改写（偿还条件已触发：5951 LOC / 77 能力） | 拆分后 `npm run verify` 全绿 + 真机全量回归 |
