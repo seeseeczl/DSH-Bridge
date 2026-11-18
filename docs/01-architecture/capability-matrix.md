@@ -22,7 +22,7 @@ evidence: [packages/dsh-bridge/adapters/unity/index.mjs, packages/dsh-bridge/ada
 | 维度 | DSH-Bridge | MCP（CoplayDev） | Codely Bridge |
 | --- | --- | --- | --- |
 | 通信 | 工程内文件邮箱（`Library/DSHBridge/`），无监听端口 | TCP/HTTP server（如 8080） | TCP 25916（动态分配） |
-| 目标端安装 | 单文件 C# 探针（embedded package，可整体删除） | UPM 包 + Python server | UPM 包 + 三平台原生库 |
+| 目标端安装 | C# partial class 源码包（embedded package，可整体删除） | UPM 包 + Python server | UPM 包 + 三平台原生库 |
 | 暴露形态 | DSH 工具（`bridge_*` 10 个） | MCP 标准协议 | 无公开协议（仅自家 Codely 生态） |
 | 多实例 | `instanceId` + 文件邮箱隔离 | 端口/实例名路由 | 端口动态分配 |
 

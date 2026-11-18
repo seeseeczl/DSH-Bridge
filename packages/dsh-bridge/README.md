@@ -3,7 +3,7 @@
 DSH 主动式外部软件控制桥。目标软件侧不需要 MCP server，也不需要开放端口。
 
 - **传输**：工程内文件邮箱（`Library/DSHBridge/`），原子写 + 轮询，双方都不监听端口。
-- **探针**：单文件 C# 源码，作为 embedded package 安装在 `Packages/com.dsh.bridge/`。
+- **探针**：C# partial class 源码包（按域拆为 9 个文件），作为 embedded package 安装在 `Packages/com.dsh.bridge/`；整目录删除即卸载。
 - **扩展**：`adapters/` 下新增目录即可接入新软件，不需要修改 `core/`、`transport/` 或 `tools/`。
 
 ## 安装形态（不污染工作区）

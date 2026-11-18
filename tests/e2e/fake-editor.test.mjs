@@ -93,7 +93,7 @@ test('安装探针：dry_run 不落盘、真实安装写入单文件、重复安
   try {
     const preview = await bridge.install(id, { dryRun: true })
     assert.equal(preview.dryRun, true)
-    assert.equal(preview.files.length, 2)
+    assert.equal(preview.files.length, 10)
     await assert.rejects(() => stat(preview.files[0].path))
 
     const first = await bridge.install(id, { dryRun: false, autoActivate: false, waitForReady: false })

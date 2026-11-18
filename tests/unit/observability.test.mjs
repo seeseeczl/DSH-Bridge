@@ -52,8 +52,8 @@ test('AA-OPT-012 旧探针被标记 probeOutdated 并在调用前拒绝', async 
 
 test('AA-OPT-010 探针源码包含旧通道目录清扫', async () => {
   const { readFile } = await import('node:fs/promises')
-  const { PROBE_TEMPLATE_PATH } = await import('../../packages/dsh-bridge/adapters/unity/probe.template.mjs')
-  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  const { readProbeTemplateText } = await import('../../packages/dsh-bridge/adapters/unity/probe.template.mjs')
+  const source = readProbeTemplateText()
   assert.match(source, /SweepStaleBootDirs/)
   assert.match(source, /GetDirectories\(_rootDir\)/)
 })

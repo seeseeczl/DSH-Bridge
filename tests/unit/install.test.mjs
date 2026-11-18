@@ -28,7 +28,7 @@ test('dry_run 只给出包内两个文件，不落盘', async () => {
   const preview = await adapter.install(inst(dir), { dryRun: true })
   assert.equal(preview.dryRun, true)
   assert.equal(preview.location, 'packages/embedded')
-  assert.equal(preview.files.length, 2)
+  assert.equal(preview.files.length, 10)
   assert.match(preview.files[0].relativePath, /Packages\/com\.dsh\.bridge\/package\.json$/)
   assert.match(preview.files[1].relativePath, /Packages\/com\.dsh\.bridge\/Editor\/DSHBridgeProbe\.cs$/)
   await assert.rejects(() => stat(preview.files[0].path))

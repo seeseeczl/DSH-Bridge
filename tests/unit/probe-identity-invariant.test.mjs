@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { PROBE_TEMPLATE_PATH } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
+import { readProbeTemplateText } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 
 // BUG-001：instance.json 的 bootId 指向不存在的通道目录。
 //
@@ -14,7 +14,7 @@ import { PROBE_TEMPLATE_PATH } from '../../packages/dsh-bridge/adapters/unity/pr
 //   2. 心跳发布 instance.json 之前保证目录存在（自愈）。
 // 只检查源码形态——行为正确性由 capability-semantics 的真实驱动用例负责。
 
-const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+const source = readProbeTemplateText()
 
 /** 取出某个方法的函数体（按大括号配平），避免跨方法误匹配。 */
 function bodyOf(name) {

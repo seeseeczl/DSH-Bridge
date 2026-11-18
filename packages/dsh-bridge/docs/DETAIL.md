@@ -67,7 +67,7 @@
 
 ## 限制
 
-- 探针是**单个 C# 源码文件**，作为 embedded package 写入 `<工程>/Packages/com.dsh.bridge/Editor/DSHBridgeProbe.cs`；首次写入会让 Unity 编译并重载一次。
+- 探针是**按域拆分的 C# partial class 源码包**（9 个文件），作为 embedded package 写入 `<工程>/Packages/com.dsh.bridge/Editor/`；首次写入会让 Unity 编译并重载一次，卸载删除整目录。
 - 传输基于文件轮询（约 100ms），单次调用延迟通常在 100–300ms。
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。

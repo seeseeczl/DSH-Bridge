@@ -27,7 +27,7 @@ test('bridge_install dry-run 输出覆盖 schema 声明的全部字段', async (
     assert.equal(result.dryRun, true)
     assert.equal(typeof result.changed, 'boolean', 'changed 必须是布尔（schema required）')
     assert.deepEqual(result.deniedCapabilities, ['unity.asset.delete'])
-    assert.ok(Array.isArray(result.files) && result.files.length === 2)
+    assert.ok(Array.isArray(result.files) && result.files.length === 10)
     // dry-run 绝不能落盘
     const written = await import('node:fs/promises').then((fs) => fs.readdir(join(projectPath, 'Packages')).catch(() => null))
     assert.equal(written, null, 'dry-run 不应创建 Packages 目录')

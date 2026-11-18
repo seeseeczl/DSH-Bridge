@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { renderProbe } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
+import { renderProbeFiles } from '../../packages/dsh-bridge/adapters/unity/probe.template.mjs'
 import { assertProbeToolchain, CSC_COMMAND, resolveMonoCommand } from './toolchain.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -420,16 +420,18 @@ public static class Harness
 async function compile(workDir) {
   // 审计 P2.6：csc/mono 缺失时显式失败；只有 DSH_BRIDGE_SKIP_PROBE=1 才跳过。
   await assertProbeToolchain({ requireMono: true })
-  const probePath = join(workDir, 'DSHBridgeProbe.cs')
   const stubsPath = join(workDir, 'semantics-stubs.cs')
   const harnessPath = join(workDir, 'harness.cs')
   const exePath = join(workDir, 'semantics.exe')
   // 探针的 Execute 是 private static；测试副本里注入一个公开转发入口，模板本身保持 private。
   const anchor = '        static object Execute(string cap, Dictionary<string, object> args)'
-  const source = renderProbe({ probeVersion: 'semantics' })
-  if (!source.includes(anchor)) {
+  // 拆分后 Execute 位于 Security 文件；跨 partial class 文件（同一类）注入照样可用。
+  const rendered = renderProbeFiles({ probeVersion: 'semantics' })
+  const securityFile = rendered.files.find((item) => item.content.includes(anchor))
+  if (!securityFile) {
     throw new Error('探针模板结构已变化：找不到 Execute 定义锚点，请同步 capability-semantics.mjs')
   }
+  const source = securityFile.content
   const injected = [
     '        // 走完整链路：写 inbox → HandleFile（含授权闸门）→ 读 outbox，避免测试绕过安全闸门。',
     '        public static object __bridge_submit__(string cap, Dictionary<string, object> args)',
@@ -531,26 +533,34 @@ async function compile(workDir) {
     anchor,
   ].join('\n')
   const withAnchor = source.replace(anchor, injected)
-  // 授权替身：把 ReflectAuthorized 的实现换成 stub 标志（测试里完全可控）。
-  const hooked = withAnchor.replace(
-    'return _reflectEnabled.HasValue ? _reflectEnabled.Value : AuthorizedByArgv();',
-    'return __AuthorizedByArgvOverride__();',
-  )
-  if (hooked === withAnchor) throw new Error('无法注入授权替身：ReflectAuthorized 结构已变化')
-  const withEntry = hooked
-  await writeFile(probePath, withEntry, 'utf8')
+  if (withAnchor === source) throw new Error('无法注入测试入口：Execute 锚点替换失败')
+  // 授权替身位于主文件（AuthorizedByArgv 所在文件）；partial 文件共享同一类，注入后照样能调用 Execute。
+  const AUTH_OLD = 'return _reflectEnabled.HasValue ? _reflectEnabled.Value : AuthorizedByArgv();'
+  const AUTH_NEW = 'return __AuthorizedByArgvOverride__();'
+  const mainFile = rendered.files[0]
+  if (!mainFile.content.includes(AUTH_OLD)) throw new Error('无法注入授权替身：ReflectAuthorized 结构已变化')
+  const probePaths = []
+  for (const item of rendered.files) {
+    const target = join(workDir, item.file)
+    let content = item.content
+    if (item.file === securityFile.file) content = withAnchor
+    if (item.file === mainFile.file) content = content.replace(AUTH_OLD, AUTH_NEW)
+    await writeFile(target, content, 'utf8')
+    probePaths.push(target)
+  }
   await writeFile(stubsPath, await readFile(join(here, 'semantics-stubs.cs'), 'utf8'), 'utf8')
   await writeFile(harnessPath, harnessSource(), 'utf8')
   const { stdout, stderr } = await run(CSC_COMMAND, [
     '-nologo', '-define:UNITY_EDITOR', '-target:exe', '-warn:0',
-    `-out:${exePath}`, stubsPath, probePath, harnessPath,
+    `-out:${exePath}`, stubsPath, ...probePaths, harnessPath,
   ]).catch((error) => ({ stdout: error.stdout ?? '', stderr: error.stderr ?? String(error) }))
   return { exePath, output: `${stdout}${stderr}` }
 }
 
 /** 探测真实能力名：探针的 Execute 分发里出现过的 cap 字符串。 */
 export async function declaredCapabilities() {
-  const source = await readFile(join(here, '../../packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl'), 'utf8')
+  const { readProbeTemplateText } = await import('../../packages/dsh-bridge/adapters/unity/probe.template.mjs')
+  const source = readProbeTemplateText()
   const caps = new Set()
   for (const match of source.matchAll(/"cap == "(unity\.[\w.]+)"/g)) caps.add(match[1])
   for (const match of source.matchAll(/cap == "(unity\.[\w.]+)"/g)) caps.add(match[1])

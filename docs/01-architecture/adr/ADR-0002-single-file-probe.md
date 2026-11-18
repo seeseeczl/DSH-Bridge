@@ -1,16 +1,19 @@
 ---
 id: ADR-0002
 type: architecture-decision
-status: accepted
+status: superseded
 version: 0.1.0
 created_at: 2026-11-16T13:56:42+08:00
 owner: lead
 related: [ARCH-REQ-0001, FR-0003, NFR-0005]
 supersedes: []
+superseded_by: [ADR-0003]
 evidence: [docs/first-principles/2026-11-16-134736-optimization-plan.md]
 ---
 
-# ADR-0002｜用单文件探针取得进程内执行能力
+# ADR-0002｜用单文件探针取得进程内执行能力（已被 ADR-0003 取代）
+
+> 状态：已由 [ADR-0003](ADR-0003-multi-file-probe-package.md) 取代（探针按域拆为多文件 partial class 包，卸载/零依赖语义不变）。以下保留历史决策。
 
 ## 背景与约束
 

@@ -10,7 +10,7 @@ import {
   legacyDir, manifestFile, packageDir, packageManifest, probeFile,
   PACKAGE_RELATIVE_DIR, PROBE_FILE_NAME,
 } from './paths.mjs'
-import { renderProbe } from './probe.template.mjs'
+import { renderProbeFiles } from './probe.template.mjs'
 
 const LEGACY_GITIGNORE_ENTRIES = ['/Assets/DSHBridge/', '/Assets/DSHBridge.meta']
 
@@ -126,16 +126,13 @@ export async function installProbe(instance, probeVersion, {
   // 授权快照渲染进源码：反射执行面能否使用，取决于这一次安装时的配置。
   const granted = Array.from(new Set(allowDangerous.filter((item) => typeof item === 'string' && item))).sort()
   const deniedCapabilities = Array.from(new Set(denied.filter((item) => typeof item === 'string' && item))).sort()
-  const probeContent = renderProbe({ probeVersion, allowDangerous: granted, denied: deniedCapabilities })
-  // 从渲染结果里回读哈希：DSH 侧必须用「写进去的那份」去比对心跳，而不是自己再算一次。
-  const sourceHash = /SourceHash = "([0-9a-f]+)"/.exec(probeContent)?.[1] ?? null
+  // 探针由多个 partial class 文件组成（EXC-0001 拆分）：渲染后逐个写入 embedded package。
+  const rendered = renderProbeFiles({ probeVersion, allowDangerous: granted, denied: deniedCapabilities })
+  const sourceHash = rendered.sourceHash
   const pkgContent = packageManifest(probeVersion)
-  const existingProbe = await readIfExists(file)
   const existingPkg = await readIfExists(pkg)
-  const probeChanged = existingProbe !== probeContent
   const pkgChanged = existingPkg !== pkgContent
-  const changed = probeChanged || pkgChanged
-
+  const changedFiles = []
   const files = [
     {
       path: pkg,
@@ -144,14 +141,24 @@ export async function installProbe(instance, probeVersion, {
       sha256: sha256(pkgContent),
       changed: pkgChanged,
     },
-    {
-      path: file,
-      relativePath: `${PACKAGE_RELATIVE_DIR}/Editor/${PROBE_FILE_NAME}`,
-      bytes: Buffer.byteLength(probeContent, 'utf8'),
-      sha256: sha256(probeContent),
-      changed: probeChanged,
-    },
   ]
+  let probeChanged = false
+  for (const item of rendered.files) {
+    const target = join(dir, 'Editor', item.file)
+    await assertNotSymlink(target)
+    const existing = await readIfExists(target)
+    const different = existing !== item.content
+    probeChanged = probeChanged || different
+    if (different) changedFiles.push({ target, content: item.content })
+    files.push({
+      path: target,
+      relativePath: `${PACKAGE_RELATIVE_DIR}/Editor/${item.file}`,
+      bytes: Buffer.byteLength(item.content, 'utf8'),
+      sha256: item.sha256,
+      changed: different,
+    })
+  }
+  const changed = probeChanged || pkgChanged
 
   if (dryRun) {
     return {
@@ -172,8 +179,8 @@ export async function installProbe(instance, probeVersion, {
 
   if (changed) {
     await mkdir(join(dir, 'Editor'), { recursive: true })
-    await writeFile(pkg, pkgContent, 'utf8')
-    await writeFile(file, probeContent, 'utf8')
+    if (pkgChanged) await writeFile(pkg, pkgContent, 'utf8')
+    for (const item of changedFiles) await writeFile(item.target, item.content, 'utf8')
   }
 
   const legacy = await migrateLegacy(instance.projectPath)
