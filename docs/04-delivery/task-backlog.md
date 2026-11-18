@@ -51,3 +51,22 @@ evidence: []
 | 任务 | 关联缺陷 | 状态 | 产物 | 验收（回归） |
 | --- | --- | --- | --- | --- |
 | TASK-0028 | BUG-0001 | 完成 | 探针 v12：`BootDirsComplete` 复用前校验、`EnsureBootDirs` 心跳自愈、`IsValidBootId` 字符集校验；DSH 侧 `transport/channel.mjs` 的 `inspectBootDirs` 与 `channel_missing` 状态 | REG-CHANNEL-001、REG-CHANNEL-002、REG-CHANNEL-003 |
+
+## BUG-0002 整改（v0.0.6）
+
+> 来源：`docs/03-quality/BUG-0002.md`
+> 发布：`docs/04-delivery/REL-0003.md`
+
+| 任务 | 关联缺陷 | 状态 | 产物 | 验收（回归） |
+| --- | --- | --- | --- | --- |
+| TASK-0029 | BUG-0002 | 完成 | `bridge_install` dry-run 输出按需展开可选字段（不再返回 `undefined`）；`bridge_knowledge_save` 只返回 output schema 四字段；`removeTopic` 支持标题/slug 定位且不存在返回 `false` | REG-TOOL-001、REG-KNOWLEDGE-002 |
+
+## BUG-0002 后的能力补全（v0.0.7）
+
+> 来源：`docs/04-delivery/REL-0004.md`（FR-0014）
+> 用户决策：能力与自由优先；缺口 1-7 全做，忽略协议生态与平台。
+
+| 任务 | 关联需求 | 状态 | 产物 | 验收（回归） |
+| --- | --- | --- | --- | --- |
+| TASK-0030 | FR-0014 | 完成 | 探针 v22：截图/脚本编辑/生产管线/垂直域/原生交互/作业化/菜单解禁 | REG-SHOT-001、REG-MENU-001、REG-SCRIPT-001、REG-PROD-001、REG-JOB-001、REG-NATIVE-001 |
+

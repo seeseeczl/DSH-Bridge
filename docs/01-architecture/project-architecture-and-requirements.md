@@ -89,6 +89,7 @@ kickoff_completion: complete
 | FR-0011 | 功能 | 工程扫描与预植入：在目标软件未运行时提前写入探针，首次启动即完成编译 | 默认只预览；`apply: true` 才写入；运行中工程默认跳过 | P2 | `specs/unity-adapter`、REG-INSTALL-001 | approved |
 | FR-0012 | 功能 | 后台实例唤醒：编辑器失去焦点时心跳与轮询停止，调用前临时激活并在完成后恢复前台应用 | 心跳陈旧时先激活；结束后恢复原前台应用；非 darwin 平台退化为直接调用 | P2 | REG-RECOVERY-001 | approved |
 | FR-0013 | 功能 | 事件与拒绝可观测：编译状态三态、`request_rejected` 事件、通道积压统计 | 编译未知时 `ok:null` 且 `stateKnown:false`；越权尝试产生事件；`bridge_targets` 暴露积压 | P1 | `specs/unity-adapter`、REG-EVENT-001、REG-SEC-003 | approved |
+| FR-0014 | 功能 | 能力补全（对标 MCP/Codely）：视觉截图、脚本行列编辑+SHA 乐观锁、生产管线（构建/包管理/烘焙）、垂直域（图形/Profiler/物理/动画/粒子/UI/ProBuilder/Sprite/纹理生成）、原生交互（窗口/输入注入）、长任务作业化、解禁 `unity.menu.execute` 为可授权危险能力 | 截图落工程内 artifacts；构建输出禁止写 Library；作业持久化且域重载后标 interrupted；菜单执行默认拒绝、授权后可用 | P1 | `specs/unity-adapter`、REG-SHOT-001、REG-MENU-001、REG-SCRIPT-001、REG-JOB-001、REG-PROD-001、REG-NATIVE-001 | implemented |
 
 ## 推荐技术路径
 

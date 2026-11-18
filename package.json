@@ -1,7 +1,7 @@
 {
   "name": "dsh-bridge-workspace",
   "license": "MIT",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "private": true,
   "type": "module",
   "description": "DSH-Bridge workspace: DSH-side bridge plugin and its governance artifacts.",

@@ -45,7 +45,9 @@ export function createKnowledgeTools(tool, bridge) {
         sources: args.sources ?? [],
       })
       await bridge?.observe?.('knowledge_save', { instanceId: args.instance_id, slug: saved.slug, bytes: saved.bytes }).catch(() => {})
-      return saved
+      // 工具输出契约只暴露 output schema 声明的字段（additionalProperties: false）；
+      // saveTopic 的 updated 只用于文件头与列表展示，不能透传到工具层。
+      return { path: saved.path, slug: saved.slug, topic: saved.topic, bytes: saved.bytes }
     },
   })
 

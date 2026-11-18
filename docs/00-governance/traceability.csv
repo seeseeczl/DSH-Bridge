@@ -24,3 +24,9 @@ FR-0013,functional,approved,ARCH-REQ-0001,MOD-0003,TASK-0027,REG-EVENT-001/REG-S
 BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0002,TASK-0028,REG-CHANNEL-001,2026-11-18,REL-0002,lead,instance.json 指向不存在通道目录：新增 inspectBootDirs 与 channel_missing 状态
 BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0001,TASK-0028,REG-CHANNEL-003,2026-11-18,REL-0002,lead,发现链路暴露 channelOk/channelMissing，调用侧细化错误码
 BUG-0001,defect,implemented,ARCH-REQ-0001,MOD-0003,TASK-0028,REG-CHANNEL-002,2026-11-18,REL-0002,lead,探针 v12：复用前校验目录齐全 + 心跳前自愈 + bootId 字符集校验
+BUG-0002,defect,implemented,ARCH-REQ-0001,MOD-0005,TASK-0029,REG-TOOL-001,2026-11-18,REL-0003,lead,工具输出契约：dry-run 不返回 undefined、knowledge_save 不透传 updated
+BUG-0002,defect,implemented,ARCH-REQ-0001,MOD-0001,TASK-0029,REG-KNOWLEDGE-002,2026-11-18,REL-0003,lead,知识库删除按标题/slug 定位，不存在返回 false
+FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0003,TASK-0030,REG-SHOT-001/REG-MENU-001/REG-SCRIPT-001,2026-11-18,REL-0004,lead,能力补全：视觉/脚本编辑/生产管线/作业化/菜单解禁
+FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0005,TASK-0030,REG-TOOL-001,2026-11-18,REL-0004,lead,能力补全的 DSH 工具面输出契约与授权一致性
+FR-0014,functional,implemented,ARCH-REQ-0001,MOD-0001,TASK-0030,REG-NATIVE-001/REG-PROD-001/REG-JOB-001,2026-11-18,REL-0004,lead,作业持久化与窗口/输入受管交互
+

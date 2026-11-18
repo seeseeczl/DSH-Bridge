@@ -130,10 +130,12 @@ namespace UnityEngine
         public override bool Equals(object other) => ReferenceEquals(this, other);
         public override int GetHashCode() => base.GetHashCode();
         public static T Instantiate<T>(T original, Transform parent) where T : Object => original;
+        public static void DestroyImmediate(Object target) { if (target != null) target.Destroyed = true; }
+        public static T[] FindObjectsOfType<T>() where T : Object => new T[0];
     }
 
     public struct Vector2 { public float x, y; public Vector2(float x, float y) { this.x = x; this.y = y; } }
-    public struct Vector3 { public float x, y, z; public Vector3(float x, float y, float z) { this.x = x; this.y = y; this.z = z; } }
+    public struct Vector3 { public float x, y, z; public Vector3(float x, float y, float z) { this.x = x; this.y = y; this.z = z; } public Vector3 normalized => this; }
     public struct Vector4 { public float x, y, z, w; public Vector4(float x, float y, float z, float w) { this.x = x; this.y = y; this.z = z; this.w = w; } }
     public struct Quaternion
     {
@@ -150,8 +152,144 @@ namespace UnityEngine
     {
         public static bool TryParseHtmlString(string html, out Color color) { color = new Color(); return true; }
     }
+    public class ScriptableObject : Object { }
     public class Texture : Object { }
     public enum PrimitiveType { Sphere, Capsule, Cylinder, Cube, Plane, Quad }
+
+    // ===== 截图能力（unity.screenshot.capture）所需的最小签名 =====
+    public enum RenderTextureFormat { ARGB32, Default }
+    public enum TextureFormat { RGB24, RGBA32 }
+    public enum RenderTextureReadWrite { Default, Linear, sRGB }
+    public struct Rect
+    {
+        public float x, y, width, height;
+        public Rect(float x, float y, float width, float height) { this.x = x; this.y = y; this.width = width; this.height = height; }
+    }
+    public class RenderTexture : Texture
+    {
+        public static RenderTexture active { get; set; }
+        public static RenderTexture GetTemporary(int width, int height, int depth, RenderTextureFormat format) => new RenderTexture();
+        public static RenderTexture GetTemporary(int width, int height, int depth, RenderTextureFormat format, RenderTextureReadWrite readWrite) => new RenderTexture();
+        public static void ReleaseTemporary(RenderTexture tex) { }
+    }
+    public class Texture2D : Texture
+    {
+        public Texture2D(int width, int height, TextureFormat format, bool mipChain) { }
+        public void ReadPixels(Rect source, int destX, int destY) { }
+        public void Apply() { }
+        public void SetPixels(Color[] colors) { }
+        public byte[] EncodeToPNG() => System.Array.Empty<byte>();
+    }
+
+    // ===== 垂直域第二批（animation / vfx / ui / sprite / texture）所需的最小签名 =====
+    public class Behaviour : Component
+    {
+        public bool enabled { get; set; } = true;
+    }
+
+    public enum AnimatorControllerParameterType { Float, Int, Bool, Trigger }
+
+    public class AnimatorControllerParameter
+    {
+        public string name;
+        public AnimatorControllerParameterType type;
+    }
+
+    public class RuntimeAnimatorController : Object { }
+
+    public struct AnimatorStateInfo
+    {
+        public float normalizedTime;
+        public float length;
+        public int fullPathHash;
+        public bool IsName(string name) => false;
+    }
+
+    public class Animator : Behaviour
+    {
+        public RuntimeAnimatorController runtimeAnimatorController { get; set; }
+        public float speed { get; set; } = 1f;
+        public AnimatorControllerParameter[] parameters => new AnimatorControllerParameter[0];
+        public float GetFloat(string name) => 0f;
+        public void SetFloat(string name, float value) { }
+        public int GetInteger(string name) => 0;
+        public void SetInteger(string name, int value) { }
+        public bool GetBool(string name) => false;
+        public void SetBool(string name, bool value) { }
+        public void SetTrigger(string name) { }
+        public AnimatorStateInfo GetCurrentAnimatorStateInfo(int layerIndex) => new AnimatorStateInfo();
+        public bool IsInTransition(int layerIndex) => false;
+    }
+
+    public class ParticleSystem : Behaviour
+    {
+        public struct MainModule
+        {
+            public bool loop;
+        }
+        public bool isPlaying => false;
+        public bool isPaused => false;
+        public bool isStopped => true;
+        public int particleCount => 0;
+        public float time => 0f;
+        public float duration => 1f;
+        public MainModule main => new MainModule();
+        public void Play() { }
+        public void Pause() { }
+        public void Stop() { }
+        public void Clear() { }
+    }
+
+    public enum RenderMode { ScreenSpaceOverlay, ScreenSpaceCamera, WorldSpace }
+
+
+    // ===== 原生交互（enabled 窗口/输入注入）所需的最小签名 =====
+    public enum EventType { KeyDown, KeyUp, MouseDown, MouseUp, MouseDrag, ScrollWheel, Layout, Repaint }
+    public enum EventModifiers { None, Shift, Control, Alt, Command }
+    public enum KeyCode { None, A, B, C, Space, Return, Escape, Tab, Delete, Backspace, LeftArrow, RightArrow, UpArrow, DownArrow }
+
+    public class Event
+    {
+        public EventType type;
+        public KeyCode keyCode;
+        public char character;
+        public int button;
+        public Vector2 mousePosition;
+        public Vector2 delta;
+        public EventModifiers modifiers;
+    }
+
+    public class GUIContent
+    {
+        public string text;
+    }
+
+    public static class Resources
+    {
+        public static T[] FindObjectsOfTypeAll<T>() where T : Object => new T[0];
+    }
+
+    public class Canvas : Behaviour
+    {
+        public RenderMode renderMode { get; set; }
+        public int sortingOrder { get; set; }
+        public bool isRootCanvas => true;
+    }
+
+    public class Sprite : Object
+    {
+        public Rect rect;
+        public float pixelsPerUnit;
+    }
+
+
+    public class Camera : Object
+    {
+        public static Camera main => null;
+        public static Camera[] allCameras => System.Array.Empty<Camera>();
+        public RenderTexture targetTexture { get; set; }
+        public void Render() { }
+    }
 
     public class Material : Object
     {
@@ -214,12 +352,66 @@ namespace UnityEngine
         public static GameObject CreatePrimitive(PrimitiveType type) => new GameObject();
     }
 
+
+    // ===== 垂直域第一批（graphics / profiler / physics）所需的最小签名 =====
+    public enum ColorSpace { Gamma, Linear }
+
+    public static class QualitySettings
+    {
+        public static string[] names => new string[0];
+        public static ColorSpace activeColorSpace => ColorSpace.Gamma;
+        public static int GetQualityLevel() => 0;
+        public static void SetQualityLevel(int index, bool applyExpensiveChanges) { }
+    }
+
+    public static class RenderSettings
+    {
+        public static UnityEngine.Rendering.AmbientMode ambientMode { get; set; }
+        public static Color ambientLight { get; set; }
+        public static bool fog { get; set; }
+        public static Color fogColor { get; set; }
+        public static float fogDensity { get; set; }
+        public static Material skybox { get; set; }
+    }
+
+    public static class SystemInfo
+    {
+        public static string graphicsDeviceName => "Fake GPU";
+        public static int graphicsMemorySize => 1024;
+        public static int graphicsShaderLevel => 50;
+    }
+
+    public static class Physics
+    {
+        public static Vector3 gravity { get; set; } = new Vector3(0f, -9.81f, 0f);
+        public static int defaultSolverIterations { get; set; } = 6;
+        public static int defaultSolverVelocityIterations { get; set; } = 1;
+        public static bool queriesHitTriggers { get; set; } = true;
+        public static float bounceThreshold { get; set; } = 2f;
+        public static bool Raycast(Vector3 origin, Vector3 direction, out RaycastHit hit, float maxDistance)
+        {
+            hit = new RaycastHit();
+            return false;
+        }
+    }
+
+    public struct RaycastHit
+    {
+        public Vector3 point;
+        public Vector3 normal;
+        public float distance;
+        public Collider collider;
+    }
+
+    public class Collider : Component { public bool enabled { get; set; } = true; }
+
     public static class Application
     {
         public static string dataPath { get { return Path.Combine(DSHBridgeStub.ProjectRoot, "Assets"); } }
         public static string unityVersion => "2022.3.0f1";
         public static string productName => "Fake";
         public static RuntimePlatform platform => RuntimePlatform.OSXEditor;
+        public static int targetFrameRate { get; set; } = -1;
         public static bool isPlaying => UnityEditor.EditorApplication.isPlaying;
         public static event LogCallback logMessageReceivedThreaded;
         public static void RaiseLog(string c, string s, LogType t) => logMessageReceivedThreaded?.Invoke(c, s, t);
@@ -230,6 +422,32 @@ namespace UnityEngine
         public static void Log(object message) { }
         public static void LogWarning(object message) { }
         public static void LogError(object message) { }
+    }
+}
+
+
+namespace UnityEngine.Rendering
+{
+    public enum AmbientMode { Skybox, Trilight, Flat, Custom }
+
+    public class RenderPipelineAsset : UnityEngine.Object { }
+
+    public static class GraphicsSettings
+    {
+        public static RenderPipelineAsset currentRenderPipeline => null;
+    }
+}
+
+namespace UnityEngine.Profiling
+{
+    public static class Profiler
+    {
+        public static bool enabled { get; set; }
+        public static bool supported => true;
+        public static long GetTotalAllocatedMemoryLong() => 0L;
+        public static long GetTotalReservedMemoryLong() => 0L;
+        public static long GetMonoUsedSizeLong() => 0L;
+        public static long GetMonoHeapSizeLong() => 0L;
     }
 }
 
@@ -258,13 +476,57 @@ namespace UnityEditor
     using UnityEngine;
 
     public enum PlayModeStateChange { EnteredEditMode, ExitingEditMode, EnteredPlayMode, ExitingPlayMode }
-    public enum ImportAssetOptions { Default, ForceUpdate }
+    public enum ImportAssetOptions { Default, ForceUpdate, ForceSynchronousImport }
+
+    public class SceneView
+    {
+        public static SceneView lastActiveSceneView => null;
+        public Camera camera => null;
+        public void Repaint() { }
+    }
+
+    // ===== 生产管线（能力补全第 3 项）所需的最小签名 =====
+    public enum BuildTarget { OSXUniversal, OSXIntel64, StandaloneWindows64, StandaloneLinux64, Android, iOS, WebGL }
+    public enum BuildOptions { None }
+    public struct BuildPlayerOptions
+    {
+        public string[] scenes;
+        public string locationPathName;
+        public BuildTarget target;
+        public BuildOptions options;
+    }
+    public static class EditorUserBuildSettings
+    {
+        public static BuildTarget activeBuildTarget => BuildTarget.OSXUniversal;
+    }
+    public class EditorBuildSettingsScene
+    {
+        public string path;
+        public bool enabled;
+        public EditorBuildSettingsScene(string path, bool enabled) { this.path = path; this.enabled = enabled; }
+    }
+    public static class EditorBuildSettings
+    {
+        public static EditorBuildSettingsScene[] scenes { get; set; } = new EditorBuildSettingsScene[0];
+    }
+    public static class Lightmapping
+    {
+        public static bool isRunning => false;
+        public static bool BakeAsync() => true;
+        public static void Cancel() { }
+    }
+    public static class BuildPipeline
+    {
+        public static UnityEditor.Build.Reporting.BuildReport BuildPlayer(BuildPlayerOptions options)
+            => new UnityEditor.Build.Reporting.BuildReport();
+    }
 
     public static class Selection
     {
         // 默认返回「伪 null」对象：!= null 为 true，但隐式 bool 为 false。
         static readonly UnityEngine.Object Ghost = new UnityEngine.Object { Destroyed = true };
         public static UnityEngine.Object[] objects => new UnityEngine.Object[0];
+        public static UnityEngine.GameObject activeGameObject => null;
         public static UnityEngine.Object activeObject
         {
             get { return DSHBridgeStub.SelectionIsNull ? null : Ghost; }
@@ -272,9 +534,36 @@ namespace UnityEditor
         }
     }
 
+    public enum SpriteImportMode { None, Single, Multiple, Polygon }
+
+    public enum TextureImporterType { Default, NormalMap, Sprite, Cursor, Cookie, Lightmap, SingleChannel }
+
+    public class TextureImporter : AssetImporter
+    {
+        public SpriteImportMode spriteImportMode { get; set; }
+        public float spritePixelsPerUnit { get; set; } = 100f;
+        public TextureImporterType textureType { get; set; }
+        public int maxTextureSize { get; set; } = 2048;
+        public TextureImporterFormat? textureCompression { get; set; }
+    }
+
+    public enum TextureImporterFormat { Automatic, RGBA32 }
+
+
+    public class EditorWindow : ScriptableObject
+    {
+        public GUIContent titleContent => new GUIContent();
+        public bool hasFocus => false;
+        public Rect position { get; set; }
+        public static EditorWindow focusedWindow => null;
+        public void Focus() { }
+        public void Repaint() { }
+        public void SendEvent(Event e) { }
+    }
+
     public class AssetImporter
     {
-        public static AssetImporter GetAtPath(string path) => new AssetImporter();
+        public static AssetImporter GetAtPath(string path) => new TextureImporter();
         public string textureType { get; set; } = "Default";
         public bool sRGBTexture { get; set; } = true;
         public bool mipmapEnabled { get; set; } = true;
@@ -284,6 +573,9 @@ namespace UnityEditor
 
     public static class AssetDatabase
     {
+        public static Object[] LoadAllAssetsAtPath(string path) => new Object[0];
+        public static void ImportAsset(string path) { }
+        public static void ImportAsset(string path, ImportAssetOptions options) { }
         public static List<string> Known => DSHBridgeStub.Known;
         public static string[] FindAssets(string filter) => FindAssets(filter, null);
         public static string[] FindAssets(string filter, string[] searchInFolders)
@@ -423,6 +715,77 @@ namespace UnityEditor
         public static void Exit(int code) { DSHBridgeStub.MenuCalls.Add("__Exit"); }
         public static void RaiseUpdate() => update?.Invoke();
         public static void RaisePlayMode(PlayModeStateChange change) => playModeStateChanged?.Invoke(change);
+    }
+}
+
+namespace UnityEditor.Build.Reporting
+{
+    public enum BuildResult { Unknown, Succeeded, Failed, Cancelled }
+
+    public struct BuildSummary
+    {
+        public BuildResult result;
+        public ulong totalSize;
+        public System.TimeSpan totalTime;
+    }
+
+    public class BuildReport
+    {
+        public BuildSummary summary => new BuildSummary();
+    }
+}
+
+namespace UnityEditor.PackageManager
+{
+    public enum StatusCode { InProgress, Success, Failure, NotFound }
+    public enum PackageSource { Registry, Embedded, Local, Git, BuiltIn, Unknown }
+
+    public class Error
+    {
+        public string message;
+    }
+
+    public class PackageInfo
+    {
+        public string name;
+        public string displayName;
+        public string version;
+        public PackageSource source;
+        public static PackageInfo[] GetAllRegisteredPackages() => new PackageInfo[0];
+    }
+
+    public abstract class Request
+    {
+        public bool IsCompleted => true;
+        public StatusCode Status => StatusCode.Success;
+        public Error Error => null;
+    }
+
+    public class AddRequest : Request
+    {
+        public PackageInfo Result => null;
+    }
+
+    public class RemoveRequest : Request { }
+
+    public class ListRequest : Request
+    {
+        public PackageInfo[] Result => new PackageInfo[0];
+    }
+
+    public static class Client
+    {
+        public static AddRequest Add(string identifier) => new AddRequest();
+        public static RemoveRequest Remove(string name) => new RemoveRequest();
+        public static ListRequest List(bool offlineMode) => new ListRequest();
+    }
+}
+
+namespace UnityEditor.AI
+{
+    public static class NavMeshBuilder
+    {
+        public static void BuildNavMesh() { }
     }
 }
 

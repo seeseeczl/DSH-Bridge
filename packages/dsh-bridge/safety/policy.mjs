@@ -10,8 +10,9 @@ import { mkdir } from 'node:fs/promises'
  * 任意菜单执行（menu.execute）、主线程长阻塞（asset.refresh）、资产破坏性操作（delete/move/rename/duplicate）、
  * 导入设置写入（importer.set）。只拦一个名字等于没拦，因此这里按「能改变宿主状态到什么程度」重新分级。
  *
- * unity.menu.execute 例外：它在探针侧被永久关闭（没有任何配置能打开），因此不列在这里，
- * 避免给用户「打开就安全了」的错误暗示。
+ * unity.menu.execute 归入本清单：它能触发任意编辑器菜单（含工程内自定义菜单 = 任意项目代码执行）。
+ * 用户决策（2026-11-18）：能力与自由优先——探针侧永久封禁取消，改为由调用方在 allowDangerous 里
+ * 显式承担风险；DSH 侧仍默认拒绝，避免误用。
  *
  * unity.api.batch 与 api.invoke 等价（能触达私有成员，只是支持一次多条 + 共享 Undo 组），
  * 因此同样默认关闭；探针侧也把它放在需要授权快照的清单里，两侧必须一致。
@@ -31,10 +32,15 @@ export const DEFAULT_DANGEROUS = Object.freeze([
   'unity.asset.rename',
   'unity.asset.duplicate',
   'unity.importer.set',
+  'unity.menu.execute',
+  // 包管理会改写工程依赖并可能拉取远端包，默认关闭；build/bake 属常规编辑操作，默认开启。
+  'unity.package.add',
+  'unity.package.remove',
 ])
 
-/** 探针侧永久关闭的能力：即使 DSH 放行，探针也会拒绝。 */
-export const PROBE_BLOCKED = Object.freeze(['unity.menu.execute'])
+/** 探针侧永久关闭的能力：即使 DSH 放行，探针也会拒绝。
+ *  用户决策（2026-11-18）：能力与自由优先，当前为空；`unity.menu.execute` 已降级为可授权危险能力。 */
+export const PROBE_BLOCKED = Object.freeze([])
 
 export class PolicyError extends Error {
   constructor(code, message, detail) {

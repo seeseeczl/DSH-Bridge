@@ -31,9 +31,15 @@ test('危险能力清单覆盖所有等价执行面', () => {
   assert.equal(authorizeCapability('unity.api.invoke', { allowDangerous: ['unity.api.invoke'] }).ok, true)
 })
 
-test('探针永久关闭的能力不进入可授权清单', () => {
-  assert.ok(PROBE_BLOCKED.includes('unity.menu.execute'))
-  assert.equal(DEFAULT_DANGEROUS.includes('unity.menu.execute'), false, '永久关闭的能力不应暗示"开启后可用"')
+test('unity.menu.execute 已从探针永久封禁降级为可授权危险能力', () => {
+  assert.ok(DEFAULT_DANGEROUS.includes('unity.menu.execute'), 'menu.execute 必须默认关闭')
+  assert.equal(PROBE_BLOCKED.includes('unity.menu.execute'), false, '探针侧不再永久封禁')
+  assert.equal(authorizeCapability('unity.menu.execute').ok, false, '默认配置下必须拒绝')
+  assert.equal(
+    authorizeCapability('unity.menu.execute', { allowDangerous: ['unity.menu.execute'] }).ok,
+    true,
+    '显式 allowDangerous 后应放行',
+  )
 })
 
 test('危险能力清单只包含真实声明过的能力', () => {

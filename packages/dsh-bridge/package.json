@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-bridge",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "private": true,
   "description": "DSH-side bridge that discovers and controls local creative apps (Unity first) without MCP servers or listening ports.",
   "type": "module",

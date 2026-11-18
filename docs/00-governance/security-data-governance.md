@@ -39,9 +39,10 @@ evidence: []
 - 只写两类位置：`$HOME/.dsh/bridge/**`（由本插件独占）与用户显式安装的 `<project>/Packages/com.dsh.bridge/**`。
 - 危险能力清单（与 `packages/dsh-bridge/safety/policy.mjs` 的 `DEFAULT_DANGEROUS` 保持一致，AA-OPT-001）：
   `unity.reflect.invoke`、`unity.api.invoke`、`unity.api.members`、`unity.api.batch`、`unity.asset.refresh`、
-  `unity.asset.delete`、`unity.asset.move`、`unity.asset.rename`、`unity.asset.duplicate`、`unity.importer.set`；
-  **默认全部关闭**。
-- 探针永久关闭（`PROBE_BLOCKED`，任何配置都打不开）：`unity.menu.execute`。
+  `unity.asset.delete`、`unity.asset.move`、`unity.asset.rename`、`unity.asset.duplicate`、`unity.importer.set`、
+  `unity.menu.execute`、`unity.package.add`、`unity.package.remove`；**默认全部关闭**。
+- 探针永久关闭（`PROBE_BLOCKED`）：当前为空。用户决策（2026-11-18）：能力与自由优先，`unity.menu.execute`
+  从永久封禁降级为可授权危险能力，风险由调用方在 `allowDangerous` 中显式承担。
 - `unity.code.execute` 是**唯一默认开启**的高权能力（等价 MCP `execute_code`，ASE 编辑流程依赖它）。
   它的存在意味着「允许写代码」之后，硬拒绝清单不再构成边界：清单只剩防误用价值。
   需要收紧时把该能力名加入插件配置 `bridge.dangerous`（或 `DSH_BRIDGE_DANGEROUS`），它会重新变成需显式授权。

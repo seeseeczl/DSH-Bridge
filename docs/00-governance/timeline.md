@@ -79,3 +79,11 @@ evidence: []
 | 2026-11-17T10:50:00+08:00 | QA-0002 | 全量门禁通过：87 项测试、探针编译、文档一致性（24 回归+3 任务卡路径）、OpenSpec 状态、架构 strict、--check-release | lead |  | npm run verify |
 | 2026-11-18T14:20:00+08:00 | BUG-0001 | 定位并修复 instance.json 的 bootId 指向不存在通道目录：探针复用前校验目录齐全 + 心跳前自愈；DSH 侧新增 channel_missing 状态 | lead |  | `docs/03-quality/defect-0001-bootid-channel.md`, packages/dsh-bridge/transport/channel.mjs |
 | 2026-11-18T14:25:00+08:00 | REL-0002 | 发布 v0.0.5，探针 PROBE_VERSION 11→12；125 项测试全绿，架构 strict PASS | lead |  | docs/04-delivery/REL-0002.md |
+| 2026-11-18T22:35:00+08:00 | REAL-ENV-006 | 团结引擎 2022.3.62t7 隔离空工程真机验收：44 项能力 57/57 用例通过；同时暴露 3 处 DSH 工具面缺陷（dry-run 无损 JSON、knowledge_save 字段越界、knowledge_delete 静默不删） | lead |  | docs/03-quality/BUG-0002.md, /tmp/dsh-bridge-capability-report.json |
+| 2026-11-18T22:48:00+08:00 | BUG-0002 | 修复三处工具面契约：install dry-run 不再返回 undefined 字段；knowledge_save 只返回 schema 字段；removeTopic 按标题/slug 定位且不存在返回 false | lead |  | docs/03-quality/BUG-0002.md, tests/unit/tool-output.test.mjs, tests/unit/knowledge.test.mjs |
+| 2026-11-18T22:52:00+08:00 | REL-0003 | 发布 v0.0.6：134 项测试全绿（新增 9 项，其中 5 项修复前为红）；探针 PROBE_VERSION 保持 12 | lead |  | docs/04-delivery/REL-0003.md |
+| 2026-11-18T22:56:00+08:00 | 能力补全-1 | 探针 v13/v14：截图 `unity.screenshot.capture`（PNG 真机校验通过）+ 解禁 `unity.menu.execute`（降级为可授权危险能力）+ 脚本精细编辑（`get_sha`/`apply_edits`，7/7 真机通过） | lead |  | tests/unit/probe-source-shape.test.mjs |
+| 2026-11-18T23:06:00+08:00 | 能力补全-2 | 探针 v15-v17：生产管线（构建/包管理/烘焙）+ 长任务作业化（持久化、域重载标 interrupted）；真机 9/10 + 域重载专项通过 | lead |  | packages/dsh-bridge/adapters/unity/probe/DSHBridgeProbe.cs.tpl |
+| 2026-11-18T23:15:00+08:00 | 能力补全-3 | 探针 v18-v19：垂直域第一批（图形/Profiler/物理 8/8）与第二批（动画/粒子/UI/ProBuilder/Sprite/纹理 6/6）真机通过 | lead |  | docs/03-quality/regression-catalog.md |
+| 2026-11-18T23:22:00+08:00 | 能力补全-4 | 探针 v22：原生交互（窗口枚举/聚焦/输入注入）6/6 真机通过；能力面 44 → 74 项 | lead |  | docs/04-delivery/REL-0004.md |
+| 2026-11-18T23:30:00+08:00 | REL-0004 | 发布 v0.0.7：能力补全（FR-0014），138 项测试全绿 | lead |  | docs/04-delivery/REL-0004.md |

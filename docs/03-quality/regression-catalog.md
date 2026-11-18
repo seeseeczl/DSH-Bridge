@@ -31,7 +31,9 @@ evidence: [docs/adversarial-audits/2026-11-16-144546-audit-report.md, docs/adver
 | REG-LATENCY-001 | NFR-0002 | 100ms 轮询基准 | p95 < 500ms | `tests/perf/latency.test.mjs` |
 | REG-SAFETY-001 | NFR-0004 | 危险能力默认拒绝、路径越界 | 返回 `capability_disabled` / `path_escape` | `tests/unit/safety.test.mjs` |
 | REG-EXTEND-001 | FR-0007 | 加载 Blender 适配器 | 不改 core/transport/tools 即可被发现 | `tests/unit/safety.test.mjs` |
-| REG-SEC-001 | AA-SEC-001, AA-OPT-001, BUG-194223-P0 | 危险能力清单覆盖等价执行面 | 9 项危险能力默认拒绝；`unity.menu.execute` 永久关闭 | `tests/unit/authorization.test.mjs` |
+| REG-SEC-001 | AA-SEC-001, AA-OPT-001, BUG-194223-P0 | 危险能力清单覆盖等价执行面 | 10 项危险能力默认拒绝；`unity.menu.execute` 从永久封禁降级为可授权危险能力（默认仍拒绝） | `tests/unit/authorization.test.mjs` |
+| REG-MENU-001 | 能力补全第 7 项, FR-0008 | 菜单执行解禁后可授权执行 | 未授权默认拒绝；`allowDangerous` 放行后探针真实调用 `EditorApplication.ExecuteMenuItem` 并回传 `executed` | `tests/unit/authorization.test.mjs`、`tests/unity-probe/capability-semantics.test.mjs` |
+| REG-SHOT-001 | 能力补全第 1 项, FR-0008 | 截图能力落在工程内产物目录 | 探针声明并对 `unity.screenshot.capture` 生效；PNG 写入工程 Library 下的 artifacts 目录，返回路径/尺寸/字节数 | `tests/unit/probe-source-shape.test.mjs` |
 | REG-SEC-002 | AA-SEC-002, AA-SEC-003, AA-OPT-002/003, BUG-194223-P0, FR-0008 | 探针路径边界 | `asset.read`/`asset.create`/`importer.set` 越界返回 `path_escape`，工程外无文件 | `tests/unity-probe/capability-semantics.test.mjs` |
 | REG-SEC-003 | AA-OPT-001, AA-OPT-006, BUG-194223-P1, BUG-194223-P0, FR-0008, FR-0009, FR-0013 | 反射执行面与空引用 | 未授权 `capability_denied`；已授权也拒绝黑名单类型；空选择返回 `invalid_argument` | `tests/unity-probe/capability-semantics.test.mjs` |
 | REG-LIMIT-001 | AA-LIMIT-001, AA-OPT-011, BUG-194223-P2, BUG-194223-P0, FR-0008 | 长操作预算 | `search.content` 回传 budgetMs/truncated；编译中 `asset.refresh` 返回 `editor_busy` | `tests/unity-probe/capability-semantics.test.mjs` |
@@ -42,3 +44,11 @@ evidence: [docs/adversarial-audits/2026-11-16-144546-audit-report.md, docs/adver
 | REG-CHANNEL-001 | BUG-0001, FR-0001, FR-0013 | 心跳正常但 bootId 通道目录缺失 | `bridge_targets` 报 `channel_missing` 并列出缺失子目录；调用以 `channel_missing` 快速失败而非超时 | `tests/unit/channel-missing-detection.test.mjs` |
 | REG-CHANNEL-002 | BUG-0001, FR-0003 | 探针身份复用与目录自愈 | 目录不齐全时换新 bootId；心跳发布 `instance.json` 前重建目录；bootId 仅接受 16 位 hex | `tests/unit/probe-identity-invariant.test.mjs` |
 | REG-CHANNEL-003 | BUG-0001, AA-OBS-003 | 通道缺失的端到端可见性 | 目录被删后 `bridge_targets` 由 ready 转 `channel_missing`，调用拒绝并提示重装 | `tests/unit/observability.test.mjs` |
+| REG-TOOL-001 | BUG-0002, FR-0003, FR-0010 | DSH 工具输出契约 | `execute` 返回值是无损 JSON 且只含 output schema 声明字段（dry-run 不再带 `undefined`，save 不透传 `updated`） | `tests/unit/tool-output.test.mjs` |
+| REG-KNOWLEDGE-002 | BUG-0002, FR-0010 | 主题删除定位语义 | 主题原文（含全角括号）与 slug 均可删除；不存在返回 `removed: false`；路径逃逸仍拒绝 | `tests/unit/knowledge.test.mjs` |
+| REG-SCRIPT-001 | 能力补全第 2 项, FR-0008 | 脚本精细编辑 | `get_sha` 返回 64 位 sha256；`apply_edits` 按 1-based 行列 patch、支持 preconditionSha256 乐观锁、拒绝越界/重叠；原子落盘 | `tests/unit/probe-source-shape.test.mjs` |
+| REG-JOB-001 | 能力补全第 6 项 | 长任务作业化 | 作业持久化到工程 Library 下的 jobs 目录；`unity.job.list`、`unity.job.status`、`unity.job.cancel` 可用；域重载后运行中作业标 `interrupted`；不可取消作业返回 `cancelled:false` | `tests/unit/probe-source-shape.test.mjs` |
+| REG-PROD-001 | 能力补全第 3 项 | 生产管线 | `unity.build.start` 异步构建成功且产物路径真实存在；构建输出写进工程 Library 目录会被拒绝；`unity.package.list` 返回已注册包；`unity.bake.navmesh` 与 `unity.bake.lighting` 可执行 | `tests/unit/probe-source-shape.test.mjs` |
+| REG-NATIVE-001 | 能力补全第 5 项 | 原生交互（受管层） | `unity.window.list` 枚举编辑器窗口；`unity.window.focus` 聚焦窗口；`unity.input.send` 注入 key/mouse/scroll 事件；未知窗口/空事件被拒绝 | `tests/unit/probe-source-shape.test.mjs` |
+| REG-SHOT-002 | 能力补全第 1 项, FR-0014 | 截图序列（录屏帧序列） | `unity.screenshot.sequence` 按 count/interval 生成 N 帧 PNG 到 artifacts 序列目录并返回文件清单 | `tests/unit/probe-source-shape.test.mjs` |
+| REG-SCRIPT-002 | 能力补全第 2 项, FR-0014 | 脚本编译校验 | `unity.script.validate` 对合法脚本 valid=true，对语法错误脚本返回 errorCount>0 与逐条 diagnostics | `tests/unit/probe-source-shape.test.mjs` |

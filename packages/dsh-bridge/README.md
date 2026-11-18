@@ -37,7 +37,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 - 安装：写包 → 激活 → 等编译完成 → 恢复（实测 5～10 秒就绪）；
 - 调用：若实例在后台且心跳陈旧，先唤醒再发请求，完成后恢复。
 
-## Unity 能力（42 项）
+## Unity 能力（76 项）
 
 | 分组 | 能力 |
 | --- | --- |
@@ -51,7 +51,13 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 | 材质 | `unity.material.get/set` |
 | 资产 | `unity.asset.create/rename/move/delete/duplicate` |
 | 导入设置 | `unity.importer.get/set`（纹理/模型/音频） |
-| 编辑器 | `unity.menu.execute` `unity.playmode.set` `unity.asset.refresh` |
+| 视觉 | `unity.screenshot.capture`（GameView / SceneView / 指定相机 → PNG，落 `Library/DSHBridge/artifacts/`）；`unity.screenshot.sequence`（定间隔帧序列，录屏的帧序列等价物） |
+| 脚本编辑 | `unity.script.get_sha` `unity.script.apply_edits`（SHA 乐观锁 + 1-based 行列 patch）；`unity.script.validate`（mono-mcs 编译校验，逐条诊断） |
+| 生产管线 | `unity.build.start` `unity.bake.navmesh` `unity.bake.lighting` `unity.package.list`（`unity.package.add/remove` 默认关闭） |
+| 长任务作业 | `unity.job.list` `unity.job.status` `unity.job.cancel`（持久化到 `Library/DSHBridge/jobs/`，域重载后可查，未完成的标 `interrupted`） |
+| 垂直域 | `unity.graphics.quality/render_settings/stats` `unity.profiler.status/set` `unity.physics.settings/raycast` `unity.animation.info/set` `unity.vfx.particles/control` `unity.ui.canvases` `unity.probuilder.state` `unity.sprite.info` `unity.texture.generate` |
+| 原生交互 | `unity.window.list` `unity.window.focus` `unity.input.send`（受管层：编辑器窗口与输入注入；系统级模态对话框需 OS 自动化，不在纯 C# 探针范围） |
+| 编辑器 | `unity.menu.execute`（默认关闭，需 `allowDangerous`） `unity.playmode.set` `unity.asset.refresh` |
 
 `unity.api.invoke` 是覆盖长尾的兜底：给定句柄或类型名，可以调用任意方法/属性/字段；返回值会自动变成可复用的句柄。
 
@@ -78,7 +84,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
 - 传输基于文件轮询（约 80ms），单次调用延迟通常 100–300ms。
-- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与资产破坏性能力默认关闭；`unity.menu.execute` 永久关闭。
+- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）、`unity.menu.execute`、资产破坏性能力与包增删（`unity.package.add/remove`）默认关闭，需 `allowDangerous` 显式开启（用户决策：能力与自由优先，风险由调用方承担）。
 - 本机信任模型：同用户进程可读取通道身份文件；配对校验防的是跨用户与误投递，不是同用户恶意进程。
 
 ## 安全边界
@@ -88,8 +94,8 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 执行层（探针内，见 `DETAIL.md`）：
 
 - **路径边界**：`asset.read` / `asset.create` / `importer.*` / `asset.*` 的所有路径强制落在工程根之内，越界返回 `path_escape`，只受理文本类资产扩展名。
-- **能力闸门**：反射执行面需 `allowDangerous` 授权才会在探针里解锁；`unity.menu.execute` 永久关闭；未授权请求即使绕过 DSH 直写 inbox 也会被拒绝。
-- **成员黑名单**：即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `System.Diagnostics.Process` 等类型与 `ExecuteMenuItem` / `Exit` 等成员。
+- **能力闸门**：反射执行面与 `unity.menu.execute` 等危险能力默认拒绝，需 `allowDangerous` 授权才放行（用户决策：能力与自由优先，风险由调用方承担）；探针侧不再永久封禁任何能力。反射面的未授权请求即使绕过 DSH 直写 inbox 也会被拒绝。
+- **成员黑名单**：反射面（`api.invoke` / `reflect.invoke`）即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `System.Diagnostics.Process` 等类型与 `ExecuteMenuItem` / `Exit` 等成员——执行菜单请走 `unity.menu.execute` 能力本身。
 - **执行期超时可观测**：请求被取走后超时返回 `in_flight`（`retryable: false`），避免 Agent 把"可能已生效"当成"没发生"而重复执行。
 
 ## 配置
@@ -97,7 +103,7 @@ bridge_preinstall {"apply": true}          # 真正写入未运行的工程
 ```yaml
 config:
   auditPath: ~/.dsh/bridge/audit.log
-  allowDangerous: []          # 例如 [unity.reflect.invoke, unity.api.invoke]；unity.menu.execute 无法开启
+  allowDangerous: []          # 例如 [unity.reflect.invoke, unity.api.invoke, unity.menu.execute]
   preinstallAuto: false       # 启动时自动预植入
   preinstallRoots: []         # 省略则用常见工程位置
 ```

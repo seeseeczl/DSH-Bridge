@@ -64,18 +64,22 @@ export function createLifecycleTools(tool, bridge) {
         autoExclude: args.exclude !== false,
         autoActivate: args.activate !== false,
       })
-      return {
+      // 工具输出必须是无损 JSON：值为 undefined 的键会被 DSH 判为非法载荷
+      // （dry-run 分支没有 exclude/activation/ready），因此按需展开而不是赋 undefined。
+      const payload = {
         dryRun: Boolean(result.dryRun ?? args.dry_run),
         changed: Boolean(result.changed),
         reloadExpected: Boolean(result.reloadExpected),
         probeVersion: String(result.probeVersion ?? ''),
         files: result.files ?? [],
-        note: result.note,
-        location: result.location,
-        exclude: result.exclude ?? undefined,
-        activation: result.activation ?? undefined,
-        ready: result.ready ?? undefined,
       }
+      for (const key of [
+        'instanceId', 'sourceHash', 'grantedCapabilities', 'deniedCapabilities',
+        'note', 'location', 'exclude', 'activation', 'ready',
+      ]) {
+        if (result[key] !== undefined && result[key] !== null) payload[key] = result[key]
+      }
+      return payload
     },
     presentCall: (args) => ({ card: 'generic', title: `Install probe: ${args.instance_id}`, kind: 'other', rawInput: args }),
   })

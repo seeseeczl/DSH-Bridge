@@ -35,3 +35,50 @@ test('探针不引入监听端口或外部进程', () => {
   assert.equal(/Process\.Start\(/.test(source), false, '探针不得启动外部进程')
   assert.equal(/WebClient|HttpClient/.test(source), false, '探针不得访问网络')
 })
+
+// 能力补全第 1 项（视觉反馈）与第 7 项（菜单执行解禁）。
+test('探针包含截图能力且落在 Library 产物目录', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.match(source, /unity\.screenshot\.capture/, '必须声明截图能力')
+  assert.match(source, /ScreenshotCapture/, '必须有截图实现')
+  assert.match(source, /EncodeToPNG/, '必须真正编码 PNG')
+  assert.match(source, /artifacts/, '截图必须落在 Library/DSHBridge/artifacts')
+})
+
+test('菜单执行已从永久封禁解禁为可授权危险能力', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.equal(source.includes('unity.menu.execute 在探针侧永久关闭'), false, 'menu.execute 不应再被永久封禁')
+  assert.match(source, /static readonly string\[\] _blockedCapabilities = new string\[\] \{\s*\};/, '永久封禁清单应为空')
+  assert.match(source, /ExecuteMenuItem\(path\)/, '必须调用 EditorApplication.ExecuteMenuItem')
+})
+
+// 能力补全第 2 项（脚本精细编辑）。
+test('探针包含脚本精细编辑能力（SHA 前置校验 + 行列 patch）', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.match(source, /unity\.script\.get_sha/)
+  assert.match(source, /unity\.script\.apply_edits/)
+  assert.match(source, /precondition_failed/, '必须支持 preconditionSha256 失败')
+  assert.match(source, /edits_overlap/, '必须拒绝重叠编辑区间')
+})
+
+// 能力补全第 3/6 项（生产管线 + 长任务作业化）。
+test('探针包含生产管线与作业体系', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.match(source, /unity\.build\.start/)
+  assert.match(source, /unity\.job\.list/)
+  assert.match(source, /unity\.job\.cancel/)
+  assert.match(source, /unity\.package\.add/)
+  assert.match(source, /unity\.bake\.lighting/)
+  assert.match(source, /RecoverInterruptedJobs/, '域重载后必须恢复/标记作业')
+  assert.match(source, /interrupted/, '未完成作业必须显式标记 interrupted')
+  assert.match(source, /invalid_output_path/, '构建输出不得写进 Library')
+})
+
+// 能力补全补充：截图序列（录屏帧序列）与脚本编译校验。
+test('探针包含截图序列与脚本编译校验', async () => {
+  const source = await readFile(PROBE_TEMPLATE_PATH, 'utf8')
+  assert.match(source, /unity\.screenshot\.sequence/)
+  assert.match(source, /unity\.script\.validate/)
+  assert.match(source, /ValidateCode/)
+  assert.match(source, /CompileAssemblyFromSource/)
+})

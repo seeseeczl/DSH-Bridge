@@ -38,10 +38,11 @@ namespace DSHBridge
         static readonly string[] _reflectCapabilities = new string[] {
             "unity.reflect.invoke", "unity.api.invoke", "unity.api.members", "unity.api.batch"
         };
-        // 永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
-        static readonly string[] _blockedCapabilities = new string[] {
-            "unity.menu.execute"
-        };
+        // 探针侧永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
+        // 用户决策（2026-11-18）：能力与自由优先，unity.menu.execute 从永久封禁降级为
+        // 「可授权的危险能力」——默认在 DSH 侧拒绝（DEFAULT_DANGEROUS），显式 allowDangerous 后放行。
+        // 保留该数组，为将来确实需要永久封禁的能力留统一落点。
+        static readonly string[] _blockedCapabilities = new string[] { };
         // 授权快照：安装探针时由 DSH 侧把 allowDangerous 的内容渲染进源码（见 probe.template.mjs）。
         // 之所以写进源码而不是读配置文件，是为了让「授权」必须经过一次显式安装/重装，
         // 运行期无法通过写 Library 下的文件自行提权。
@@ -99,6 +100,29 @@ namespace DSHBridge
             "unity.prefab.open", "unity.prefab.save", "unity.prefab.close", "unity.material.get",
             "unity.material.set", "unity.asset.rename", "unity.asset.move", "unity.asset.delete",
             "unity.asset.duplicate",
+            // 视觉反馈（能力补全第 1 项）：截图落到 Library/DSHBridge/artifacts/，不进 Assets、不进版本库。
+            "unity.screenshot.capture",
+            // 脚本精细编辑（能力补全第 2 项）：SHA 前置校验 + 行列级 patch。
+            "unity.script.get_sha", "unity.script.apply_edits",
+            // 生产管线与长任务作业（能力补全第 3/6 项）：构建 / 包管理 / 烘焙 / 作业查询取消。
+            "unity.job.list", "unity.job.status", "unity.job.cancel",
+            "unity.build.start",
+            "unity.package.list", "unity.package.add", "unity.package.remove",
+            "unity.bake.navmesh", "unity.bake.lighting",
+            // 垂直域第一批（能力补全第 4 项）：图形 / Profiler / 物理。
+            "unity.graphics.quality", "unity.graphics.render_settings", "unity.graphics.stats",
+            "unity.profiler.status", "unity.profiler.set",
+            "unity.physics.settings", "unity.physics.raycast",
+            // 垂直域第二批（能力补全第 4 项）：动画 / 粒子 / UI / ProBuilder / Sprite / 纹理生成。
+            "unity.animation.info", "unity.animation.set",
+            "unity.vfx.particles", "unity.vfx.control",
+            "unity.ui.canvases",
+            "unity.probuilder.state",
+            "unity.sprite.info", "unity.texture.generate",
+            // 原生交互（能力补全第 5 项）：窗口枚举/聚焦 + 受管输入注入。
+            "unity.window.list", "unity.window.focus", "unity.input.send",
+            // 补充：截图序列（录屏帧序列）与脚本编译校验。
+            "unity.screenshot.sequence", "unity.script.validate",
             // 通用反射执行面扩展：批量事务与进程内代码执行（等价 MCP execute_code）。
             "unity.api.batch", "unity.code.execute"
         };
@@ -140,6 +164,8 @@ namespace DSHBridge
 
             // 先补写「上次被打断」的响应，再开始心跳，避免调用方在窗口期内看不到结论。
             RecoverInterruptedRequests();
+            // 作业体系：把上次域重载遗留的 running/pending 作业标记为 interrupted。
+            RecoverInterruptedJobs();
 
             WriteHeartbeat();
 
@@ -295,6 +321,7 @@ namespace DSHBridge
                     _nextOutboxSweep = now + OutboxSweepInterval;
                     SweepStaleOutbox();
                 }
+                JobTick();
                 if (_scanning || now < _nextScan) return;
                 _nextScan = now + ScanInterval;
                 Poll();
@@ -668,7 +695,7 @@ namespace DSHBridge
             for (var i = 0; i < _blockedCapabilities.Length; i++)
             {
                 if (_blockedCapabilities[i] != cap) continue;
-                throw new KnownError("capability_denied", "能力 " + cap + " 在探针侧永久关闭（菜单执行等同任意编辑器操作）");
+                throw new KnownError("capability_denied", "能力 " + cap + " 在探针侧永久关闭（该能力被永久封禁，任何配置都无法开启）");
             }
             for (var i = 0; i < _reflectCapabilities.Length; i++)
             {
@@ -860,6 +887,38 @@ namespace DSHBridge
             if (cap == "unity.hierarchy.list") return HierarchyList(args);
             if (cap == "unity.asset.find") return AssetFind(args);
             if (cap == "unity.menu.execute") return MenuExecute(args);
+            if (cap == "unity.screenshot.capture") return ScreenshotCapture(args);
+            if (cap == "unity.script.get_sha") return ScriptGetSha(args);
+            if (cap == "unity.script.apply_edits") return ScriptApplyEdits(args);
+            if (cap == "unity.job.list") return JobList(args);
+            if (cap == "unity.job.status") return JobStatus(args);
+            if (cap == "unity.job.cancel") return JobCancel(args);
+            if (cap == "unity.build.start") return BuildStart(args);
+            if (cap == "unity.package.list") return PackageList(args);
+            if (cap == "unity.package.add") return PackageAdd(args);
+            if (cap == "unity.package.remove") return PackageRemove(args);
+            if (cap == "unity.bake.navmesh") return BakeNavmesh(args);
+            if (cap == "unity.bake.lighting") return BakeLighting(args);
+            if (cap == "unity.graphics.quality") return GraphicsQuality(args);
+            if (cap == "unity.graphics.render_settings") return GraphicsRenderSettings(args);
+            if (cap == "unity.graphics.stats") return GraphicsStats(args);
+            if (cap == "unity.profiler.status") return ProfilerStatus(args);
+            if (cap == "unity.profiler.set") return ProfilerSet(args);
+            if (cap == "unity.physics.settings") return PhysicsSettings(args);
+            if (cap == "unity.physics.raycast") return PhysicsRaycast(args);
+            if (cap == "unity.animation.info") return AnimationInfo(args);
+            if (cap == "unity.animation.set") return AnimationSet(args);
+            if (cap == "unity.vfx.particles") return VfxParticles(args);
+            if (cap == "unity.vfx.control") return VfxControl(args);
+            if (cap == "unity.ui.canvases") return UiCanvases(args);
+            if (cap == "unity.probuilder.state") return ProBuilderState(args);
+            if (cap == "unity.sprite.info") return SpriteInfo(args);
+            if (cap == "unity.texture.generate") return TextureGenerate(args);
+            if (cap == "unity.window.list") return WindowList(args);
+            if (cap == "unity.window.focus") return WindowFocus(args);
+            if (cap == "unity.input.send") return InputSend(args);
+            if (cap == "unity.screenshot.sequence") return ScreenshotSequence(args);
+            if (cap == "unity.script.validate") return ScriptValidate(args);
             if (cap == "unity.playmode.set") return PlaymodeSet(args);
             if (cap == "unity.asset.refresh") return AssetRefresh(args);
             if (cap == "unity.reflect.invoke") return ReflectInvoke(args);
@@ -2104,17 +2163,1416 @@ namespace DSHBridge
 
         static Dictionary<string, object> MenuExecute(Dictionary<string, object> args)
         {
-            // 双保险：即使 EnsureCapabilityAllowed 被改坏，这里也不会执行任意菜单项。
-            throw new KnownError("capability_denied", "unity.menu.execute 在探针侧永久关闭");
-#pragma warning disable CS0162
+            // 危险能力：DSH 侧默认拒绝（DEFAULT_DANGEROUS），显式 allowDangerous 后才下发。
+            // 探针侧不再永久封禁（用户决策 2026-11-18：能力优先，风险由调用方/用户承担）。
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var ok = EditorApplication.ExecuteMenuItem(path);
             if (!ok) throw new KnownError("menu_not_found", "菜单不存在或不可执行: " + path);
             var d = new Dictionary<string, object>();
             d["executed"] = path;
+            d["path"] = path;
             return d;
-#pragma warning restore CS0162
+        }
+
+        // ===== 视觉反馈：截图（能力补全第 1 项）=====
+        // 把 GameView / SceneView / 指定相机渲染成 PNG，落在 <工程>/Library/DSHBridge/artifacts/，
+        // 不进 Assets、不进版本库，返回相对/绝对路径、尺寸与字节数，供 Agent 直接读图做自验收。
+        // 参数：target=game|scene|camera（默认 game）；camera/handle（target=camera 时）；
+        //       width/height（默认 1280x720，上限 8192）。
+        static Dictionary<string, object> ScreenshotCapture(Dictionary<string, object> args)
+        {
+            var target = GetString(args, "target") ?? "game";
+            target = target.ToLowerInvariant();
+            var width = (int)Math.Max(1, Math.Min(8192, ToLong(args, "width", 1280)));
+            var height = (int)Math.Max(1, Math.Min(8192, ToLong(args, "height", 720)));
+            Camera cam = null;
+            if (target == "scene")
+            {
+                var sceneView = UnityEditor.SceneView.lastActiveSceneView;
+                if (sceneView == null || sceneView.camera == null) throw new KnownError("no_scene_view", "当前没有活动的 Scene View");
+                cam = sceneView.camera;
+            }
+            else if (target == "camera")
+            {
+                var handle = GetString(args, "handle");
+                var wanted = GetString(args, "camera");
+                if (!string.IsNullOrEmpty(handle))
+                {
+                    cam = GetHandle(handle) as Camera;
+                    if (cam == null) throw new KnownError("invalid_handle", "句柄不是相机: " + handle);
+                }
+                else if (!string.IsNullOrEmpty(wanted))
+                {
+                    var cameras = Camera.allCameras;
+                    for (var i = 0; i < cameras.Length; i++)
+                    {
+                        if (cameras[i].name == wanted) { cam = cameras[i]; break; }
+                    }
+                    if (cam == null) throw new KnownError("camera_not_found", "找不到相机: " + wanted);
+                }
+                else throw new KnownError("invalid_argument", "target=camera 需要 camera 或 handle 参数");
+            }
+            else if (target == "game" || target == "main")
+            {
+                cam = Camera.main;
+                if (cam == null)
+                {
+                    var cameras = Camera.allCameras;
+                    if (cameras.Length > 0) cam = cameras[0];
+                }
+                if (cam == null) throw new KnownError("no_camera", "工程里没有可用相机（GameView/MainCamera）");
+            }
+            else throw new KnownError("invalid_argument", "未知 target: " + target + "（game/scene/camera）");
+
+            var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+            var previousTarget = cam.targetTexture;
+            var previousActive = RenderTexture.active;
+            Texture2D tex = null;
+            try
+            {
+                cam.targetTexture = rt;
+                cam.Render();
+                RenderTexture.active = rt;
+                tex = new Texture2D(width, height, TextureFormat.RGB24, false);
+                tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                tex.Apply();
+                var png = tex.EncodeToPNG();
+                var dir = System.IO.Path.Combine(_projectRoot, "Library", "DSHBridge", "artifacts");
+                System.IO.Directory.CreateDirectory(dir);
+                var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture);
+                var file = System.IO.Path.Combine(dir, "screenshot-" + target + "-" + stamp + ".png");
+                System.IO.File.WriteAllBytes(file, png);
+                var d = new Dictionary<string, object>();
+                d["path"] = "Library/DSHBridge/artifacts/" + System.IO.Path.GetFileName(file);
+                d["absolutePath"] = file;
+                d["target"] = target;
+                d["camera"] = cam.name;
+                d["width"] = (long)width;
+                d["height"] = (long)height;
+                d["bytes"] = (long)png.Length;
+                d["format"] = "png";
+                d["capturedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                return d;
+            }
+            finally
+            {
+                cam.targetTexture = previousTarget;
+                RenderTexture.active = previousActive;
+                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                RenderTexture.ReleaseTemporary(rt);
+            }
+        }
+
+        // ===== 脚本精细编辑（能力补全第 2 项）=====
+        // MCP `get_sha` + `apply_text_edits` 的等价实现：按 1-based 行列做精确 patch，
+        // 支持 preconditionSha256 乐观锁（文件被外部改动时拒绝覆盖），原子落盘并按需触发编译。
+        static string Sha256HexBytes(byte[] raw)
+        {
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var bytes = sha.ComputeHash(raw ?? new byte[0]);
+                    var builder = new StringBuilder();
+                    for (var i = 0; i < bytes.Length; i++) builder.Append(bytes[i].ToString("x2"));
+                    return builder.ToString();
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        static Dictionary<string, object> ScriptGetSha(Dictionary<string, object> args)
+        {
+            var path = GetString(args, "path");
+            if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            var full = ResolveProjectPath(path, "path");
+            EnsureTextable(full, "path");
+            if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
+            var bytes = System.IO.File.ReadAllBytes(full);
+            var d = new Dictionary<string, object>();
+            d["path"] = ToProjectRelative(full);
+            d["sha256"] = Sha256HexBytes(bytes);
+            d["bytes"] = (long)bytes.Length;
+            return d;
+        }
+
+        static Dictionary<string, object> ScriptApplyEdits(Dictionary<string, object> args)
+        {
+            var path = GetString(args, "path");
+            if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            var full = ResolveProjectPath(path, "path");
+            EnsureTextable(full, "path");
+            if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
+            var originalBytes = System.IO.File.ReadAllBytes(full);
+            var shaBefore = Sha256HexBytes(originalBytes);
+            var precondition = GetString(args, "preconditionSha256");
+            if (!string.IsNullOrEmpty(precondition) && !string.Equals(precondition, shaBefore, StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("precondition_failed", "文件已变化：preconditionSha256 与当前内容不匹配", "expected=" + precondition + ", actual=" + shaBefore);
+            var edits = AsObjectList(args, "edits");
+            if (edits.Count == 0) throw new KnownError("invalid_argument", "edits 不能为空");
+
+            var original = System.IO.File.ReadAllText(full);
+            var newline = original.Contains("\r\n") ? "\r\n" : "\n";
+            var lines = original.Replace("\r\n", "\n").Split('\n');
+            var starts = new List<int>();
+            starts.Add(0);
+            for (var i = 0; i < lines.Length; i++) starts.Add(starts[i] + lines[i].Length + 1);
+            var parsed = new List<Dictionary<string, object>>();
+            for (var i = 0; i < edits.Count; i++)
+            {
+                var raw = edits[i] as Dictionary<string, object>;
+                if (raw == null) throw new KnownError("invalid_argument", "edits[" + i + "] 不是对象");
+                var startLine = (int)ToLong(raw, "startLine", 1);
+                var startColumn = (int)ToLong(raw, "startColumn", 1);
+                var endLine = (int)ToLong(raw, "endLine", startLine);
+                var endColumn = (int)ToLong(raw, "endColumn", startColumn);
+                var text = raw.ContainsKey("text") ? (raw["text"] as string ?? string.Empty) : string.Empty;
+                if (startLine < 1 || startLine > lines.Length) throw new KnownError("edit_out_of_range", "edits[" + i + "] startLine 越界: " + startLine);
+                if (endLine < startLine || endLine > lines.Length) throw new KnownError("edit_out_of_range", "edits[" + i + "] endLine 越界: " + endLine);
+                if (startColumn < 1 || startColumn > lines[startLine - 1].Length + 1) throw new KnownError("edit_out_of_range", "edits[" + i + "] startColumn 越界: " + startColumn);
+                if (endColumn < 1 || endColumn > lines[endLine - 1].Length + 1) throw new KnownError("edit_out_of_range", "edits[" + i + "] endColumn 越界: " + endColumn);
+                if (endLine == startLine && endColumn < startColumn) throw new KnownError("invalid_argument", "edits[" + i + "] 结束列早于开始列");
+                var e = new Dictionary<string, object>();
+                e["startLine"] = (long)startLine; e["startColumn"] = (long)startColumn;
+                e["endLine"] = (long)endLine; e["endColumn"] = (long)endColumn;
+                e["text"] = text;
+                parsed.Add(e);
+            }
+            // 按起点排序（手写插入排序，避免依赖 LINQ 比较器在旧 Mono 上的行为差异）。
+            for (var i = 1; i < parsed.Count; i++)
+            {
+                var current = parsed[i];
+                var j = i - 1;
+                while (j >= 0 && ((long)parsed[j]["startLine"] > (long)current["startLine"]
+                    || ((long)parsed[j]["startLine"] == (long)current["startLine"] && (long)parsed[j]["startColumn"] > (long)current["startColumn"])))
+                {
+                    parsed[j + 1] = parsed[j];
+                    j--;
+                }
+                parsed[j + 1] = current;
+            }
+            // 计算偏移并检查重叠（后一条的起点不得早于前一条的终点）。
+            var ops = new List<long[]>();
+            for (var i = 0; i < parsed.Count; i++)
+            {
+                var e = parsed[i];
+                var startOffset = (long)starts[(int)(long)e["startLine"] - 1] + (long)(long)e["startColumn"] - 1;
+                var endOffset = (long)starts[(int)(long)e["endLine"] - 1] + (long)(long)e["endColumn"] - 1;
+                if (i > 0 && startOffset < ops[i - 1][1]) throw new KnownError("edits_overlap", "edits 区间重叠（第 " + i + " 条）");
+                ops.Add(new[] { startOffset, endOffset });
+            }
+            var builder = new StringBuilder(original.Replace("\r\n", "\n"));
+            for (var i = parsed.Count - 1; i >= 0; i--)
+            {
+                var startOffset = (int)ops[i][0];
+                var endOffset = (int)ops[i][1];
+                builder.Remove(startOffset, endOffset - startOffset);
+                builder.Insert(startOffset, (string)parsed[i]["text"]);
+            }
+            var updated = builder.ToString();
+            if (newline == "\r\n") updated = updated.Replace("\n", "\r\n");
+
+            // 原子写：先写临时文件再替换，避免半截文件被编辑器编译到。
+            var tmp = full + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                System.IO.File.WriteAllText(tmp, updated, new System.Text.UTF8Encoding(false));
+                System.IO.File.Replace(tmp, full, null);
+            }
+            finally
+            {
+                if (System.IO.File.Exists(tmp)) System.IO.File.Delete(tmp);
+            }
+            var shaAfter = Sha256HexBytes(System.IO.File.ReadAllBytes(full));
+            var refresh = args.ContainsKey("refresh") ? ToBool(args, "refresh") : true;
+            if (refresh) AssetDatabase.Refresh();
+            var d = new Dictionary<string, object>();
+            d["path"] = ToProjectRelative(full);
+            d["applied"] = (long)parsed.Count;
+            d["sha256Before"] = shaBefore;
+            d["sha256After"] = shaAfter;
+            d["bytesBefore"] = (long)originalBytes.Length;
+            d["bytesAfter"] = (long)System.IO.File.ReadAllBytes(full).Length;
+            d["refreshed"] = refresh;
+            return d;
+        }
+
+        // ===== 截图序列（录屏的帧序列等价物，能力补全第 1 项补充）=====
+        // 纯 C# 探针无法编码视频；这里按固定间隔截 N 帧 PNG 到工程内目录，供 DSH 侧合成/查看。
+        // 注意：循环在主线程同步执行（Sleep 会短暂阻塞编辑器），count/intervalMs 已做上限约束。
+        static Dictionary<string, object> ScreenshotSequence(Dictionary<string, object> args)
+        {
+            var target = (GetString(args, "target") ?? "game").ToLowerInvariant();
+            var width = (int)Math.Max(1, Math.Min(8192, ToLong(args, "width", 640)));
+            var height = (int)Math.Max(1, Math.Min(8192, ToLong(args, "height", 360)));
+            var count = (int)Math.Max(1, Math.Min(600, ToLong(args, "count", 10)));
+            var intervalMs = (int)Math.Max(0, Math.Min(10000, ToLong(args, "intervalMs", 200)));
+            var name = GetString(args, "dir");
+            var safeName = "";
+            if (!string.IsNullOrEmpty(name))
+            {
+                for (var i = 0; i < name.Length; i++)
+                {
+                    var c = name[i];
+                    if (char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == '.') safeName += c;
+                }
+                if (safeName.Length == 0) throw new KnownError("invalid_argument", "dir 名称不合法（只允许字母数字 - _ .）");
+            }
+            var dirName = "sequence-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture)
+                + (safeName.Length > 0 ? "-" + safeName : "");
+            var dir = System.IO.Path.Combine(_projectRoot, "Library", "DSHBridge", "artifacts", dirName);
+            Directory.CreateDirectory(dir);
+            Camera cam;
+            if (target == "scene")
+            {
+                var sceneView = UnityEditor.SceneView.lastActiveSceneView;
+                if (sceneView == null || sceneView.camera == null) throw new KnownError("no_scene_view", "当前没有活动的 Scene View");
+                cam = sceneView.camera;
+            }
+            else if (target == "game" || target == "main")
+            {
+                cam = Camera.main;
+                if (cam == null)
+                {
+                    var cameras = Camera.allCameras;
+                    if (cameras.Length > 0) cam = cameras[0];
+                }
+                if (cam == null) throw new KnownError("no_camera", "工程里没有可用相机（GameView/MainCamera）");
+            }
+            else throw new KnownError("invalid_argument", "sequence 只支持 target=game|scene");
+            var frames = new List<object>();
+            var clock = Stopwatch.StartNew();
+            for (var index = 0; index < count; index++)
+            {
+                var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                var previousTarget = cam.targetTexture;
+                var previousActive = RenderTexture.active;
+                Texture2D tex = null;
+                try
+                {
+                    cam.targetTexture = rt;
+                    cam.Render();
+                    RenderTexture.active = rt;
+                    tex = new Texture2D(width, height, TextureFormat.RGB24, false);
+                    tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                    tex.Apply();
+                    var png = tex.EncodeToPNG();
+                    var frameName = "frame-" + index.ToString("D4", CultureInfo.InvariantCulture) + ".png";
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(dir, frameName), png);
+                    frames.Add("Library/DSHBridge/artifacts/" + dirName + "/" + frameName);
+                    if (intervalMs > 0 && index < count - 1) System.Threading.Thread.Sleep(intervalMs);
+                }
+                finally
+                {
+                    cam.targetTexture = previousTarget;
+                    RenderTexture.active = previousActive;
+                    if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                    RenderTexture.ReleaseTemporary(rt);
+                }
+            }
+            clock.Stop();
+            var d = new Dictionary<string, object>();
+            d["dir"] = "Library/DSHBridge/artifacts/" + dirName;
+            d["frames"] = frames;
+            d["count"] = (long)frames.Count;
+            d["width"] = (long)width;
+            d["height"] = (long)height;
+            d["target"] = target;
+            d["camera"] = cam.name;
+            d["elapsedMs"] = clock.ElapsedMilliseconds;
+            d["blocking"] = true;
+            return d;
+        }
+
+        // ===== 脚本编译校验（能力补全第 2 项补充，等价 MCP validate_script）=====
+        // 复用 code.execute 的 mono-mcs 进程内编译链路：只编译、不执行，返回逐条诊断。
+        static Dictionary<string, object> ScriptValidate(Dictionary<string, object> args)
+        {
+            var path = GetString(args, "path");
+            if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            var full = ResolveProjectPath(path, "path");
+            EnsureTextable(full, "path");
+            if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
+            var code = System.IO.File.ReadAllText(full);
+            return ValidateCode(code, ToProjectRelative(full));
+        }
+
+        static Dictionary<string, object> ValidateCode(string code, string displayPath)
+        {
+            EnsureMonoCompiler();
+            var clock = Stopwatch.StartNew();
+            bool referencesCached;
+            long referencesBuildMs;
+            var references = CollectReferencesForMonoCompiler(out referencesCached, out referencesBuildMs);
+            var parameters = Activator.CreateInstance(_tCompilerParameters);
+            SetProperty(parameters, "GenerateInMemory", true);
+            SetProperty(parameters, "GenerateExecutable", false);
+            SetProperty(parameters, "TreatWarningsAsErrors", false);
+            var facadesNetStandard = Path.Combine(
+                Path.GetDirectoryName(RoslynDirectory()), "4.7.1-api", "Facades", "netstandard.dll");
+            var hasFacadesNetStandard = File.Exists(facadesNetStandard);
+            var effectiveReferences = new List<string>();
+            var seenEffective = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var reference in references)
+            {
+                var normalized = reference.Replace('\\', '/');
+                if (normalized.IndexOf("/NetStandard/compat/", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                var fileName = Path.GetFileName(reference);
+                if (hasFacadesNetStandard && string.Equals(fileName, "netstandard.dll", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (seenEffective.Add(facadesNetStandard)) effectiveReferences.Add(facadesNetStandard);
+                    continue;
+                }
+                if (seenEffective.Add(reference)) effectiveReferences.Add(reference);
+            }
+            // 工程脚本通常带 UNITY_EDITOR 条件编译：不定义会让 Editor-only using 全部误报。
+            SetProperty(parameters, "CompilerOptions",
+                "-nowarn:1685 -nowarn:1701 -nowarn:1702 -nostdlib -define:UNITY_EDITOR;UNITY_2022_3_OR_NEWER");
+            var referenced = GetProperty(parameters, "ReferencedAssemblies");
+            var addReference = referenced == null ? null : FindMethod(referenced.GetType(), "Add", delegate (ParameterInfo[] ps) { return ps.Length == 1 && ps[0].ParameterType == typeof(string); });
+            if (addReference != null)
+            {
+                foreach (var reference in effectiveReferences)
+                {
+                    try { addReference.Invoke(referenced, new object[] { reference }); } catch (Exception) { }
+                }
+            }
+            var provider = Activator.CreateInstance(_tCodeProvider);
+            var compile = FindMethod(_tCodeProvider, "CompileAssemblyFromSource", delegate (ParameterInfo[] ps)
+            {
+                return ps.Length == 2 && ps[0].ParameterType.Name == "CompilerParameters" && ps[1].ParameterType == typeof(string[]);
+            });
+            if (compile == null) throw new KnownError("code_execute_unavailable", "当前运行时不支持 C# 编译校验");
+            var results = compile.Invoke(provider, new object[] { parameters, new string[] { code } });
+            var errors = GetProperty(results, "Errors");
+            var diagnostics = new List<object>();
+            var errorCount = 0;
+            var warningCount = 0;
+            var errorCollection = errors as IEnumerable;
+            if (errorCollection != null)
+            {
+                foreach (var item in errorCollection)
+                {
+                    if (item == null) continue;
+                    var warning = GetProperty(item, "IsWarning");
+                    var isWarning = warning is bool && (bool)warning;
+                    var row = new Dictionary<string, object>();
+                    row["id"] = System.Convert.ToString(GetProperty(item, "ErrorNumber"), CultureInfo.InvariantCulture);
+                    row["message"] = System.Convert.ToString(GetProperty(item, "ErrorText"), CultureInfo.InvariantCulture) ?? string.Empty;
+                    row["line"] = System.Convert.ToInt64(GetProperty(item, "Line") ?? 0L, CultureInfo.InvariantCulture);
+                    row["column"] = System.Convert.ToInt64(GetProperty(item, "Column") ?? 0L, CultureInfo.InvariantCulture);
+                    row["severity"] = isWarning ? "warning" : "error";
+                    diagnostics.Add(row);
+                    if (isWarning) warningCount += 1; else errorCount += 1;
+                    if (diagnostics.Count >= 200) break;
+                }
+            }
+            clock.Stop();
+            var d = new Dictionary<string, object>();
+            d["path"] = displayPath;
+            d["valid"] = errorCount == 0;
+            d["errorCount"] = (long)errorCount;
+            d["warningCount"] = (long)warningCount;
+            d["diagnostics"] = diagnostics;
+            d["backend"] = "mono-mcs";
+            d["elapsedMs"] = clock.ElapsedMilliseconds;
+            d["referencesCached"] = referencesCached;
+            d["referencesBuildMs"] = referencesBuildMs;
+            return d;
+        }
+
+        // ===== 长任务作业体系（能力补全第 6 项）=====
+        // 作业记录持久化到 Library/DSHBridge/jobs/<id>.json：域重载/重启后仍可查询，
+        // 运行中的作业被标记为 interrupted（编辑器主线程任务随域重载丢失，不能假装还在跑）。
+        static readonly Dictionary<string, Dictionary<string, object>> _jobs = new Dictionary<string, Dictionary<string, object>>();
+        static readonly List<JobRunner> _jobRunners = new List<JobRunner>();
+
+        class JobRunner
+        {
+            public Dictionary<string, object> Job;
+            public Func<bool> Advance;
+        }
+
+        static string JobsDir()
+        {
+            return Path.Combine(_rootDir, "jobs");
+        }
+
+        static string JobFile(string id)
+        {
+            return Path.Combine(JobsDir(), id + ".json");
+        }
+
+        static void PersistJob(Dictionary<string, object> job)
+        {
+            try
+            {
+                Directory.CreateDirectory(JobsDir());
+                File.WriteAllText(JobFile(GetString(job, "id")), MiniJson.Serialize(job), new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+        }
+
+        static Dictionary<string, object> FindJob(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId)) return null;
+            Dictionary<string, object> job;
+            if (_jobs.TryGetValue(jobId, out job)) return job;
+            var file = JobFile(jobId);
+            if (!File.Exists(file)) return null;
+            try
+            {
+                var parsed = MiniJson.Parse(File.ReadAllText(file)) as Dictionary<string, object>;
+                if (parsed != null) _jobs[jobId] = parsed;
+                return parsed;
+            }
+            catch (Exception) { return null; }
+        }
+
+        static Dictionary<string, object> CreateJob(string kind, string label, bool cancelable)
+        {
+            var job = new Dictionary<string, object>();
+            job["id"] = "job-" + Guid.NewGuid().ToString("N").Substring(0, 16);
+            job["kind"] = kind;
+            job["label"] = label ?? kind;
+            job["status"] = "pending";
+            job["cancelable"] = cancelable;
+            job["startedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            job["progress"] = 0L;
+            _jobs[(string)job["id"]] = job;
+            PersistJob(job);
+            return job;
+        }
+
+        static void CompleteJob(Dictionary<string, object> job, Dictionary<string, object> result)
+        {
+            job["status"] = "done";
+            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            job["progress"] = 1L;
+            job["result"] = result;
+            PersistJob(job);
+        }
+
+        static void FailJob(Dictionary<string, object> job, Exception error)
+        {
+            job["status"] = "failed";
+            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            job["error"] = error == null ? "unknown error" : (error.GetType().Name + ": " + error.Message);
+            PersistJob(job);
+        }
+
+        static void RecoverInterruptedJobs()
+        {
+            try
+            {
+                var dir = JobsDir();
+                if (!Directory.Exists(dir)) return;
+                var files = Directory.GetFiles(dir, "*.json");
+                for (var i = 0; i < files.Length; i++)
+                {
+                    try
+                    {
+                        var job = MiniJson.Parse(File.ReadAllText(files[i])) as Dictionary<string, object>;
+                        if (job == null) continue;
+                        var status = GetString(job, "status");
+                        if (status == "pending" || status == "running")
+                        {
+                            job["status"] = "interrupted";
+                            job["error"] = "编辑器域重载或重启，长任务未执行完";
+                            job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                            File.WriteAllText(files[i], MiniJson.Serialize(job), new UTF8Encoding(false));
+                        }
+                        _jobs[GetString(job, "id")] = job;
+                    }
+                    catch (Exception) { }
+                }
+            }
+            catch (Exception) { }
+        }
+
+        static bool ToBoolValue(object value)
+        {
+            if (value == null) return false;
+            if (value is bool) return (bool)value;
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture);
+            bool parsed;
+            return bool.TryParse(text, out parsed) && parsed;
+        }
+
+        static void JobTick()
+        {
+            if (_jobRunners.Count == 0) return;
+            for (var i = _jobRunners.Count - 1; i >= 0; i--)
+            {
+                var runner = _jobRunners[i];
+                var job = runner.Job;
+                if (job.ContainsKey("cancelRequested"))
+                {
+                    try { if (Lightmapping.isRunning) Lightmapping.Cancel(); } catch (Exception) { }
+                    job["status"] = "cancelled";
+                    job["finishedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+                    PersistJob(job);
+                    _jobRunners.RemoveAt(i);
+                    continue;
+                }
+                try
+                {
+                    job["status"] = "running";
+                    if (runner.Advance()) _jobRunners.RemoveAt(i);
+                }
+                catch (Exception error)
+                {
+                    FailJob(job, error);
+                    _jobRunners.RemoveAt(i);
+                }
+            }
+        }
+
+        static void QueueJob(Dictionary<string, object> job, Func<bool> advance)
+        {
+            var runner = new JobRunner();
+            runner.Job = job;
+            runner.Advance = advance;
+            _jobRunners.Add(runner);
+        }
+
+        /**
+         * 作业视图。cancelable/progress 在 domain reload 后可能缺字段（旧文件），
+         * 一律用 ContainsKey 兜底，避免序列化差异导致 NRE。
+         */
+        static Dictionary<string, object> JobSummary(Dictionary<string, object> job)
+        {
+            var d = new Dictionary<string, object>();
+            d["id"] = job.ContainsKey("id") ? job["id"] : null;
+            d["kind"] = job.ContainsKey("kind") ? job["kind"] : null;
+            d["label"] = job.ContainsKey("label") ? job["label"] : null;
+            d["status"] = job.ContainsKey("status") ? job["status"] : null;
+            d["progress"] = job.ContainsKey("progress") ? job["progress"] : (object)0L;
+            d["startedAt"] = job.ContainsKey("startedAt") ? job["startedAt"] : null;
+            if (job.ContainsKey("finishedAt")) d["finishedAt"] = job["finishedAt"];
+            if (job.ContainsKey("cancelable")) d["cancelable"] = job["cancelable"];
+            if (job.ContainsKey("error")) d["error"] = job["error"];
+            if (job.ContainsKey("result")) d["result"] = job["result"];
+            return d;
+        }
+
+        static Dictionary<string, object> JobList(Dictionary<string, object> args)
+        {
+            var limit = (int)Math.Max(1, Math.Min(200, ToLong(args, "limit", 20)));
+            var filter = GetString(args, "status");
+            var all = new List<Dictionary<string, object>>();
+            foreach (var pair in _jobs) all.Add(pair.Value);
+            all.Sort((a, b) => string.CompareOrdinal(GetString(b, "startedAt") ?? "", GetString(a, "startedAt") ?? ""));
+            var rows = new List<object>();
+            for (var i = 0; i < all.Count && rows.Count < limit; i++)
+            {
+                if (!string.IsNullOrEmpty(filter) && GetString(all[i], "status") != filter) continue;
+                rows.Add(JobSummary(all[i]));
+            }
+            var d = new Dictionary<string, object>();
+            d["jobs"] = rows;
+            d["total"] = (long)all.Count;
+            return d;
+        }
+
+        static Dictionary<string, object> JobStatus(Dictionary<string, object> args)
+        {
+            var jobId = GetString(args, "jobId");
+            if (string.IsNullOrEmpty(jobId)) throw new KnownError("invalid_argument", "缺少 jobId");
+            var job = FindJob(jobId);
+            if (job == null) throw new KnownError("job_not_found", "找不到作业: " + jobId);
+            return JobSummary(job);
+        }
+
+        static Dictionary<string, object> JobCancel(Dictionary<string, object> args)
+        {
+            var jobId = GetString(args, "jobId");
+            if (string.IsNullOrEmpty(jobId)) throw new KnownError("invalid_argument", "缺少 jobId");
+            var job = FindJob(jobId);
+            if (job == null) throw new KnownError("job_not_found", "找不到作业: " + jobId);
+            var d = new Dictionary<string, object>();
+            if (!ToBoolValue(job.ContainsKey("cancelable") ? job["cancelable"] : null))
+            {
+                d["cancelled"] = false;
+                d["reason"] = "该作业不支持取消（构建/包操作不可中断）";
+                return d;
+            }
+            job["cancelRequested"] = true;
+            d["cancelled"] = true;
+            d["jobId"] = jobId;
+            return d;
+        }
+
+        // ---- 生产管线：构建 / 包管理 / 烘焙（能力补全第 3 项）----
+        static Dictionary<string, object> BuildStart(Dictionary<string, object> args)
+        {
+            var scenesArg = GetStringList(args, "scenes");
+            var outputPath = GetString(args, "outputPath");
+            var targetArg = GetString(args, "target");
+            var currentTarget = EditorUserBuildSettings.activeBuildTarget;
+            var target = currentTarget;
+            if (!string.IsNullOrEmpty(targetArg))
+            {
+                target = (BuildTarget)Enum.Parse(typeof(BuildTarget), targetArg, true);
+                if (target != currentTarget)
+                    throw new KnownError("build_target_mismatch", "当前活动构建目标为 " + currentTarget + "；本能力不自动切换平台（会触发全量重编译），请先在编辑器切换");
+            }
+            var sceneList = new List<string>();
+            if (scenesArg.Count > 0)
+            {
+                for (var i = 0; i < scenesArg.Count; i++) sceneList.Add(scenesArg[i]);
+            }
+            else
+            {
+                var settings = EditorBuildSettings.scenes;
+                for (var i = 0; i < settings.Length; i++)
+                {
+                    if (settings[i].enabled) sceneList.Add(settings[i].path);
+                }
+            }
+            if (sceneList.Count == 0) throw new KnownError("build_no_scenes", "没有可构建场景：请传 scenes，或先在 Build Settings 里启用场景");
+            if (string.IsNullOrEmpty(outputPath))
+            {
+                var extension = target == BuildTarget.StandaloneWindows64 ? ".exe" : "";
+                outputPath = Path.Combine(_projectRoot, "Builds", Application.productName + "-" + target + extension);
+            }
+            // Unity 禁止把构建产物写进 Library（引擎内部工作目录）：提前拒绝，避免引擎内部吞掉异常只返回 null。
+            var outputFull = Path.GetFullPath(outputPath);
+            var libraryRoot = Path.Combine(_projectRoot, "Library");
+            if (outputFull == libraryRoot || outputFull.StartsWith(libraryRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                throw new KnownError("invalid_output_path", "构建输出不能在 Library 目录内（Unity 内部工作目录），请换到工程内其他目录");
+            var job = CreateJob("build", "BuildPlayer " + target, false);
+            var jobRef = job;
+            var sceneArray = sceneList.ToArray();
+            QueueJob(job, delegate
+            {
+                var options = new BuildPlayerOptions();
+                options.scenes = sceneArray;
+                options.locationPathName = outputPath;
+                options.target = target;
+                options.options = BuildOptions.None;
+                var report = BuildPipeline.BuildPlayer(options);
+                // Unity 会把 BuildPlayer 内部异常写进 Editor.log 后返回 null；不能当成成功。
+                if (report == null) throw new Exception("BuildPlayer 返回 null：构建未成功（详情见编辑器日志）");
+                var result = new Dictionary<string, object>();
+                result["target"] = target.ToString();
+                result["outputPath"] = outputPath;
+                result["scenes"] = (long)sceneArray.Length;
+                result["result"] = report.summary.result.ToString();
+                result["totalSize"] = (long)report.summary.totalSize;
+                result["totalTimeMs"] = (long)report.summary.totalTime.TotalMilliseconds;
+                // macOS 的构建产物是 .app 目录（引擎自动补扩展名），Windows 是 .exe；
+                // 回传真实存在的产物路径，调用方不用自己猜扩展名。
+                var artifact = outputPath;
+                var candidates = new string[] { outputPath, outputPath + ".app", outputPath + ".exe" };
+                for (var i = 0; i < candidates.Length; i++)
+                {
+                    if (System.IO.File.Exists(candidates[i]) || System.IO.Directory.Exists(candidates[i])) { artifact = candidates[i]; break; }
+                }
+                result["artifact"] = artifact;
+                result["artifactExists"] = System.IO.File.Exists(artifact) || System.IO.Directory.Exists(artifact);
+                CompleteJob(jobRef, result);
+                return true;
+            });
+            var d = new Dictionary<string, object>();
+            d["jobId"] = job["id"];
+            d["target"] = target.ToString();
+            d["outputPath"] = outputPath;
+            d["scenes"] = (long)sceneArray.Length;
+            return d;
+        }
+
+        static Dictionary<string, object> PackageList(Dictionary<string, object> args)
+        {
+            var filter = GetString(args, "filter");
+            var limit = (int)Math.Max(1, Math.Min(500, ToLong(args, "limit", 100)));
+            var infos = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages();
+            var rows = new List<object>();
+            for (var i = 0; i < infos.Length && rows.Count < limit; i++)
+            {
+                var info = infos[i];
+                var name = info.name ?? "";
+                if (!string.IsNullOrEmpty(filter) && name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var row = new Dictionary<string, object>();
+                row["name"] = name;
+                row["displayName"] = info.displayName;
+                row["version"] = info.version;
+                row["source"] = info.source.ToString();
+                rows.Add(row);
+            }
+            var d = new Dictionary<string, object>();
+            d["total"] = (long)infos.Length;
+            d["packages"] = rows;
+            return d;
+        }
+
+        static Dictionary<string, object> PackageAdd(Dictionary<string, object> args)
+        {
+            var identifier = GetString(args, "name");
+            if (string.IsNullOrEmpty(identifier)) throw new KnownError("invalid_argument", "缺少 name（包名或 identifier）");
+            var job = CreateJob("package-add", "Add " + identifier, false);
+            var jobRef = job;
+            var request = UnityEditor.PackageManager.Client.Add(identifier);
+            QueueJob(job, delegate
+            {
+                if (!request.IsCompleted) return false;
+                if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                {
+                    var result = new Dictionary<string, object>();
+                    result["name"] = request.Result != null ? request.Result.name : identifier;
+                    result["version"] = request.Result != null ? request.Result.version : null;
+                    result["displayName"] = request.Result != null ? request.Result.displayName : null;
+                    CompleteJob(jobRef, result);
+                }
+                else
+                {
+                    FailJob(jobRef, new Exception("包添加失败: " + (request.Error != null ? request.Error.message : "unknown")));
+                }
+                return true;
+            });
+            var d = new Dictionary<string, object>();
+            d["jobId"] = job["id"];
+            d["name"] = identifier;
+            return d;
+        }
+
+        static Dictionary<string, object> PackageRemove(Dictionary<string, object> args)
+        {
+            var name = GetString(args, "name");
+            if (string.IsNullOrEmpty(name)) throw new KnownError("invalid_argument", "缺少 name");
+            var job = CreateJob("package-remove", "Remove " + name, false);
+            var jobRef = job;
+            var request = UnityEditor.PackageManager.Client.Remove(name);
+            QueueJob(job, delegate
+            {
+                if (!request.IsCompleted) return false;
+                if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                {
+                    var result = new Dictionary<string, object>();
+                    result["name"] = name;
+                    result["removed"] = true;
+                    CompleteJob(jobRef, result);
+                }
+                else
+                {
+                    FailJob(jobRef, new Exception("包移除失败: " + (request.Error != null ? request.Error.message : "unknown")));
+                }
+                return true;
+            });
+            var d = new Dictionary<string, object>();
+            d["jobId"] = job["id"];
+            d["name"] = name;
+            return d;
+        }
+
+        static Dictionary<string, object> BakeNavmesh(Dictionary<string, object> args)
+        {
+            UnityEditor.AI.NavMeshBuilder.BuildNavMesh();
+            var d = new Dictionary<string, object>();
+            d["baked"] = true;
+            d["kind"] = "navmesh";
+            return d;
+        }
+
+        static Dictionary<string, object> BakeLighting(Dictionary<string, object> args)
+        {
+            var started = Lightmapping.BakeAsync();
+            var job = CreateJob("bake-lighting", "Lightmapping.BakeAsync", true);
+            var jobRef = job;
+            QueueJob(job, delegate
+            {
+                if (Lightmapping.isRunning) return false;
+                var result = new Dictionary<string, object>();
+                result["baked"] = true;
+                result["kind"] = "lighting";
+                CompleteJob(jobRef, result);
+                return true;
+            });
+            var d = new Dictionary<string, object>();
+            d["jobId"] = job["id"];
+            d["started"] = started;
+            return d;
+        }
+
+        // ===== 垂直域第一批（能力补全第 4 项）：图形 / Profiler / 物理 =====
+        static List<object> Vector3List(Vector3 v)
+        {
+            return new List<object> { (double)v.x, (double)v.y, (double)v.z };
+        }
+
+        static List<object> ColorList(Color c)
+        {
+            return new List<object> { (double)c.r, (double)c.g, (double)c.b, (double)c.a };
+        }
+
+        static Dictionary<string, object> GraphicsQuality(Dictionary<string, object> args)
+        {
+            var names = QualitySettings.names;
+            var list = new List<object>();
+            for (var i = 0; i < names.Length; i++) list.Add(names[i]);
+            var d = new Dictionary<string, object>();
+            d["levels"] = list;
+            d["current"] = (long)QualitySettings.GetQualityLevel();
+            if (args.ContainsKey("level"))
+            {
+                var level = (int)ToLong(args, "level", 0);
+                if (level < 0 || level >= names.Length) throw new KnownError("invalid_argument", "质量等级越界: " + level);
+                QualitySettings.SetQualityLevel(level, true);
+                d["applied"] = true;
+                d["current"] = (long)QualitySettings.GetQualityLevel();
+            }
+            return d;
+        }
+
+        static Dictionary<string, object> GraphicsRenderSettings(Dictionary<string, object> args)
+        {
+            var changes = args.ContainsKey("changes") ? args["changes"] as Dictionary<string, object> : null;
+            if (changes != null)
+            {
+                if (changes.ContainsKey("ambientMode"))
+                    RenderSettings.ambientMode = (UnityEngine.Rendering.AmbientMode)Enum.Parse(typeof(UnityEngine.Rendering.AmbientMode), Convert.ToString(changes["ambientMode"], CultureInfo.InvariantCulture), true);
+                if (changes.ContainsKey("ambientLight"))
+                    RenderSettings.ambientLight = (Color)CoerceValue(changes["ambientLight"], typeof(Color));
+                if (changes.ContainsKey("fog")) RenderSettings.fog = ToBoolValue(changes["fog"]);
+                if (changes.ContainsKey("fogColor"))
+                    RenderSettings.fogColor = (Color)CoerceValue(changes["fogColor"], typeof(Color));
+                if (changes.ContainsKey("fogDensity"))
+                    RenderSettings.fogDensity = (float)Convert.ToDouble(changes["fogDensity"], CultureInfo.InvariantCulture);
+            }
+            var d = new Dictionary<string, object>();
+            d["ambientMode"] = RenderSettings.ambientMode.ToString();
+            d["ambientLight"] = ColorList(RenderSettings.ambientLight);
+            d["fog"] = RenderSettings.fog;
+            d["fogColor"] = ColorList(RenderSettings.fogColor);
+            d["fogDensity"] = (double)RenderSettings.fogDensity;
+            d["skybox"] = RenderSettings.skybox != null ? RenderSettings.skybox.name : null;
+            if (changes != null) d["applied"] = true;
+            return d;
+        }
+
+        static Dictionary<string, object> GraphicsStats(Dictionary<string, object> args)
+        {
+            var d = new Dictionary<string, object>();
+            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            d["renderPipeline"] = pipeline != null ? pipeline.name : "built-in";
+            d["colorSpace"] = QualitySettings.activeColorSpace.ToString();
+            d["qualityLevel"] = (long)QualitySettings.GetQualityLevel();
+            d["gpu"] = SystemInfo.graphicsDeviceName;
+            d["gpuMemoryMB"] = (long)SystemInfo.graphicsMemorySize;
+            d["shaderLevel"] = (long)SystemInfo.graphicsShaderLevel;
+            d["targetFrameRate"] = (long)Application.targetFrameRate;
+            return d;
+        }
+
+        static Dictionary<string, object> ProfilerStatus(Dictionary<string, object> args)
+        {
+            var d = new Dictionary<string, object>();
+            d["enabled"] = UnityEngine.Profiling.Profiler.enabled;
+            d["supported"] = UnityEngine.Profiling.Profiler.supported;
+            d["totalAllocatedMB"] = (double)UnityEngine.Profiling.Profiler.GetTotalAllocatedMemoryLong() / (1024d * 1024d);
+            d["totalReservedMB"] = (double)UnityEngine.Profiling.Profiler.GetTotalReservedMemoryLong() / (1024d * 1024d);
+            d["monoUsedMB"] = (double)UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong() / (1024d * 1024d);
+            d["monoHeapMB"] = (double)UnityEngine.Profiling.Profiler.GetMonoHeapSizeLong() / (1024d * 1024d);
+            return d;
+        }
+
+        static Dictionary<string, object> ProfilerSet(Dictionary<string, object> args)
+        {
+            if (!args.ContainsKey("enabled")) throw new KnownError("invalid_argument", "缺少 enabled");
+            UnityEngine.Profiling.Profiler.enabled = ToBool(args, "enabled");
+            var d = new Dictionary<string, object>();
+            d["enabled"] = UnityEngine.Profiling.Profiler.enabled;
+            return d;
+        }
+
+        static Dictionary<string, object> PhysicsSettings(Dictionary<string, object> args)
+        {
+            var changes = args.ContainsKey("changes") ? args["changes"] as Dictionary<string, object> : null;
+            if (changes != null)
+            {
+                if (changes.ContainsKey("gravity"))
+                    Physics.gravity = (Vector3)CoerceValue(changes["gravity"], typeof(Vector3));
+                if (changes.ContainsKey("solverIterations"))
+                    Physics.defaultSolverIterations = (int)ToLong(changes, "solverIterations", Physics.defaultSolverIterations);
+                if (changes.ContainsKey("queriesHitTriggers"))
+                    Physics.queriesHitTriggers = ToBoolValue(changes["queriesHitTriggers"]);
+            }
+            var d = new Dictionary<string, object>();
+            d["gravity"] = Vector3List(Physics.gravity);
+            d["solverIterations"] = (long)Physics.defaultSolverIterations;
+            d["queriesHitTriggers"] = Physics.queriesHitTriggers;
+            d["bounceThreshold"] = (double)Physics.bounceThreshold;
+            if (changes != null) d["applied"] = true;
+            return d;
+        }
+
+        static Dictionary<string, object> PhysicsRaycast(Dictionary<string, object> args)
+        {
+            if (!args.ContainsKey("origin") || !args.ContainsKey("direction"))
+                throw new KnownError("invalid_argument", "需要 origin 与 direction");
+            var origin = (Vector3)CoerceValue(args["origin"], typeof(Vector3));
+            var direction = (Vector3)CoerceValue(args["direction"], typeof(Vector3));
+            var distance = args.ContainsKey("distance")
+                ? (float)Convert.ToDouble(args["distance"], CultureInfo.InvariantCulture)
+                : 1000f;
+            RaycastHit hit;
+            var d = new Dictionary<string, object>();
+            if (!Physics.Raycast(origin, direction.normalized, out hit, distance))
+            {
+                d["hit"] = false;
+                return d;
+            }
+            d["hit"] = true;
+            d["distance"] = (double)hit.distance;
+            d["point"] = Vector3List(hit.point);
+            d["normal"] = Vector3List(hit.normal);
+            if (hit.collider != null)
+            {
+                d["collider"] = DescribeRef(hit.collider);
+                if (hit.collider.gameObject != null) d["gameObject"] = hit.collider.gameObject.name;
+            }
+            return d;
+        }
+
+        // ===== 垂直域第二批（能力补全第 4 项）：动画 / 粒子 / UI / ProBuilder / Sprite / 纹理生成 =====
+        static Animator ResolveAnimator(Dictionary<string, object> args)
+        {
+            var go = ResolveGameObject(args);
+            var animator = go.GetComponent<Animator>();
+            if (animator == null) throw new KnownError("component_not_found", "对象上没有 Animator: " + go.name);
+            return animator;
+        }
+
+        static Dictionary<string, object> AnimationInfo(Dictionary<string, object> args)
+        {
+            var animator = ResolveAnimator(args);
+            var d = new Dictionary<string, object>();
+            d["object"] = DescribeRef(animator.gameObject);
+            d["controller"] = animator.runtimeAnimatorController != null ? animator.runtimeAnimatorController.name : null;
+            d["speed"] = (double)animator.speed;
+            d["enabled"] = animator.enabled;
+            var parameters = new List<object>();
+            var list = animator.parameters;
+            for (var i = 0; i < list.Length; i++)
+            {
+                var parameter = list[i];
+                var row = new Dictionary<string, object>();
+                row["name"] = parameter.name;
+                row["type"] = parameter.type.ToString();
+                if (parameter.type == AnimatorControllerParameterType.Float) row["value"] = (double)animator.GetFloat(parameter.name);
+                else if (parameter.type == AnimatorControllerParameterType.Int) row["value"] = (long)animator.GetInteger(parameter.name);
+                else if (parameter.type == AnimatorControllerParameterType.Bool) row["value"] = animator.GetBool(parameter.name);
+                parameters.Add(row);
+            }
+            d["parameters"] = parameters;
+            var state = animator.GetCurrentAnimatorStateInfo(0);
+            d["normalizedTime"] = (double)state.normalizedTime;
+            d["stateLength"] = (double)state.length;
+            d["isInTransition"] = animator.IsInTransition(0);
+            return d;
+        }
+
+        static Dictionary<string, object> AnimationSet(Dictionary<string, object> args)
+        {
+            var animator = ResolveAnimator(args);
+            var changes = args.ContainsKey("changes") ? args["changes"] as Dictionary<string, object> : null;
+            var applied = new List<object>();
+            if (changes != null)
+            {
+                if (changes.ContainsKey("speed"))
+                {
+                    animator.speed = (float)Convert.ToDouble(changes["speed"], CultureInfo.InvariantCulture);
+                    applied.Add("speed");
+                }
+                if (changes.ContainsKey("enabled"))
+                {
+                    animator.enabled = ToBoolValue(changes["enabled"]);
+                    applied.Add("enabled");
+                }
+                if (changes.ContainsKey("parameters"))
+                {
+                    var values = changes["parameters"] as Dictionary<string, object>;
+                    if (values != null)
+                    {
+                        foreach (var pair in values)
+                        {
+                            var declared = animator.parameters;
+                            var type = AnimatorControllerParameterType.Float;
+                            var found = false;
+                            for (var i = 0; i < declared.Length; i++)
+                            {
+                                if (declared[i].name == pair.Key) { type = declared[i].type; found = true; break; }
+                            }
+                            if (!found) throw new KnownError("parameter_not_found", "Animator 没有参数: " + pair.Key);
+                            if (type == AnimatorControllerParameterType.Float) animator.SetFloat(pair.Key, (float)Convert.ToDouble(pair.Value, CultureInfo.InvariantCulture));
+                            else if (type == AnimatorControllerParameterType.Int) animator.SetInteger(pair.Key, (int)Convert.ToInt64(pair.Value, CultureInfo.InvariantCulture));
+                            else if (type == AnimatorControllerParameterType.Bool) animator.SetBool(pair.Key, ToBoolValue(pair.Value));
+                            else animator.SetTrigger(pair.Key);
+                            applied.Add(pair.Key);
+                        }
+                    }
+                }
+            }
+            var d = new Dictionary<string, object>();
+            d["speed"] = (double)animator.speed;
+            d["enabled"] = animator.enabled;
+            d["applied"] = applied;
+            return d;
+        }
+
+        static ParticleSystem ResolveParticles(Dictionary<string, object> args)
+        {
+            var go = ResolveGameObject(args);
+            var particles = go.GetComponent<ParticleSystem>();
+            if (particles == null) throw new KnownError("component_not_found", "对象上没有 ParticleSystem: " + go.name);
+            return particles;
+        }
+
+        static Dictionary<string, object> VfxParticles(Dictionary<string, object> args)
+        {
+            var particles = ResolveParticles(args);
+            var d = new Dictionary<string, object>();
+            d["object"] = particles.gameObject != null ? particles.gameObject.name : null;
+            d["isPlaying"] = particles.isPlaying;
+            d["isPaused"] = particles.isPaused;
+            d["isStopped"] = particles.isStopped;
+            d["particleCount"] = (long)particles.particleCount;
+            d["time"] = (double)particles.time;
+            d["duration"] = (double)particles.duration;
+            d["loop"] = particles.main.loop;
+            return d;
+        }
+
+        static Dictionary<string, object> VfxControl(Dictionary<string, object> args)
+        {
+            var particles = ResolveParticles(args);
+            var action = (GetString(args, "action") ?? "play").ToLowerInvariant();
+            if (action == "play") particles.Play();
+            else if (action == "pause") particles.Pause();
+            else if (action == "stop") particles.Stop();
+            else if (action == "clear") particles.Clear();
+            else throw new KnownError("invalid_argument", "未知 action: " + action + "（play/pause/stop/clear）");
+            var d = new Dictionary<string, object>();
+            d["action"] = action;
+            d["isPlaying"] = particles.isPlaying;
+            d["isStopped"] = particles.isStopped;
+            return d;
+        }
+
+        static Dictionary<string, object> UiCanvases(Dictionary<string, object> args)
+        {
+            var canvases = UnityEngine.Object.FindObjectsOfType<Canvas>();
+            var rows = new List<object>();
+            for (var i = 0; i < canvases.Length; i++)
+            {
+                var canvas = canvases[i];
+                var row = new Dictionary<string, object>();
+                row["path"] = ScenePathOf(canvas.transform);
+                row["renderMode"] = canvas.renderMode.ToString();
+                row["sortingOrder"] = (long)canvas.sortingOrder;
+                row["enabled"] = canvas.enabled;
+                row["isRootCanvas"] = canvas.isRootCanvas;
+                rows.Add(row);
+            }
+            var d = new Dictionary<string, object>();
+            d["count"] = (long)canvases.Length;
+            d["canvases"] = rows;
+            return d;
+        }
+
+        static Dictionary<string, object> ProBuilderState(Dictionary<string, object> args)
+        {
+            var d = new Dictionary<string, object>();
+            var pbType = FindType("UnityEngine.ProBuilder.ProBuilderMesh");
+            d["available"] = pbType != null;
+            if (pbType != null) d["typeName"] = pbType.FullName;
+            var selected = Selection.activeGameObject;
+            d["selectedObject"] = selected != null ? selected.name : null;
+            if (selected != null && pbType != null)
+            {
+                var component = selected.GetComponent(pbType);
+                d["selectedIsProBuilderMesh"] = component != null;
+                if (component != null)
+                {
+                    var vertexCount = pbType.GetProperty("vertexCount");
+                    if (vertexCount != null) d["vertexCount"] = (long)System.Convert.ToInt64(vertexCount.GetValue(component, null), CultureInfo.InvariantCulture);
+                    var faceCount = pbType.GetProperty("faceCount");
+                    if (faceCount != null) d["faceCount"] = (long)System.Convert.ToInt64(faceCount.GetValue(component, null), CultureInfo.InvariantCulture);
+                }
+            }
+            return d;
+        }
+
+        static Dictionary<string, object> SpriteInfo(Dictionary<string, object> args)
+        {
+            var path = GetString(args, "path");
+            if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            var assetPath = ResolveAssetPath(path, "path");
+            var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            var d = new Dictionary<string, object>();
+            d["assetPath"] = assetPath;
+            d["importer"] = importer != null ? importer.GetType().Name : null;
+            if (importer != null)
+            {
+                d["spriteImportMode"] = importer.spriteImportMode.ToString();
+                d["spritePixelsPerUnit"] = (double)importer.spritePixelsPerUnit;
+                d["textureType"] = importer.textureType.ToString();
+                d["maxTextureSize"] = (long)importer.maxTextureSize;
+            }
+            var sprites = new List<object>();
+            var all = AssetDatabase.LoadAllAssetsAtPath(assetPath);
+            for (var i = 0; i < all.Length; i++)
+            {
+                var sprite = all[i] as Sprite;
+                if (sprite == null) continue;
+                var row = new Dictionary<string, object>();
+                row["name"] = sprite.name;
+                row["width"] = (double)sprite.rect.width;
+                row["height"] = (double)sprite.rect.height;
+                row["pixelsPerUnit"] = (double)sprite.pixelsPerUnit;
+                sprites.Add(row);
+            }
+            d["sprites"] = sprites;
+            return d;
+        }
+
+        static Dictionary<string, object> TextureGenerate(Dictionary<string, object> args)
+        {
+            var path = GetString(args, "path");
+            if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
+            var assetPath = ResolveAssetPath(path, "path");
+            if (!assetPath.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("invalid_argument", "纹理必须生成在 Assets/ 下: " + assetPath);
+            if (!assetPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                throw new KnownError("invalid_argument", "纹理路径必须以 .png 结尾");
+            var kind = (GetString(args, "kind") ?? "checker").ToLowerInvariant();
+            var width = (int)Math.Max(1, Math.Min(4096, ToLong(args, "width", 256)));
+            var height = (int)Math.Max(1, Math.Min(4096, ToLong(args, "height", 256)));
+            var cell = (int)Math.Max(1, ToLong(args, "cell", 16));
+            var colorA = args.ContainsKey("colorA") ? (Color)CoerceValue(args["colorA"], typeof(Color)) : new Color(1f, 1f, 1f, 1f);
+            var colorB = args.ContainsKey("colorB") ? (Color)CoerceValue(args["colorB"], typeof(Color)) : new Color(0f, 0f, 0f, 1f);
+            var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+            try
+            {
+                var pixels = new Color[width * height];
+                for (var y = 0; y < height; y++)
+                {
+                    for (var x = 0; x < width; x++)
+                    {
+                        Color color;
+                        if (kind == "checker") color = (((x / cell) + (y / cell)) % 2 == 0) ? colorA : colorB;
+                        else if (kind == "stripes") color = ((x / cell) % 2 == 0) ? colorA : colorB;
+                        else if (kind == "gradient")
+                        {
+                            var ratio = (float)y / Math.Max(1, height - 1);
+                            color = new Color(
+                                colorA.r + (colorB.r - colorA.r) * ratio,
+                                colorA.g + (colorB.g - colorA.g) * ratio,
+                                colorA.b + (colorB.b - colorA.b) * ratio,
+                                colorA.a + (colorB.a - colorA.a) * ratio);
+                        }
+                        else if (kind == "solid") color = colorA;
+                        else throw new KnownError("unsupported_kind", "不支持的 texture kind: " + kind + "（checker/stripes/gradient/solid）");
+                        pixels[y * width + x] = color;
+                    }
+                }
+                tex.SetPixels(pixels);
+                tex.Apply();
+                var png = tex.EncodeToPNG();
+                var full = System.IO.Path.Combine(_projectRoot, assetPath.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                var parent = System.IO.Path.GetDirectoryName(full);
+                if (!string.IsNullOrEmpty(parent)) System.IO.Directory.CreateDirectory(parent);
+                System.IO.File.WriteAllBytes(full, png);
+                AssetDatabase.ImportAsset(assetPath);
+                var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+                if (importer != null && ToBool(args, "sprite"))
+                {
+                    // 只设 spriteImportMode 不够：textureType 必须切到 Sprite，导入器才会生成 Sprite 子资产。
+                    importer.textureType = TextureImporterType.Sprite;
+                    importer.spriteImportMode = SpriteImportMode.Single;
+                    if (args.ContainsKey("pixelsPerUnit"))
+                        importer.spritePixelsPerUnit = (float)Convert.ToDouble(args["pixelsPerUnit"], CultureInfo.InvariantCulture);
+                    importer.SaveAndReimport();
+                    // SaveAndReimport 是异步的：强制同步导入一次，保证返回时 Sprite 子资产已经可加载。
+                    AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceSynchronousImport);
+                }
+                var d = new Dictionary<string, object>();
+                d["path"] = assetPath;
+                d["width"] = (long)width;
+                d["height"] = (long)height;
+                d["kind"] = kind;
+                d["bytes"] = (long)png.Length;
+                d["importer"] = importer != null ? importer.GetType().Name : null;
+                return d;
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(tex);
+            }
+        }
+
+        // ===== 原生交互（能力补全第 5 项）：编辑器窗口与受管输入注入 =====
+        // 边界说明：纯 C# 探针无法可靠应答系统级模态对话框（需要原生/OS 自动化，Codely 走 native 层）。
+        // 这里提供受管层能做到的部分：窗口枚举/聚焦 + 向编辑器窗口注入输入事件。
+        static Dictionary<string, object> WindowList(Dictionary<string, object> args)
+        {
+            var limit = (int)Math.Max(1, Math.Min(200, ToLong(args, "limit", 50)));
+            var windows = Resources.FindObjectsOfTypeAll<EditorWindow>();
+            var rows = new List<object>();
+            for (var i = 0; i < windows.Length && rows.Count < limit; i++)
+            {
+                var window = windows[i];
+                var row = new Dictionary<string, object>();
+                row["type"] = window.GetType().Name;
+                row["fullType"] = window.GetType().FullName;
+                row["title"] = window.titleContent != null ? window.titleContent.text : null;
+                row["hasFocus"] = window.hasFocus;
+                row["position"] = new List<object> {
+                    (double)window.position.x, (double)window.position.y,
+                    (double)window.position.width, (double)window.position.height,
+                };
+                rows.Add(row);
+            }
+            var d = new Dictionary<string, object>();
+            d["count"] = (long)windows.Length;
+            d["windows"] = rows;
+            d["focused"] = EditorWindow.focusedWindow != null ? EditorWindow.focusedWindow.GetType().Name : null;
+            return d;
+        }
+
+        static EditorWindow FindWindow(string typeName, string title)
+        {
+            var windows = Resources.FindObjectsOfTypeAll<EditorWindow>();
+            for (var i = 0; i < windows.Length; i++)
+            {
+                var window = windows[i];
+                var name = window.GetType().Name;
+                var fullName = window.GetType().FullName;
+                var windowTitle = window.titleContent != null ? window.titleContent.text : null;
+                if (!string.IsNullOrEmpty(typeName) && (name == typeName || fullName == typeName)) return window;
+                if (!string.IsNullOrEmpty(title) && windowTitle == title) return window;
+            }
+            return null;
+        }
+
+        static Dictionary<string, object> WindowFocus(Dictionary<string, object> args)
+        {
+            var typeName = GetString(args, "type");
+            var title = GetString(args, "title");
+            if (string.IsNullOrEmpty(typeName) && string.IsNullOrEmpty(title))
+                throw new KnownError("invalid_argument", "需要 type 或 title");
+            var window = FindWindow(typeName, title);
+            if (window == null) throw new KnownError("window_not_found", "找不到窗口: " + (typeName ?? title));
+            window.Focus();
+            window.Repaint();
+            var d = new Dictionary<string, object>();
+            d["type"] = window.GetType().Name;
+            d["title"] = window.titleContent != null ? window.titleContent.text : null;
+            d["hasFocus"] = window.hasFocus;
+            return d;
+        }
+
+        static Event NewKeyEvent(EventType type, KeyCode keyCode)
+        {
+            var evt = new Event();
+            evt.type = type;
+            evt.keyCode = keyCode;
+            return evt;
+        }
+
+        static Dictionary<string, object> InputSend(Dictionary<string, object> args)
+        {
+            var events = AsObjectList(args, "events");
+            if (events.Count == 0) throw new KnownError("invalid_argument", "events 不能为空");
+            var targetName = GetString(args, "window");
+            EditorWindow target;
+            if (!string.IsNullOrEmpty(targetName))
+            {
+                target = FindWindow(targetName, null);
+                if (target == null) throw new KnownError("window_not_found", "找不到窗口: " + targetName);
+            }
+            else
+            {
+                target = EditorWindow.focusedWindow;
+            }
+            if (target == null) throw new KnownError("no_focused_window", "没有焦点窗口；请用 window 参数指定（如 SceneView）");
+            var applied = new List<object>();
+            for (var i = 0; i < events.Count; i++)
+            {
+                var raw = events[i] as Dictionary<string, object>;
+                if (raw == null) continue;
+                var type = (GetString(raw, "type") ?? "key").ToLowerInvariant();
+                if (type == "key")
+                {
+                    var keyName = GetString(raw, "key");
+                    if (string.IsNullOrEmpty(keyName)) throw new KnownError("invalid_argument", "key 事件缺少 key");
+                    KeyCode keyCode;
+                    if (!Enum.TryParse<KeyCode>(keyName, true, out keyCode))
+                        throw new KnownError("invalid_argument", "未知按键: " + keyName);
+                    var action = (GetString(raw, "action") ?? "press").ToLowerInvariant();
+                    if (action == "down") target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode));
+                    else if (action == "up") target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode));
+                    else
+                    {
+                        target.SendEvent(NewKeyEvent(EventType.KeyDown, keyCode));
+                        target.SendEvent(NewKeyEvent(EventType.KeyUp, keyCode));
+                        action = "press";
+                    }
+                    var row = new Dictionary<string, object>();
+                    row["type"] = "key";
+                    row["key"] = keyName;
+                    row["action"] = action;
+                    applied.Add(row);
+                }
+                else if (type == "mouse")
+                {
+                    var action = (GetString(raw, "action") ?? "click").ToLowerInvariant();
+                    var button = (int)ToLong(raw, "button", 0);
+                    var x = (float)System.Convert.ToDouble(raw.ContainsKey("x") ? raw["x"] : (object)0, CultureInfo.InvariantCulture);
+                    var y = (float)System.Convert.ToDouble(raw.ContainsKey("y") ? raw["y"] : (object)0, CultureInfo.InvariantCulture);
+                    var down = new Event();
+                    down.type = EventType.MouseDown;
+                    down.button = button;
+                    down.mousePosition = new Vector2(x, y);
+                    var up = new Event();
+                    up.type = EventType.MouseUp;
+                    up.button = button;
+                    up.mousePosition = new Vector2(x, y);
+                    if (action == "down") target.SendEvent(down);
+                    else if (action == "up") target.SendEvent(up);
+                    else
+                    {
+                        target.SendEvent(down);
+                        target.SendEvent(up);
+                        action = "click";
+                    }
+                    var row = new Dictionary<string, object>();
+                    row["type"] = "mouse";
+                    row["button"] = (long)button;
+                    row["action"] = action;
+                    applied.Add(row);
+                }
+                else if (type == "scroll")
+                {
+                    var evt = new Event();
+                    evt.type = EventType.ScrollWheel;
+                    evt.delta = new Vector2(
+                        (float)System.Convert.ToDouble(raw.ContainsKey("x") ? raw["x"] : (object)0, CultureInfo.InvariantCulture),
+                        (float)System.Convert.ToDouble(raw.ContainsKey("y") ? raw["y"] : (object)0, CultureInfo.InvariantCulture));
+                    target.SendEvent(evt);
+                    var row = new Dictionary<string, object>();
+                    row["type"] = "scroll";
+                    row["delta"] = new List<object> { (double)evt.delta.x, (double)evt.delta.y };
+                    applied.Add(row);
+                }
+                else throw new KnownError("invalid_argument", "未知事件 type: " + type + "（key/mouse/scroll）");
+            }
+            target.Repaint();
+            var d = new Dictionary<string, object>();
+            d["window"] = target.GetType().Name;
+            d["applied"] = applied;
+            return d;
         }
 
         static Dictionary<string, object> PlaymodeSet(Dictionary<string, object> args)

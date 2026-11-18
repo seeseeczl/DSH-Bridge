@@ -111,15 +111,32 @@ export async function readTopic(instanceId, slugOrTopic) {
   return { path: file, content: await readFile(file, 'utf8') }
 }
 
-/** 删除一个主题。 */
-export async function removeTopic(instanceId, slugOrTopic) {
-  const file = join(knowledgeRoot(instanceId), 'topics', `${safeTopicName(slugOrTopic)}.md`)
+async function existsFile(path) {
   try {
-    await rm(assertInsideTopics(join(knowledgeRoot(instanceId), 'topics'), file), { force: true })
+    await stat(path)
     return true
   } catch {
     return false
   }
+}
+
+/** 删除一个主题；slug 或标题都可（与 readTopic 相同的定位语义）。 */
+export async function removeTopic(instanceId, slugOrTopic) {
+  const dir = join(knowledgeRoot(instanceId), 'topics')
+  const direct = join(dir, `${safeTopicName(slugOrTopic)}.md`)
+  if (await existsFile(direct)) {
+    await rm(assertInsideTopics(dir, direct))
+    return true
+  }
+  // 回退：按标题匹配。saveTopic 用 slugify(topic) 落盘，含全角括号/空格的主题
+  // 只有文件头保留原文标题，直接用原文拼文件名会静默删不掉（BUG-0002）。
+  const list = await listTopics(instanceId)
+  const match = list.topics.find((item) => item.topic === slugOrTopic || item.slug === slugify(slugOrTopic))
+  if (!match) return false
+  const file = join(dir, `${match.slug}.md`)
+  if (!(await existsFile(file))) return false
+  await rm(assertInsideTopics(dir, file))
+  return true
 }
 
 export async function knowledgeStats(instanceId) {

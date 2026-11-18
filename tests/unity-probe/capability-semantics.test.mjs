@@ -82,9 +82,8 @@ test('AA-SEC-003 探针拒绝把资产写到工程之外', async (t) => {
 test('AA-SEC-001 反射执行面必须受危险能力/成员策略约束', async (t) => {
   if (skipReason) return t.skip(skipReason)
   const menu = await row('menu.execute')
-  assert.equal(menu.ok, false, 'unity.menu.execute 属于危险执行面，探针应可被策略阻断')
-  assert.equal(menu.errorCode, 'capability_denied')
-  assert.deepEqual(menu.menuCalls, [], '被拒绝时不得真的执行菜单项')
+  assert.equal(menu.ok, true, 'unity.menu.execute 解禁后应能执行（用户决策：能力优先）')
+  assert.deepEqual(menu.menuCalls, ['Assets/Reimport All'], '必须真的执行菜单项并留下调用记录')
 
   const unauthorized = await row('reflect.invoke-unauthorized')
   assert.equal(unauthorized.ok, false, '未授权时反射入口必须直接关闭')

@@ -31,9 +31,28 @@
 | `unity.console.read` | 控制台最近条目，按级别过滤 |
 | `unity.hierarchy.list` | 当前场景根对象树 |
 | `unity.asset.find` | `AssetDatabase.FindAssets` 搜索结果 |
-| `unity.menu.execute` | 执行菜单路径 |
+| `unity.menu.execute` | 执行任意菜单路径（**危险能力，默认关闭，需 allowDangerous**） |
 | `unity.playmode.set` | 进入/退出 Play Mode |
 | `unity.asset.refresh` | 触发资产刷新 |
+| `unity.screenshot.capture` | GameView / SceneView / 指定相机截图 → PNG 落 `Library/DSHBridge/artifacts/`，返回路径与尺寸 |
+| `unity.screenshot.sequence` | 定间隔截 N 帧 PNG 到 artifacts 序列目录（录屏的帧序列等价物；纯 C# 不编码视频） |
+| `unity.script.get_sha` | 文件 SHA-256 与字节数，用于乐观并发校验 |
+| `unity.script.apply_edits` | 1-based 行列级 patch；支持 `preconditionSha256`、越界/重叠拒绝、原子落盘 |
+| `unity.script.validate` | 用 mono-mcs 进程内编译校验脚本，返回 valid/errorCount/diagnostics（等价 MCP validate_script） |
+| `unity.build.start` | 异步构建当前平台（作业化）；输出**不得**写进 `Library/`；产物支持 `.app`/`.exe` |
+| `unity.package.list` | 已注册包列表；`add`/`remove` 为异步作业（默认关闭，属危险能力） |
+| `unity.bake.navmesh` / `unity.bake.lighting` | NavMesh 同步烘焙 / 光照异步烘焙（作业化） |
+| `unity.job.list/status/cancel` | 长任务作业查询与取消；作业持久化到 `Library/DSHBridge/jobs/`，域重载后未完成的标 `interrupted` |
+| `unity.graphics.quality/render_settings/stats` | 质量等级、环境光/雾/天空盒、渲染管线与 GPU 信息 |
+| `unity.profiler.status/set` | Profiler 开关与内存统计（总分配/保留、Mono 堆） |
+| `unity.physics.settings/raycast` | 重力/求解迭代/触发器查询设置；射线检测（命中点/法线/碰撞体） |
+| `unity.animation.info/set` | Animator 控制器/参数/speed 读取与设置 |
+| `unity.vfx.particles/control` | ParticleSystem 状态读取与 play/pause/stop/clear |
+| `unity.ui.canvases` | 场景 Canvas 列表（renderMode/sortingOrder/isRootCanvas） |
+| `unity.probuilder.state` | ProBuilder 包可用性与当前选择检测（反射，无编译依赖） |
+| `unity.sprite.info` | TextureImporter 的 sprite 模式/pixelsPerUnit 与 Sprite 子资产 |
+| `unity.texture.generate` | 程序化生成纹理（checker/stripes/gradient/solid）→ PNG 资产 + 可选 Sprite 导入 |
+| `unity.window.list` / `unity.window.focus` / `unity.input.send` | 编辑器窗口枚举/聚焦与受管输入注入（key/mouse/scroll；系统级模态对话框不在范围） |
 | `unity.reflect.invoke` | 反射访问成员：多候选名、绑定标志、命中回传（**默认关闭**） |
 | `unity.api.batch` | 批量调用 + 共享 Undo 组 + 失败回滚/补偿 + `failures[]`（**默认关闭**） |
 | `unity.code.execute` | 进程内编译执行 C#，等价 MCP `execute_code`（**默认开启**） |
@@ -51,8 +70,7 @@
 - 传输基于文件轮询（约 100ms），单次调用延迟通常在 100–300ms。
 - 只支持本机，不支持跨机。
 - 只支持编辑器（Editor），不支持 Player/真机。
-- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）默认关闭；开启方式见下节。
-- `unity.menu.execute` 在探针侧**永久关闭**，任何配置都无法打开。
+- 反射执行面（`unity.reflect.invoke` / `unity.api.invoke` / `unity.api.members`）与 `unity.menu.execute` 默认关闭；开启方式见下节。探针侧已不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先）。
 
 ## 安装位置与工作区
 
@@ -75,7 +93,7 @@ Unity 会在 `Packages/packages-lock.json` 中追加一条包记录（引擎行�
 探针侧另有三层边界：
 
 1. **路径边界**：`unity.asset.read` / `unity.asset.create` / `unity.importer.*` / `unity.asset.*` 的所有路径都先 `GetFullPath` 再要求落在工程根之内，绝对路径与 `../` 逃逸一律返回 `path_escape`；读写限定在文本类资产扩展名。
-2. **能力闸门**：反射执行面（`reflect.invoke` / `api.invoke` / `api.members`）只有 DSH 侧 `allowDangerous` 授权后才会在探针里解锁；`unity.menu.execute` 永久关闭。即使请求绕过 DSH 直接写入 inbox，也会被拒绝并写一条 `request_rejected` 事件。
+2. **能力闸门**：反射执行面（`reflect.invoke` / `api.invoke` / `api.members`）与 `unity.menu.execute` 等危险能力默认拒绝，只有 DSH 侧 `allowDangerous` 授权后才放行；探针侧不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先，风险由调用方承担）。反射面的未授权请求即使绕过 DSH 直接写入 inbox，也会被拒绝并写一条 `request_rejected` 事件。
 3. **成员黑名单**：反射面即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `CompilationPipeline` / `System.Diagnostics.Process` 等类型，以及 `ExecuteMenuItem` / `Exit` 等成员；`api.invoke` / `api.members` 只暴露公开成员。
 
 被拒绝的请求会同时写事件与 `outbox/<id>.rejected.json`，便于 DSH 侧在调用返回时就看到原因。
@@ -88,6 +106,7 @@ Unity 会在 `Packages/packages-lock.json` 中追加一条包记录（引擎行�
 config:
   allowDangerous:
     - unity.reflect.invoke
+    - unity.menu.execute   # 危险：可执行任意编辑器菜单（含工程内自定义菜单代码）
 ```
 
 ## 反射执行面（面向 ASE 这类需要私有字段的调用方）

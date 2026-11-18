@@ -18,7 +18,7 @@ import { withWake } from './wake.mjs'
 import { backlog, sweepEvents } from '../../transport/maintenance.mjs'
 import { installProbe, probePaths, uninstallProbe } from './installer.mjs'
 
-export const PROBE_VERSION = '12'
+export const PROBE_VERSION = '23'
 
 export const UNITY_CAPABILITIES = Object.freeze([
   'unity.editor.status',
@@ -67,6 +67,45 @@ export const UNITY_CAPABILITIES = Object.freeze([
   'unity.asset.move',
   'unity.asset.delete',
   'unity.asset.duplicate',
+  // 视觉反馈（能力补全第 1 项）：截图落到 Library/DSHBridge/artifacts/，返回路径供 Agent 读图。
+  'unity.screenshot.capture',
+  // 脚本精细编辑（能力补全第 2 项）：SHA 前置校验 + 行列级 patch。
+  'unity.script.get_sha',
+  'unity.script.apply_edits',
+  // 生产管线与长任务作业（能力补全第 3/6 项）。
+  'unity.job.list',
+  'unity.job.status',
+  'unity.job.cancel',
+  'unity.build.start',
+  'unity.package.list',
+  'unity.package.add',
+  'unity.package.remove',
+  'unity.bake.navmesh',
+  'unity.bake.lighting',
+  // 垂直域第一批：图形 / Profiler / 物理。
+  'unity.graphics.quality',
+  'unity.graphics.render_settings',
+  'unity.graphics.stats',
+  'unity.profiler.status',
+  'unity.profiler.set',
+  'unity.physics.settings',
+  'unity.physics.raycast',
+  // 垂直域第二批：动画 / 粒子 / UI / ProBuilder / Sprite / 纹理生成。
+  'unity.animation.info',
+  'unity.animation.set',
+  'unity.vfx.particles',
+  'unity.vfx.control',
+  'unity.ui.canvases',
+  'unity.probuilder.state',
+  'unity.sprite.info',
+  'unity.texture.generate',
+  // 原生交互（能力补全第 5 项）。
+  'unity.window.list',
+  'unity.window.focus',
+  'unity.input.send',
+  // 补充：截图序列（录屏帧序列）与脚本编译校验。
+  'unity.screenshot.sequence',
+  'unity.script.validate',
   // 通用反射执行面（可授权）：批量事务与进程内代码执行。
   // unity.code.execute 等价于 MCP 的 execute_code——ASE 的编辑脚本是含控制流的完整程序，
   // 只有整段编译执行才能保持 Undo 组与 AssetDatabase 刷新时序一致。
