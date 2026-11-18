@@ -156,6 +156,8 @@ export async function installProbe(instance, probeVersion, {
   if (dryRun) {
     return {
       dryRun: true,
+      // schema 把 changed 标为必填：dry-run 也要如实给出「这次会不会写文件」。
+      changed,
       instanceId: instance.instanceId,
       probeVersion,
       sourceHash,

@@ -34,6 +34,11 @@ export function createLifecycleTools(tool, bridge) {
         properties: {
           dryRun: { type: 'boolean', required: true },
           changed: { type: 'boolean', required: true },
+          // dry-run 也会回传这些，schema 必须声明它们（additionalProperties: false）。
+          instanceId: { type: 'string' },
+          sourceHash: { type: 'string' },
+          grantedCapabilities: { type: 'array', items: { type: 'string' } },
+          deniedCapabilities: { type: 'array', items: { type: 'string' } },
           reloadExpected: { type: 'boolean', required: true },
           probeVersion: { type: 'string', required: true },
           files: { type: 'array', required: true, items: { type: 'object', additionalProperties: true } },
