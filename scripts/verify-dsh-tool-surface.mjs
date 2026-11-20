@@ -18,7 +18,16 @@ import { PROBE_VERSION } from '../packages/dsh-bridge/adapters/unity/index.mjs'
 const PROJECT = resolve(process.argv[2] ?? '/Users/long/Documents/Tuanjie/DSHBridgeVerify')
 const INSTANCE_FILE = join(PROJECT, 'Library/DSHBridge/instance.json')
 const JSON_OUT = process.argv.includes('--json')
-const ALLOW_DANGEROUS = ['unity.reflect.invoke', 'unity.api.invoke', 'unity.api.members', 'unity.api.batch', 'unity.menu.execute', 'unity.asset.delete']
+// 默认授权模型（v0.0.10 收敛后）：
+//   - DEFAULT_DANGEROUS 共 17 项（含 unity.code.execute），默认拒绝，必须显式放行；
+//   - unity.script.apply_edits 属 ALWAYS_HIGH_RISK（审计不可用即拒），不需要也不允许靠 allowDangerous 绕过；
+//   - unity.asset.create 写普通资产默认放行，写 .cs/.asmdef/.asmref 才要 code.execute 授权。
+// 因此这里既要放行用到的危险能力，也要把 code.execute 放行——探针侧的授权快照按这份清单渲染，
+// 少了它，「写 .cs」这类用例会在探针侧被 capability_denied 挡掉。
+const ALLOW_DANGEROUS = [
+  'unity.reflect.invoke', 'unity.api.invoke', 'unity.api.members', 'unity.api.batch',
+  'unity.menu.execute', 'unity.asset.delete', 'unity.code.execute',
+]
 
 const rows = []
 function record(id, name, ok, detail) {
@@ -48,6 +57,56 @@ function checkOutput(tool, value) {
   return value
 }
 
+/**
+ * 没有可用实例时的结构化失败（P3-84）。
+ *
+ * 旧实现直接 `readFile(INSTANCE_FILE)`：没有实例时栈里只有一个裸 `ENOENT`，
+ * 看不出「本脚本需要**已经装好探针并正在运行**的编辑器」，也看不出该准备哪个工程。
+ * 这里统一成 `code=no_live_instance` + 可执行的三步准备说明，退出码非 0。
+ */
+function failNoLiveInstance(reason, projectPath, instancePath) {
+  const payload = {
+    code: 'no_live_instance',
+    message: `没有可用的探针实例：${reason}`,
+    projectPath,
+    instanceFile: instancePath,
+    hint: [
+      `1) 在目标编辑器（Unity/Tuanjie）中打开工程：${projectPath}`,
+      `2) 向该工程安装探针（装完编辑器会编译一次并重载）：node scripts/bridge-cli.mjs install "${projectPath}" --allow-dangerous unity.code.execute`,
+      `3) 等 instance.json 出现心跳后再运行本脚本：node scripts/verify-dsh-tool-surface.mjs "${projectPath}"`,
+      '本脚本只在“探针已就绪”的环境下有意义；离线门禁请用 npm run verify。',
+    ],
+  }
+  if (JSON_OUT) {
+    console.error(JSON.stringify({ error: payload }, null, 2))
+  } else {
+    console.error(`FAIL  探针就绪（${payload.code}）：${payload.message}`)
+    for (const line of payload.hint) console.error(`      ${line}`)
+  }
+  process.exit(1)
+}
+
+/** 读取 instance.json：文件缺失/损坏都收敛成结构化错误，而不是裸异常。 */
+async function readProbeInstance(instancePath, projectPath) {
+  let text
+  try {
+    text = await readFile(instancePath, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') failNoLiveInstance('实例文件不存在（探针未安装或编辑器未打开工程）', projectPath, instancePath)
+    failNoLiveInstance(`读取实例文件失败（${error?.code ?? error?.message ?? 'unknown'}）`, projectPath, instancePath)
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    failNoLiveInstance('实例文件内容不是合法 JSON（可能刚被截断，重试一次）', projectPath, instancePath)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    failNoLiveInstance('实例文件结构不是 JSON object', projectPath, instancePath)
+  }
+  return parsed
+}
+
 const registered = []
 const ctx = {
   tools: { register: (tool) => { registered.push(tool); return () => {} } },
@@ -56,7 +115,7 @@ const ctx = {
 }
 
 const auditDir = await mkdtemp(join(tmpdir(), 'dsh-bridge-tool-surface-'))
-await apply(ctx, { auditPath: join(auditDir, 'audit.log'), allowDangerous: ALLOW_DANGEROUS })
+await apply(ctx, { auditPath: join(auditDir, "audit.log"), allowDangerous: ALLOW_DANGEROUS, agentsRule: false })
 const tool = (name) => {
   const found = registered.find((item) => item.name === name)
   if (!found) throw new Error(`工具未注册: ${name}`)
@@ -69,7 +128,9 @@ async function runTool(name, args = {}) {
 }
 
 // ---------- 0) 探针就绪 ----------
-const raw = JSON.parse(await readFile(INSTANCE_FILE, 'utf8'))
+// P3-84 收口：此前直接 readFile 会抛裸 ENOENT（栈里只有一个 ENOENT，看不出「这个脚本需要
+// 一个已经装好探针并正在运行的编辑器」）。这里改为结构化失败：给出 code、路径与准备步骤。
+const raw = await readProbeInstance(INSTANCE_FILE, PROJECT)
 record('T00', '探针就绪（直读 instance.json）', raw.probeVersion === PROBE_VERSION && raw.capabilities?.length === 116, {
   probe: raw.probeVersion, caps: raw.capabilities?.length, sourceHash: raw.sourceHash,
 })
@@ -223,8 +284,45 @@ try {
     rejected = error.code === 'capability_disabled' || /allowDangerous/.test(error.message)
   }
   record('T12', '危险能力默认拒绝（menu.execute）', rejected, { note: rejected ? '已被插件策略层拒绝' : '未被拒绝' })
+
+  // P3-70 / 默认授权模型：code.execute 以前是「唯一默认开启」的高权能力，现在必须默认拒绝。
+  let codeRejected = false
+  try {
+    await call2.execute({ instance_id: instanceId, capability: 'unity.code.execute', args_json: '{"code":"return 1;"}' }, {})
+  } catch (error) {
+    codeRejected = error.code === 'capability_disabled'
+  }
+  record('T13', 'code.execute 默认拒绝（默认授权模型）', codeRejected, {
+    note: codeRejected ? '已被插件策略层拒绝' : '仍可零配置执行任意 C#（授权模型回退）',
+  })
 } catch (error) {
   record('T12', '危险能力默认拒绝（menu.execute）', false, { error: error.message })
+}
+
+// ---------- 11) 工具契约：新授权模型与运维字段（只看 schema，不产生副作用） ----------
+// P2-15 / P3-103：restartRequired 必须在 schema 里，否则 DSH 会按 additionalProperties:false 拒绝该字段，
+// 调用方永远拿不到「必须重启编辑器」这个唯一机器可读信号。
+try {
+  const install = tool('bridge_install')
+  const props = install.output?.schema?.properties ?? {}
+  const paramNames = Object.keys(install.parameters ?? {})
+  record('T14', 'bridge_install 声明 restartRequired 与引擎版本旁路',
+    'restartRequired' in props && props.restartRequired?.type === 'boolean' && paramNames.includes('allow_unsupported_engine'),
+    { hasRestartRequired: 'restartRequired' in props, params: paramNames })
+} catch (error) {
+  record('T14', 'bridge_install 声明 restartRequired 与引擎版本旁路', false, { error: error.message })
+}
+
+// P2-31：卸载需要能表达「通道数据是否已清理」与「保留排障现场」。
+try {
+  const uninstall = tool('bridge_uninstall')
+  const props = uninstall.output?.schema?.properties ?? {}
+  const paramNames = Object.keys(uninstall.parameters ?? {})
+  record('T15', 'bridge_uninstall 声明 channelPurged 与 keep_diagnostics',
+    'channelPurged' in props && paramNames.includes('keep_diagnostics'),
+    { hasChannelPurged: 'channelPurged' in props, params: paramNames })
+} catch (error) {
+  record('T15', 'bridge_uninstall 声明 channelPurged 与 keep_diagnostics', false, { error: error.message })
 }
 
 await rm(auditDir, { recursive: true, force: true }).catch(() => null)

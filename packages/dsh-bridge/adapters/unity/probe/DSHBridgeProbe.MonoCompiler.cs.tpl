@@ -13,6 +13,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.Compilation;
 using UnityEngine;
@@ -1161,21 +1162,313 @@ namespace DSHBridge
             return t;
         }
 
+        // ===== 日志数据最小化与事件自限（审计 P2-7 / P2-36 / P2-52）=====
+        //
+        // 三个缺陷同一个根因：OnLog 把每条 error/exception/assert 都「原文 + 无条件」写成一个
+        // 事件文件，由此同时得到三个后果：
+        //   1) 无速率上限：一次 code.execute 里的 for 循环 LogError 就能造出数万个文件，
+        //      之后每次 bridge_events 都是 O(n) 的 readdir + readFile + JSON.parse（P2-7）；
+        //   2) 无自清扫：唯一回收点是 DSH 侧调用 bridge_events 时顺带 sweep，不订阅事件的
+        //      会话会让 events/ 无界增长（inode 与磁盘，P2-36）；
+        //   3) 无脱敏：工程日志里的 token/邮箱被原文复制到第二处存储，并随 bridge_events /
+        //      unity.console.read 进入模型上下文，与治理文档「不采集凭据与 PII」冲突（P2-52）。
+        // 收敛在日志入口：先脱敏（原文不再落盘、不可回取），再按固定窗口节流，最后在写入
+        // 路径上按窗口自清扫事件目录——不依赖调用方是否来订阅事件。
+
+        /// <summary>控制台正文里需要掩码的模式（顺序即优先级）。</summary>
+        /// <remarks>
+        /// 「key=value」必须排在最前：`Authorization: Bearer a.b.c` 这种形状如果不先按键名
+        /// 吞掉整个值，就只会被 JWT 规则部分掩盖，令牌之外的上下文仍留在明文里。
+        /// 值模式里的 `Bearer\s+\S+` 分支就是为了让「键名 + Bearer 令牌」一次吃干净。
+        /// 邮箱整体掩码：只保留「曾经是邮箱」这一事实，不保留域名轮廓（组织信息本身也是
+        /// 泄漏面）。正则刻意写得宽松（宁可多掩）——日志脱敏的失败模式是「漏掩 = 泄漏」，
+        /// 而误掩只影响可读性。
+        /// </remarks>
+        static readonly Regex[] LogRedactPatterns = new Regex[]
+        {
+            new Regex(
+                "(?i)\\b(token|access[_-]?token|refresh[_-]?token|id[_-]?token|password|passwd|pwd"
+                + "|secret|client[_-]?secret|api[_-]?key|apikey|authorization|session[_-]?id|cookie"
+                + "|private[_-]?key)\\b\\s*[:=]\\s*"
+                + "(\"[^\"]*\"|'[^']*'|Bearer\\s+[^\\s,;&}\\]]+|[^\\s,;&}\\]]+)",
+                RegexOptions.Compiled),
+            new Regex("(?i)\\bBearer\\s+[A-Za-z0-9._~+/=\\-]{6,}", RegexOptions.Compiled),
+            new Regex("eyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}", RegexOptions.Compiled),
+            new Regex("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}", RegexOptions.Compiled),
+        };
+
+        /// <summary>掩码文本：只表达「此处有敏感值」，不带长度（长度本身也是信息）。</summary>
+        const string LogMask = "***";
+
+        /// <summary>单条控制台日志入环前的最大长度（保持既有 2000 字符契约）。</summary>
+        const int LogMessageMaxChars = 2000;
+
+        /// <summary>脱敏前先截到这个长度，避免在超大文本上跑正则占用编辑器主线程。</summary>
+        /// <remarks>
+        /// 不变量：必须 ≥ LogMessageMaxChars。入环文本只从脱敏后的片段里截取，
+        /// 因此保留长度一旦超过扫描长度，超长日志的尾部就会以未脱敏状态入环。
+        /// </remarks>
+        const int LogRedactScanMaxChars = 20000;
+
+        /// <summary>log_error 事件正文的最大长度：事件只需要「首行摘要」，不是日志副本。</summary>
+        const int LogErrorSummaryMaxChars = 200;
+
+        /// <summary>
+        /// 脱敏模式名：unity.console.read 的响应会带上该字段，让调用方知道正文已被掩码，
+        /// 不会把 `***` 当成工程的真实输出。
+        /// </summary>
+        const string LogRedactionMode = "masked";
+
+        /// <summary>
+        /// 对控制台正文做脱敏，同时返回命中的规则数（0 表示未命中任何规则）。
+        /// 返回值直接用于入环，因此 unity.console.read 与 log_error 事件都只见到脱敏后的文本。
+        /// </summary>
+        static string RedactLogMessage(string message, out int maskedCount)
+        {
+            maskedCount = 0;
+            if (string.IsNullOrEmpty(message)) return message;
+            // 廉价预筛：绝大多数日志既不含分隔符也不含令牌/邮箱特征，跳过 4 次正则。
+            var probe = message.Length > LogRedactScanMaxChars
+                ? message.Substring(0, LogRedactScanMaxChars)
+                : message;
+            var lower = probe.ToLowerInvariant();
+            if (lower.IndexOf('@') < 0 && lower.IndexOf('=') < 0 && lower.IndexOf(':') < 0
+                && lower.IndexOf("bearer", StringComparison.Ordinal) < 0
+                && lower.IndexOf("eyj", StringComparison.Ordinal) < 0)
+                return TruncateLogMessage(message);
+
+            var text = probe;
+            foreach (var pattern in LogRedactPatterns)
+            {
+                try
+                {
+                    var replaced = pattern.Replace(text, delegate(Match match)
+                    {
+                        // key=value 形态保留「键名 + 原始分隔符与空白」，只掩掉值：
+                        // 排障时仍能看出「泄漏了哪一类凭据」，又不会丢掉日志的结构。
+                        // 有第 2 组（值）时以它为锚点，否则退到第 1 组（键名）。
+                        Group anchor = null;
+                        if (match.Groups.Count > 2 && match.Groups[2].Success) anchor = match.Groups[2];
+                        else if (match.Groups.Count > 1 && match.Groups[1].Success) anchor = match.Groups[1];
+                        if (anchor != null && anchor.Length > 0)
+                            return match.Value.Substring(0, anchor.Index - match.Index) + LogMask;
+                        return LogMask;
+                    });
+                    if (!string.Equals(replaced, text, StringComparison.Ordinal)) maskedCount += 1;
+                    text = replaced;
+                }
+                catch (Exception)
+                {
+                    // 单条规则出错不能丢掉整条日志：继续用上一条规则的结果。
+                }
+            }
+            return TruncateLogMessage(text);
+        }
+
+        static string TruncateLogMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return message;
+            return message.Length > LogMessageMaxChars ? message.Substring(0, LogMessageMaxChars) : message;
+        }
+
+        /// <summary>取首行并截断：事件载荷用摘要，避免把整段控制台正文复制进 events/。</summary>
+        static string FirstLineOf(string message, int maxChars)
+        {
+            if (string.IsNullOrEmpty(message)) return "";
+            var nl = message.IndexOf('\n');
+            var cr = message.IndexOf('\r');
+            var cut = nl < 0 ? cr : (cr < 0 ? nl : Math.Min(nl, cr));
+            var line = cut < 0 ? message : message.Substring(0, cut);
+            if (line.Length > maxChars) line = line.Substring(0, maxChars);
+            return line;
+        }
+
+        /// <summary>
+        /// 不可逆短指纹（SHA-256 前 4 字节）：让调用方能把「同一个错误重复出现」聚合去重，
+        /// 但不保留原文、也无法由此还原原文。
+        /// </summary>
+        static string MessageHash8(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return null;
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(value));
+                    var sb = new StringBuilder();
+                    for (var i = 0; i < 4; i++) sb.Append(bytes[i].ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>log_error 事件的载荷：首行摘要 + 指纹 + 原长，不含正文全文。</summary>
+        static Dictionary<string, object> LogErrorEventData(string level, string message)
+        {
+            var summary = FirstLineOf(message, LogErrorSummaryMaxChars);
+            var data = new Dictionary<string, object>();
+            data["level"] = level;
+            data["message"] = summary;
+            data["messageHash"] = MessageHash8(message);
+            data["messageLength"] = (long)(message == null ? 0 : message.Length);
+            if (message != null && message.Length > summary.Length) data["truncated"] = true;
+            return data;
+        }
+
+        /// <summary>log_error 事件窗口内最多写这么多条，其余折叠成计数。</summary>
+        const int LogErrorEventWindowLimit = 50;
+
+        /// <summary>窗口长度（秒）：与事件目录清扫同节奏，诊断时一眼对齐两个时间轴。</summary>
+        const double LogErrorEventWindowSeconds = 60;
+
+        static readonly object _logErrorWindowLock = new object();
+        static double _logErrorWindowStart;
+        static int _logErrorWindowEmitted;
+        static int _logErrorWindowSuppressed;
+
+        /// <summary>
+        /// 申请一次 log_error 事件配额。窗口滚动时把上一窗口被折叠的条数交还调用方，
+        /// 由它补发一条 log_error_suppressed——「丢了多少」本身必须可见，否则节流会把
+        /// 错误风暴伪装成「只有 50 条错误」。
+        /// </summary>
+        static bool TryBeginLogErrorEvent(out int suppressedFromPreviousWindow)
+        {
+            suppressedFromPreviousWindow = 0;
+            var now = EditorApplication.timeSinceStartup;
+            lock (_logErrorWindowLock)
+            {
+                // now &lt; start：域重载后 timeSinceStartup 归零，必须视为新窗口。
+                if (_logErrorWindowStart <= 0
+                    || now < _logErrorWindowStart
+                    || now - _logErrorWindowStart >= LogErrorEventWindowSeconds)
+                {
+                    suppressedFromPreviousWindow = _logErrorWindowSuppressed;
+                    _logErrorWindowStart = now;
+                    _logErrorWindowEmitted = 0;
+                    _logErrorWindowSuppressed = 0;
+                }
+                if (_logErrorWindowEmitted < LogErrorEventWindowLimit)
+                {
+                    _logErrorWindowEmitted += 1;
+                    return true;
+                }
+                _logErrorWindowSuppressed += 1;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 事件目录的硬上限，与 DSH 侧 sweepEvents 的 maxFiles 默认值保持一致：
+        /// 一侧收紧另一侧放宽会让「究竟能留多少条事件」变成两套事实。
+        /// </summary>
+        const int MaxEventFiles = 5000;
+
+        /// <summary>事件保留时长：与 DSH 侧 sweepEvents 的 maxAgeMs（7 天）一致。</summary>
+        const double EventRetentionMs = 7 * 24 * 3600 * 1000;
+
+        /// <summary>清扫节奏：每 60 秒最多扫一次，与 outbox 清扫（OutboxSweepInterval）同节奏。</summary>
+        const double EventSweepIntervalSeconds = 60;
+
+        static readonly object _eventSweepLock = new object();
+        static long _nextEventSweepMs;
+
+        /// <summary>
+        /// 事件目录自清扫的节流入口，由 PushEvent 在**写入成功后、锁外**调用。
+        ///
+        /// 为什么挂在写入路径而不是 Tick：不写事件就说明没有增长，也就没有清扫的必要；
+        /// 而事件风暴恰好会持续写入，第一次写入就能触发清扫。这样不必改主文件 Tick，
+        /// 也避免「会话不订阅事件」时永远等不到调用方侧 sweep（P2-36）。
+        /// </summary>
+        static void MaybeSweepEvents()
+        {
+            var now = NowMs();
+            lock (_eventSweepLock)
+            {
+                if (now < _nextEventSweepMs) return;
+                _nextEventSweepMs = now + (long)(EventSweepIntervalSeconds * 1000);
+            }
+            try { SweepStaleEvents(); }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 回收事件目录：超龄（7 天）删除，并在超过 MaxEventFiles 时裁掉最旧的。
+        /// 语义与 DSH 侧 transport/maintenance.mjs 的 sweepEvents 逐条对齐，
+        /// 只处理 `evt_&lt;纯数字&gt;.json` 这一文件名契约内的文件。
+        /// </summary>
+        static void SweepStaleEvents()
+        {
+            if (string.IsNullOrEmpty(_eventsDir) || !Directory.Exists(_eventsDir)) return;
+            var numbered = new List<KeyValuePair<long, string>>();
+            foreach (var file in Directory.GetFiles(_eventsDir, "evt_*.json"))
+            {
+                var name = Path.GetFileNameWithoutExtension(file);
+                var digits = name.Substring(4);
+                long seq;
+                if (digits.Length == 0) continue;
+                if (!long.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out seq)) continue;
+                numbered.Add(new KeyValuePair<long, string>(seq, file));
+            }
+            numbered.Sort(delegate(KeyValuePair<long, string> a, KeyValuePair<long, string> b)
+            {
+                return a.Key.CompareTo(b.Key);
+            });
+            var cutoffSeq = numbered.Count > MaxEventFiles ? numbered[numbered.Count - MaxEventFiles].Key : long.MinValue;
+            var epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var nowMs = NowMs();
+            var removed = 0;
+            foreach (var item in numbered)
+            {
+                var expired = item.Key < cutoffSeq;
+                if (!expired)
+                {
+                    try
+                    {
+                        var age = nowMs - File.GetLastWriteTimeUtc(item.Value).ToUniversalTime().Subtract(epoch).TotalMilliseconds;
+                        if (age > EventRetentionMs) expired = true;
+                    }
+                    catch (Exception) { continue; }
+                }
+                if (!expired) continue;
+                try { File.Delete(item.Value); removed += 1; }
+                catch (Exception) { }
+            }
+            if (removed > 0) AddChannelDiagnostic("events-swept:" + removed);
+        }
+
         static void OnLog(string condition, string stackTrace, LogType type)
         {
+            // 先脱敏再入环：环形队列同时是 unity.console.read 的数据源，原文一旦入环就会被
+            // 原样外发（P2-52）。落盘事件的正文也从这里派生，不再单独持有第二份原文。
+            int masked;
+            var message = RedactLogMessage(condition, out masked);
             Dictionary<string, object> entry;
             lock (_log)
             {
                 entry = new Dictionary<string, object>();
                 entry["seq"] = (long)_log.Count;
                 entry["level"] = LevelOf(type);
-                entry["message"] = condition != null && condition.Length > 2000 ? condition.Substring(0, 2000) : condition;
+                entry["message"] = message;
+                // 命中脱敏时显式标注：调用方据此知道该条正文被掩码过，而不是工程的真实输出。
+                if (masked > 0) entry["redacted"] = (long)masked;
                 entry["time"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
                 _log.Add(entry);
                 if (_log.Count > LogCapacity) _log.RemoveAt(0);
             }
             if ((type == LogType.Error || type == LogType.Exception || type == LogType.Assert) && _eventsDir != null)
-                PushEvent("log_error", new Dictionary<string, object> { { "level", LevelOf(type) }, { "message", entry["message"] } });
+            {
+                int suppressed;
+                // 速率闸门：窗口内超额日志不再逐条刷盘，只累加计数（P2-7 / P2-36）。
+                if (!TryBeginLogErrorEvent(out suppressed)) return;
+                if (suppressed > 0)
+                    PushEvent("log_error_suppressed", new Dictionary<string, object>
+                    {
+                        { "count", (long)suppressed },
+                        { "windowSeconds", (long)LogErrorEventWindowSeconds },
+                    });
+                PushEvent("log_error", LogErrorEventData(LevelOf(type), message));
+            }
         }
 
         static string LevelOf(LogType type)
@@ -1261,6 +1554,8 @@ namespace DSHBridge
                     evt["probeVersion"] = ProbeVersion;
                     WriteAtomic(file, MiniJson.Serialize(evt));
                 }
+                // 清扫放在 _eventLock 之外：目录遍历不应该阻塞其它线程写事件。
+                MaybeSweepEvents();
             }
             catch (Exception e)
             {
@@ -1358,7 +1653,10 @@ namespace DSHBridge
                 // 目录已由上面的 EnsureBootDirs() 保证存在（含 _rootDir），不再重复创建。
                 WriteAtomic(Path.Combine(_rootDir, "instance.json"), MiniJson.Serialize(info));
             }
-            catch (Exception e) { UnityEngine.Debug.LogWarning("[DSHBridge] heartbeat: " + e.Message); }
+            // P3-105：心跳每 2 秒一次，写入失败（磁盘满、被安全软件锁住、路径被替换成链接）
+            // 往往持续存在，逐次 LogWarning 会把控制台淹掉，真正的一次性错误反而被冲走。
+            // 统一走 LogTickFailure（主文件定义，跨 partial）：通道诊断必写，控制台按 10s 节流。
+            catch (Exception e) { LogTickFailure("heartbeat", e); }
         }
 
         // 残留临时文件清理的节流状态：写入路径上不做全目录扫描（events/ 可达数千文件），
@@ -1686,6 +1984,10 @@ namespace DSHBridge
             var text = s.Substring(start, i - start);
             long l;
             if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out l)) return l;
+            // ulong 区间（> long.MaxValue）的整数：旧实现直接落到 double，2^53 以上开始丢精度，
+            // 往返后值与真实值不一致且不报错（P3-111）。先按 ulong 保留整数语义，再退 double。
+            ulong u;
+            if (text[0] != '-' && ulong.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out u)) return u;
             double dbl;
             if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out dbl)) return dbl;
             throw new FormatException("invalid number at " + start);
@@ -1698,6 +2000,26 @@ namespace DSHBridge
             return sb.ToString();
         }
 
+        /// <summary>
+        /// 非有限浮点在 JSON 里的结构化标记。
+        /// </summary>
+        /// <remarks>
+        /// NaN/±Infinity 不是合法 JSON 字面量，直接输出会让整条响应被判 malformed；旧实现
+        /// 统一降级为 null，导致调用方无法区分「字段为空」与「字段是 NaN」，属静默数据失真
+        /// （P3-111）。这里改为输出 `{"__number":"NaN"|"Infinity"|"-Infinity"}`：仍是合法
+        /// JSON，且能无损表达原值；调用方读到该形状即按非有限浮点处理。
+        /// </remarks>
+        const string NonFiniteNumberKey = "__number";
+
+        static void WriteNonFiniteNumber(StringBuilder sb, double value)
+        {
+            sb.Append('{');
+            WriteString(sb, NonFiniteNumberKey);
+            sb.Append(':');
+            WriteString(sb, double.IsNaN(value) ? "NaN" : (value > 0 ? "Infinity" : "-Infinity"));
+            sb.Append('}');
+        }
+
         static void Write(StringBuilder sb, object value)
         {
             if (value == null) { sb.Append("null"); return; }
@@ -1706,16 +2028,17 @@ namespace DSHBridge
             if (value is bool) { sb.Append((bool)value ? "true" : "false"); return; }
             if (value is float)
             {
-                // NaN/±Infinity 不是合法 JSON 字面量：直接输出会让整条响应被判 malformed。
-                // 按 JSON 惯例降级为 null（P2），比丢掉整条响应安全。
                 var f = (float)value;
-                sb.Append(float.IsNaN(f) || float.IsInfinity(f) ? "null" : f.ToString("R", CultureInfo.InvariantCulture));
+                // NaN/±Infinity 走结构化标记（见 WriteNonFiniteNumber），不再静默变 null。
+                if (float.IsNaN(f) || float.IsInfinity(f)) { WriteNonFiniteNumber(sb, (double)f); return; }
+                sb.Append(f.ToString("R", CultureInfo.InvariantCulture));
                 return;
             }
             if (value is double)
             {
                 var dbl = (double)value;
-                sb.Append(double.IsNaN(dbl) || double.IsInfinity(dbl) ? "null" : dbl.ToString("R", CultureInfo.InvariantCulture));
+                if (double.IsNaN(dbl) || double.IsInfinity(dbl)) { WriteNonFiniteNumber(sb, dbl); return; }
+                sb.Append(dbl.ToString("R", CultureInfo.InvariantCulture));
                 return;
             }
             if (value is int || value is long || value is short || value is byte

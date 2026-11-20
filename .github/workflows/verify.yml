@@ -1,7 +1,18 @@
-# CI 门禁（审计 P1.6 / AUD-BUILD-001）
+# CI 门禁（审计 P1.6 / AUD-BUILD-001 / P2-38）
 #
 # 目标：每次 push / PR 都执行 `npm run verify`，让"声明与实现一致性"不再依赖本地手工。
 # 与本地门禁的唯一差异是环境准备：探针验证需要 mono（csc + 运行时）。
+#
+# 供应链锁定（P2-38）：
+#   1) 全部 Action 用 40 位 commit SHA 固定（注释保留可读版本号）；`v4` 这类主版本标签
+#      可被上游重指向任意 commit，等于把门禁结论交给上游。
+#   2) OpenSpec CLI 固定到 1.7.0 并 `--ignore-scripts`（不在 runner 上执行上游 install 脚本），
+#      且显式断言实际版本 —— 本地 Homebrew 也是 1.7.0，两侧必须同版本才谈得上"同一判定"。
+#   3) Node 固定到补丁版本，避免 minor 变化改变 `node --test` 行为
+#      （注意：step 的 `with:` 不能读取 env 上下文，Node 版本只能写在这里）。
+#   4) mono 锁定到次版本（6.12）：包管理器只保证次版本稳定，patch 随镜像漂移；
+#      锁定次版本意味着镜像升级到 6.14 时门禁会红——这是刻意的，让工具链漂移以 PR
+#      形式显式处理，而不是静默改变探针语义测试的判定环境（R18）。
 name: verify
 
 on:
@@ -12,6 +23,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # 与 package.json engines 一致的补丁版本；升级靠显式 PR（dependabot 只看 Action/npm）。
+  NODE_VERSION: 20.20.2
+  OPENSPEC_VERSION: 1.7.0
+  MONO_REQUIRED_SERIES: '6.12'
+
 jobs:
   verify:
     name: verify (${{ matrix.os }})
@@ -21,11 +38,13 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout@v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - uses: actions/setup-node@v4
+      # actions/setup-node@v4.4.0（与上面的 NODE_VERSION 保持一致，改一处必须改两处）
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 20
+          node-version: 20.20.2
 
       - name: Install C# toolchain
         run: |
@@ -38,16 +57,32 @@ jobs:
 
       - name: Verify toolchain is actually available
         run: |
+          node --version
           csc --version || csc -help | head -3
-          mono --version
+          mono --version | head -2
           node tests/unity-probe/toolchain.mjs
+          # 次版本锁定（R18）：宁可在这里失败，也不要在探针语义测试中途出现不可解释的差异。
+          MONO_ACTUAL=$(mono --version | head -1 | sed -E 's/.*version ([0-9]+\.[0-9]+).*/\1/')
+          echo "mono=$MONO_ACTUAL required=$MONO_REQUIRED_SERIES"
+          if [ "$MONO_ACTUAL" != "$MONO_REQUIRED_SERIES" ]; then
+            echo "::error::mono 次版本漂移：期望 $MONO_REQUIRED_SERIES，实际 $MONO_ACTUAL；请显式升级 MONO_REQUIRED_SERIES 并重跑探针语义测试"
+            exit 1
+          fi
 
-      # OpenSpec CLI：本地开发用 Homebrew 版 1.7.0；CI 用 npm 全局安装并校验版本可用。
-      - name: Install OpenSpec CLI
+      # OpenSpec CLI：固定版本 + 禁用 install 脚本 + 断言实际版本。
+      - name: Install OpenSpec CLI (pinned)
         run: |
-          npm install -g @fission-ai/openspec@latest
-          openspec --version
+          npm install -g "@fission-ai/openspec@${OPENSPEC_VERSION}" --ignore-scripts
+          ACTUAL=$(openspec --version)
+          echo "openspec=$ACTUAL expected=${OPENSPEC_VERSION}"
+          if [ "$ACTUAL" != "${OPENSPEC_VERSION}" ]; then
+            echo "::error::openspec 版本漂移：期望 ${OPENSPEC_VERSION}，实际 ${ACTUAL}"
+            exit 1
+          fi
 
+      # verify 只跑 repo 自足的检查（test / lint / probe / docs / openspec）。
+      # 架构追溯性检查依赖本机 project-architect skill（不在仓库内），由 `npm run verify:arch`
+      # 在本地收尾时单独跑；把它放进 CI 会让干净 runner 必然 ENOENT（AA-BUILD-002）。
       - name: Run verify
         run: npm run verify
 
@@ -55,7 +90,8 @@ jobs:
         run: npm run doctor -- --json > doctor.json || true
         if: always()
 
-      - uses: actions/upload-artifact@v4
+      # actions/upload-artifact@v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: doctor-${{ matrix.os }}

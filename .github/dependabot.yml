@@ -1,0 +1,58 @@
+# 依赖更新（P2-38）：把"上游变更"变成可评审的 PR，而不是门禁里的隐式漂移。
+#
+# 两个生态：
+#   - github-actions：本仓库的 Action 全部按 commit SHA 固定，dependabot 是唯一会
+#     主动把 SHA 往前推的通道；每次推送都是一条可审核、可回滚的 PR。
+#   - npm：仓库当前刻意零运行时依赖（包内只有 peerDependencies，见
+#     packages/dsh-bridge/package.json）。这条配置现在就生效于根 package.json 的
+#     devDependencies；一旦将来引入工具链依赖，它同样会自动接管。
+#
+# 门槛：CI 必须绿 + 人工 approve 才合并。`open-pull-requests-limit` 压低是为了
+# 避免一次性刷出十几条改动淹没真正的安全修复。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '02:00'
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - ci
+    # 主版本升级单独成 PR 并标注：Action 的主版本可能改变输入/输出契约。
+    groups:
+      actions-minor:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '02:30'
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+
+  # 插件包自身的 peerDependencies 也纳入观察：宿主包改名/改版本时会在这里提示。
+  - package-ecosystem: npm
+    directory: /packages/dsh-bridge
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps(plugin)
+    labels:
+      - dependencies

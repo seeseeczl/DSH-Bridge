@@ -15,7 +15,12 @@ bridge_call {instance_id, capability, args_json}
 
 - 能力参数以 JSON 字符串放在 `args_json`（例如 `{"path":"Assets/Scenes/Main.unity"}`）。
 - 探针版本不匹配时调用会被拒绝（`probeOutdated`），先 `bridge_install` 升级。
-- 危险能力默认拒绝，需在插件配置 `allowDangerous` 显式开启（见 `README.md`）。
+- **17 项危险能力默认拒绝**（含 `unity.code.execute`），需在插件配置 `allowDangerous` 显式开启（见 `README.md` 的配置一节）。
+- **写代码 = 执行代码**：`unity.code.execute` 与 `unity.script.apply_edits` 属高权执行面——前者默认拒绝，
+  后者「无论配置如何都按高权处理」（审计不可用即拒）。`unity.asset.create` 写 `.cs`/`.asmdef`/`.asmref`
+  同样需要 `code.execute` 的授权，写普通资产不需要。
+- `bridge_targets` 的 channel status 有六种取值：`unprobed` / `ready` / `idle`（可调用，会先唤醒）/
+  `channel_missing`（重装探针）/ `stale` / `error`（看 `error.code`）。`idle` 不是故障。
 
 ## 1. 视觉反馈（新增）
 
@@ -132,7 +137,7 @@ bridge_call {instance_id, capability, args_json}
 { "path": "File/Save Project" }                  // unity.menu.execute
 ```
 
-- 默认关闭（`DEFAULT_DANGEROUS`），需 `allowDangerous` 显式开启。
+- 默认关闭（`DEFAULT_DANGEROUS`），需 `allowDangerous` 显式开启；要永久禁止用 `denied`。
 - 可执行任意编辑器菜单（含工程内自定义菜单），等价任意编辑器操作；不存在/不可执行的菜单返回 `menu_not_found`。
 
 ## 8. 性能参考
@@ -141,7 +146,7 @@ bridge_call {instance_id, capability, args_json}
 
 ## 9. v0.0.9 契约变化（AUD-CODE-001 修复）
 
-- **危险能力**：探针侧也要求授权快照（13 项与 DSH 侧一致）；DSH 侧行为不变（默认拒绝，`allowDangerous` 放行）。
+- **危险能力**：探针侧也要求授权快照（当时 16 项，v0.0.10 起为 17 项，与 DSH 侧逐项一致）；DSH 侧默认拒绝，`allowDangerous` 放行。
 - **截图序列**：`count ≤ 200`、`intervalMs ≤ 5000`、总预算 10s，超限 `invalid_argument`（响应含 `plannedDurationMs`）；PlayMode 的 game 截图走 `ScreenCapture`。
 - **脚本校验**：只接受 `.cs`；响应含 `encoding` / `definesSource` / `truncated`。
 - **脚本编辑**：保留文件 BOM/编码；响应含 `encoding` / `bom` / `newline`。
@@ -245,3 +250,27 @@ bridge_call {instance_id, capability, args_json}
 ```
 
 边界：`unity.docs.*` 从引擎安装目录的 `Documentation/<lang>/ScriptReference` 读取（只读、离线）；文档缺失时返回 `docs_unavailable`。`unity.reflect.signature` 读的是运行中程序集，包含工程自定义类型，比文档更贴近实际。
+
+## 11. 数据落点与保留期
+
+「跑完一次调用，磁盘上多了什么」——这张表是运维/合规检查的入口，与
+`docs/00-governance/security-data-governance.md` 的分类表同源：
+
+| 数据 | 位置 | 保留 | 删除方式 |
+| --- | --- | --- | --- |
+| 实例注册（含 pid、工程路径、配对 nonce） | `<project>/Library/DSHBridge/instance.json`（`0600`） | 实例生命周期 | 卸载即删；重装探针轮换 nonce |
+| 请求/响应 | `<project>/Library/DSHBridge/<bootId>/{inbox,outbox,in-progress}` | outbox 超过 10 分钟被清扫 | 自动清扫 |
+| 已处理归档 | `<project>/Library/DSHBridge/<bootId>/done/` | 7 天或 2000 条 | 自动清扫 |
+| 事件 | `<project>/Library/DSHBridge/<bootId>/events/` | 7 天或 5000 条 | 自动清扫 |
+| 截图 | `<project>/Library/DSHBridge/artifacts/`（含 `sequence/`） | 最近 200 个 | 自动轮转 |
+| 作业 | `<project>/Library/DSHBridge/jobs/` | 500 条 | 自动轮转 |
+| 审计 | `$HOME/.dsh/bridge/audit.log`（`0600`，8 MiB 轮转） | 1 份轮转 | 手动删除 |
+| 审计参数归档 | `$HOME/.dsh/bridge/audit-code/<requestId>.json`（`0700`/`0600`） | 随审计日志清理 | 手动删除 |
+| 主题知识 | `$HOME/.dsh/bridge/knowledge/<instanceId>/topics/*.md` | 无期限（用户内容） | `bridge_knowledge_delete` |
+| Git 元数据 | `<project>/.git/info/exclude`（追加一条） | 直到卸载 | 卸载时撤销 |
+
+两点必须知道：
+
+- `bridge_uninstall` 默认连 `<project>/Library/DSHBridge/` 一起删；要保留排障现场传 `keep_diagnostics: true`，
+  返回里的 `channelPurged` 告诉你实际清了哪个目录（未清理为 `null`）。
+- 审计只记录参数形状与内容哈希，**不落正文**；需要复核 `code.execute` 的完整源码时才查 `audit-code/`。

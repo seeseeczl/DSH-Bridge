@@ -53,13 +53,17 @@ export function readProbeTemplateText() {
 
 /** C# 字符串字面量：转义反斜杠、引号与控制字符，避免能力名注入破坏源码结构。 */
 function csharpString(value) {
-  const escaped = String(value)
+  return `"${csharpStringBody(value)}"`
+}
+
+/** 与 csharpString 相同但不加外层引号：用于模板里已经在引号内的占位符。 */
+function csharpStringBody(value) {
+  return String(value)
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n')
     .replace(/\t/g, '\\t')
-  return `"${escaped}"`
 }
 
 /**
@@ -74,7 +78,8 @@ function renderSnapshot(allowDangerous) {
 
 function renderTemplate(name, { probeVersion, allowDangerous, denied }) {
   return templateOf(name)
-    .replaceAll('__PROBE_VERSION__', String(probeVersion))
+    // 版本号在模板里位于引号内（ProbeVersion = "__PROBE_VERSION__"），只转义内容、不重复加引号。
+    .replaceAll('__PROBE_VERSION__', csharpStringBody(probeVersion))
     .replaceAll('__ALLOW_DANGEROUS__', renderSnapshot(allowDangerous))
     .replaceAll('__DENY_CAPABILITIES__', renderSnapshot(denied))
 }

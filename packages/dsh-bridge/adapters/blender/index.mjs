@@ -1,14 +1,11 @@
 // Blender 适配器骨架：只用于验证「新增软件不改内核」。
 // 真实实现留给第二期；这里提供发现/安装/调用形状与一个探针模板占位。
-import { readFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-import { instanceIdFor, newRequestId, normalizeInstance } from '../../core/identity.mjs'
+import { join } from 'node:path'
+import { newRequestId, normalizeInstance } from '../../shared/identity.mjs'
 import { assertInside, PolicyError } from '../../safety/policy.mjs'
-import { ensureBootDirs, purgeRequest, readInstance, waitForResponse, writeRequest } from '../../transport/mailbox.mjs'
+import { readInstance } from '../../transport/mailbox.mjs'
+import { executionStateOf, invokeOverChannel } from '../../transport/invoke-protocol.mjs'
 
-const run = promisify(execFile)
 export const PROBE_VERSION = '0'
 
 export const BLENDER_CAPABILITIES = Object.freeze([
@@ -20,25 +17,18 @@ const PROBE_SOURCE = `# DSH-Bridge Blender probe (skeleton)
 PROBE_VERSION = "${PROBE_VERSION}"
 `
 
+/**
+ * 发现：骨架阶段不产出实例（P3-85）。
+ *
+ * ps 命令行里只能拿到可执行文件路径（/Applications/Blender.app/Contents/MacOS/Blender），
+ * 而 projectPath 会被 channelRoot / instanceIdFor / probeHeartbeat 直接当成目录拼接 ——
+ * 把一个可执行文件当工程路径，结果是实例恒为 unprobed（心跳文件永远读不到），
+ * 且 bridge_targets 对外返回一个错误的「工程位置」，误导 Agent 与脚本。
+ * 第二期由 bpy 侧上报真实 .blend 工程目录后再返回候选；在那之前宁可没有实例，
+ * 也不伪造一条错误路径（即使 install 目前抛 adapter_skeleton，也没有理由留下这个假路径）。
+ */
 async function discoverBlender() {
-  try {
-    const { stdout } = await run('ps', ['-Ao', 'pid=,comm='], { maxBuffer: 4 * 1024 * 1024 })
-    const out = []
-    const seen = new Set()
-    for (const line of stdout.split('\n')) {
-      const m = /^(\d+)\s+(.*\/Blender\.app\/Contents\/MacOS\/Blender)$/.exec(line.trim())
-      if (!m) continue
-      // 骨架阶段没有工程路径解析：用进程号占位，避免伪造错误路径。
-      const projectPath = m[2]
-      const instanceId = instanceIdFor('blender', projectPath)
-      if (seen.has(instanceId)) continue
-      seen.add(instanceId)
-      out.push({ adapterId: 'blender', instanceId, pid: Number(m[1]), projectPath, projectName: basename(projectPath), engine: 'blender' })
-    }
-    return out
-  } catch {
-    return []
-  }
+  return []
 }
 
 export function createBlenderAdapter() {
@@ -68,33 +58,23 @@ export function createBlenderAdapter() {
       return { removed: [], note: '骨架：无实际探针' }
     },
 
+    /**
+     * 能力调用：与 unity 适配器共用 transport/invoke-protocol.mjs（P3-59 / P3-95）。
+     * 骨架版此前缺「终局取件」与「三态判定」，会把已执行但响应迟到的调用误报成可安全重试的 timeout。
+     */
     async invoke(instance, capability, args = {}, { timeoutMs = 30000, signal } = {}) {
       if (!BLENDER_CAPABILITIES.includes(capability)) {
         throw new PolicyError('capability_unsupported', `Blender 未声明能力 ${capability}`)
       }
-      const identity = {
-        instanceId: instance.instanceId,
-        bootId: instance.bootId,
-        nonce: instance.nonce,
-        projectPath: instance.projectPath,
-      }
-      if (!identity.bootId || !identity.nonce) {
-        throw new PolicyError('instance_not_ready', 'Blender 探针尚未就绪（骨架未实现）')
-      }
-      await ensureBootDirs(instance.projectPath, identity.bootId)
-      const id = newRequestId()
-      await writeRequest(instance.projectPath, identity.bootId, {
-        v: 1, id, instanceId: identity.instanceId, bootId: identity.bootId, nonce: identity.nonce,
-        cap: capability, args, issuedAt: Date.now(), deadlineMs: timeoutMs,
+      return invokeOverChannel({
+        instance,
+        capability,
+        args,
+        timeoutMs,
+        signal,
+        notReadyMessage: 'Blender 探针尚未就绪（骨架未实现）',
+        executionStateOf,
       })
-      try {
-        const response = await waitForResponse(identity, id, { timeoutMs, signal })
-        if (!response.ok) throw Object.assign(new Error(response.error?.message ?? 'probe error'), { code: response.error?.code })
-        return response.data ?? null
-      } catch (error) {
-        if (error?.code === 'timeout') await purgeRequest(instance.projectPath, identity.bootId, id)
-        throw error
-      }
     },
 
     async events() {
@@ -108,4 +88,3 @@ export function createBlenderAdapter() {
 }
 
 export const blenderAdapter = createBlenderAdapter()
-export { PROBE_SOURCE as blenderProbeSource, readFile }

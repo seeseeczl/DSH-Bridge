@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { Bridge } from '../../packages/dsh-bridge/core/bridge.mjs'
 import { createBlenderAdapter } from '../../packages/dsh-bridge/adapters/blender/index.mjs'
 import { createUnityAdapter } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
-import { assertUniqueCapabilities, validateAdapter } from '../../packages/dsh-bridge/adapters/contract.mjs'
+import { assertUniqueCapabilities, validateAdapter } from '../../packages/dsh-bridge/shared/contract.mjs'
 import {
   assertInside,
   authorizeCapability,

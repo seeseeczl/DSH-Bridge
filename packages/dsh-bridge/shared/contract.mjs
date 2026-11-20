@@ -9,6 +9,20 @@ export const ADAPTER_REQUIRED = Object.freeze([
   'uninstall',
 ])
 
+// 可选成员（P3-59）：适配器按需实现，内核据此决定是否提供唤醒 / 扫描 / 事件 / 收敛等能力。
+// 此前 bridge.mjs、preinstall.mjs、discovery.mjs 各写一遍 typeof 探测，缺失时静默降级且无处可查；
+// 现在集中在此定义，注册期一次性算出能力表（adapterFeatureTable），缺失项显式记录而不是靠读代码发现。
+export const ADAPTER_OPTIONAL = Object.freeze([
+  'wake',
+  'scan',
+  'events',
+  'settle',
+  'backlog',
+  'installStandalone',
+  'isInstalled',
+  'probePresence',
+])
+
 export class AdapterError extends Error {
   constructor(code, message, detail) {
     super(message)
@@ -49,7 +63,38 @@ export function validateAdapter(adapter) {
       )
     }
   }
+  // 可选成员一旦提供就必须可调用：否则 typeof 探测会把「实现错了」当成「没实现」，
+  // 静默降级，正是 P3-59 要消除的问题。
+  for (const key of ADAPTER_OPTIONAL) {
+    const value = adapter[key]
+    if (value !== undefined && value !== null && typeof value !== 'function') {
+      throw new AdapterError(
+        'adapter_invalid',
+        `适配器 ${adapter.id} 的 ${key} 是可选成员，一旦提供必须是函数`,
+      )
+    }
+  }
   return adapter
+}
+
+/**
+ * 注册期一次性算出适配器对可选成员的实际支持情况，供内核取代散落的 typeof 探测。
+ * 返回冻结对象；`missing` 用于诊断（bridge_targets / doctor），把「未实现」显式暴露出来。
+ * `has(key)` 是给调用点读起来更直白的便捷判断。
+ */
+export function adapterFeatureTable(adapter) {
+  const implemented = []
+  const missing = []
+  for (const key of ADAPTER_OPTIONAL) {
+    if (typeof adapter?.[key] === 'function') implemented.push(key)
+    else missing.push(key)
+  }
+  const implementedSet = new Set(implemented)
+  return Object.freeze({
+    implemented: Object.freeze(implemented),
+    missing: Object.freeze(missing),
+    has: (key) => implementedSet.has(key),
+  })
 }
 
 /** 全局能力唯一性：不同适配器不得声明同名能力。 */
@@ -65,10 +110,4 @@ export function assertUniqueCapabilities(adapters) {
     }
   }
   return seen
-}
-
-/** 从能力名解析归属适配器。 */
-export function adapterIdOfCapability(capability) {
-  const index = capability.indexOf('.')
-  return index > 0 ? capability.slice(0, index) : null
 }

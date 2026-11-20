@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bootPaths } from '../../packages/dsh-bridge/transport/mailbox.mjs'
 import { createUnityAdapter, UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
-import { instanceIdFor } from '../../packages/dsh-bridge/core/identity.mjs'
+import { instanceIdFor } from '../../packages/dsh-bridge/shared/identity.mjs'
 import { Bridge } from '../../packages/dsh-bridge/core/bridge.mjs'
 import { FakeEditor } from '../fixtures/fake-editor.mjs'
 
@@ -26,8 +26,11 @@ test('执行期超时返回 in_flight 而不是 timeout', async () => {
 
   try {
     await bridge.targets()
+    // 用 asset.create 制造「执行期超时」：它默认配置下可调用（写 .cs 的授权闸门在探针侧
+    // 按扩展名精确拦截，DSH 侧不再按能力名一刀切——见 P1-1/P1-4 收口），
+    // 因此这里能把请求真正下发到通道，而不是在授权阶段就被 capability_disabled 拦掉。
     await assert.rejects(
-      () => bridge.call(id, 'unity.asset.save'.replace('.save', '.create'), { kind: 'text', path: 'Assets/Slow.txt' }, { timeoutMs: 250 }),
+      () => bridge.call(id, 'unity.asset.create', { kind: 'text', path: 'Assets/Slow.txt' }, { timeoutMs: 250 }),
       (error) => {
         assert.equal(error.code, 'in_flight')
         assert.equal(error.retryable, false, 'in_flight 必须显式标记为不可直接重试')

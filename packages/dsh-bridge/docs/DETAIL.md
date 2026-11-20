@@ -59,7 +59,7 @@
 | `unity.window.list` / `unity.window.focus` / `unity.input.send` | 编辑器窗口枚举/聚焦与受管输入注入（key/mouse/scroll；系统级模态对话框不在范围） |
 | `unity.reflect.invoke` | 反射访问成员：多候选名、绑定标志、命中回传（**默认关闭**） |
 | `unity.api.batch` | 批量调用 + 共享 Undo 组 + 失败回滚/补偿 + `failures[]`（**默认关闭**） |
-| `unity.code.execute` | 进程内编译执行 C#，等价 MCP `execute_code`（**默认开启**） |
+| `unity.code.execute` | 进程内编译执行 C#，等价 MCP `execute_code`（**默认需显式授权**：在 `DEFAULT_DANGEROUS` 的 17 项里） |
 
 ## v0.0.10 能力补齐（39 项，对标 MCP for Unity / Codely）
 
@@ -116,8 +116,9 @@ Unity 会在 `Packages/packages-lock.json` 中追加一条包记录（引擎行�
 探针侧另有三层边界：
 
 1. **路径边界**：`unity.asset.read` / `unity.asset.create` / `unity.importer.*` / `unity.asset.*` 的所有路径都先 `GetFullPath` 再要求落在工程根之内，绝对路径与 `../` 逃逸一律返回 `path_escape`；读写限定在文本类资产扩展名。
-2. **能力闸门**：反射执行面（`reflect.invoke` / `api.invoke` / `api.members`）与 `unity.menu.execute` 等危险能力默认拒绝，只有 DSH 侧 `allowDangerous` 授权后才放行；探针侧不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先，风险由调用方承担）。反射面的未授权请求即使绕过 DSH 直接写入 inbox，也会被拒绝并写一条 `request_rejected` 事件。
-3. **成员黑名单**：反射面即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `CompilationPipeline` / `System.Diagnostics.Process` 等类型，以及 `ExecuteMenuItem` / `Exit` 等成员；`api.invoke` / `api.members` 只暴露公开成员。
+2. **能力闸门**：反射执行面（`reflect.invoke` / `api.invoke` / `api.members` / `api.batch`）、`unity.menu.execute`、资产破坏性操作、`unity.code.execute` 等 **17 项**默认拒绝，只有 DSH 侧 `allowDangerous` 授权后才放行；探针侧不再永久封禁任何能力（用户决策 2026-11-18：能力与自由优先，风险由调用方承担），但危险清单必须与 DSH 侧 `DEFAULT_DANGEROUS` 逐项一致。写 `.cs`/`.asmdef`/`.asmref` 与 `code.execute` 共用同一份授权快照。未授权请求即使绕过 DSH 直接写入 inbox，也会被拒绝并写一条 `request_rejected` 事件。
+3. **真实路径不可用即拒绝**：`ResolveProjectPath` 解析符号链接/ReparsePoint 失败时（平台不支持 realpath、权限异常）按 fail-closed 处理——拒绝该次写入，而不是"跳过校验继续执行"。
+4. **成员黑名单**：反射面即使已授权，也硬拒绝 `EditorApplication` / `AssetDatabase` / `CompilationPipeline` / `System.Diagnostics.Process` 等类型，以及 `ExecuteMenuItem` / `Exit` 等成员；`api.invoke` / `api.members` 只暴露公开成员。
 
 被拒绝的请求会同时写事件与 `outbox/<id>.rejected.json`，便于 DSH 侧在调用返回时就看到原因。
 
@@ -131,6 +132,24 @@ config:
     - unity.reflect.invoke
     - unity.menu.execute   # 危险：可执行任意编辑器菜单（含工程内自定义菜单代码）
 ```
+
+反之，要把默认放行的能力**收紧**成「需显式授权」，用 `dangerous`（新名 `requireAuth`，两者等价）：
+
+```yaml
+config:
+  dangerous:
+    - unity.code.execute   # 写代码 = 执行代码；收紧后必须写进 allowDangerous 才可用
+```
+
+想让某个能力在本项目里**永远不可用**（连 `allowDangerous` 也不认），用 `denied`：
+
+```yaml
+config:
+  denied:
+    - unity.menu.execute
+```
+
+完整键表与环境变量见 `README.md` 的「配置」一节。
 
 ## 反射执行面（面向 ASE 这类需要私有字段的调用方）
 
@@ -211,6 +230,10 @@ config:
 - 响应附带 `referenceCount` / `referenceCached` / `referenceBuildMs`：引用集按「目录指纹」缓存，命中后不再重扫。
 - 单次执行超过 5s 会向事件流写一条 `code_execute_slow`（含 `elapsedMs`、`codeBytes`、`codeSha256Prefix`，**不写代码正文**）。
   `code.execute` 在主线程同步执行且**无法中断**，慢调用可观测是当前唯一能落地的边界。
+- **授权与审计**：`unity.code.execute` 属 `DEFAULT_DANGEROUS`（默认拒绝）且同时属 `ALWAYS_HIGH_RISK`
+  （审计被禁用或写入失败时一律拒绝，`audit_unavailable`）。需要 ASE 这类工作流时显式写
+  `allowDangerous: [unity.code.execute]`；只想事后复核而不想留正文时，审计只保存参数形状 + 内容哈希，
+  完整参数按需落到 `~/.dsh/bridge/audit-code/`。
 
 ### 配置化硬拒绝（`bridge.denied`）
 
@@ -467,8 +490,7 @@ return true;
 
 ### 授权与危险能力
 
-- 探针侧 `_reflectCapabilities` 与 DSH `DEFAULT_DANGEROUS` 同为 13 项：asset.refresh/delete/move/rename/duplicate、importer.set、menu.execute、package.add/remove 以及 4 个反射能力。
-  （v0.0.10 起扩到 **16 项**，新增 `unity.tag.remove`、`unity.layer.remove`、`unity.physics.simulate`；两侧由单测强制双向一致。）
+- 探针侧 `_reflectCapabilities` 与 DSH `DEFAULT_DANGEROUS` 完全一致（**16 项**）：asset.refresh/delete/move/rename/duplicate、importer.set、menu.execute、package.add/remove、tag.remove、layer.remove、physics.simulate 以及 4 个反射能力；两侧由单测 `probe-source-shape` 强制双向一致。
 - 反射面拒绝元编程类型（Type/MethodInfo/FieldInfo/Assembly/Activator/Delegate 等）与返回句柄；batch 内嵌 code 需 `code.execute` 未被 `bridge.denied` 禁用。
 
 ### 作业

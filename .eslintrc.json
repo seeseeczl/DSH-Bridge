@@ -1,0 +1,45 @@
+{
+  "root": true,
+  "env": {
+    "node": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "module"
+  },
+  "rules": {
+    "indent": [
+      "error",
+      2,
+      {
+        "SwitchCase": 1
+      }
+    ],
+    "no-tabs": "error",
+    "no-mixed-spaces-and-tabs": "error",
+    "no-trailing-spaces": "error",
+    "eol-last": [
+      "error",
+      "always"
+    ],
+    "linebreak-style": [
+      "error",
+      "unix"
+    ],
+    "import/first": "error"
+  },
+  "dshCustomChecker": {
+    "note": "本仓库不安装 eslint（P3-98 明确不引入新依赖）。这张表是 scripts/check-code-style.mjs 的唯一规则来源：它按 rules 里声明的规则名执行等价检查，因此升级到真正的 eslint 只需要安装依赖，不需要重写期望。styleScope 刻意不含 tests/：交付代码先行，测试的风格债单独跟踪，避免门禁被一次性刷成红灯。",
+    "implementedBy": "scripts/check-code-style.mjs",
+    "styleScope": [
+      "packages",
+      "scripts"
+    ],
+    "syntaxScope": [
+      "packages",
+      "scripts",
+      "tests"
+    ]
+  }
+}

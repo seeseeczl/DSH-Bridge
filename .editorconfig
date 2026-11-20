@@ -1,0 +1,22 @@
+# 编辑器基线（P3-98）。权威门禁是 scripts/check-code-style.mjs：
+# 本文件只影响编辑器行为，不参与 `npm run lint` 的判定。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown 用「行尾两个空格 = 硬换行」，不能裁剪。
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.{cs,tpl}]
+# 探针 C# 模板沿用 4 空格（Unity 惯例），与插件 JS 的 2 空格并存。
+indent_size = 4

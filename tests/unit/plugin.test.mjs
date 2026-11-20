@@ -31,7 +31,7 @@ test('插件模块导出契约', () => {
 
 test('apply 注册 11 个工具且 schema 完整', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   assert.equal(registered.length, 11)
   const names = registered.map((t) => t.name).sort()
   assert.deepEqual(names, [
@@ -49,7 +49,7 @@ test('apply 注册 11 个工具且 schema 完整', async () => {
 
 test('bridge_targets 在无目标软件时返回空集合而非报错', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   const tool = registered.find((t) => t.name === 'bridge_targets')
   const value = await tool.execute({}, {})
   assert.ok(Array.isArray(value.instances))
@@ -59,7 +59,7 @@ test('bridge_targets 在无目标软件时返回空集合而非报错', async ()
 
 test('bridge_call 对未知实例返回结构化错误', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   const tool = registered.find((t) => t.name === 'bridge_call')
   await assert.rejects(
     () => tool.execute({ instance_id: 'unity:does-not-exist', capability: 'unity.editor.status' }, {}),
@@ -69,7 +69,7 @@ test('bridge_call 对未知实例返回结构化错误', async () => {
 
 test('bridge_call 对未声明能力在发送前拒绝', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   const call = registered.find((t) => t.name === 'bridge_call')
   // 先构造一个已登记但能力不匹配的实例：直接借道 bridge_targets 的空结果无法覆盖，
   // 因此用 dangerous 能力的关闭路径验证 gate。
@@ -93,7 +93,7 @@ test('配置解析：环境变量与显式配置优先级', () => {
 
 test('bridge_docs 无参数时返回结构化错误而不是抛异常', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   const tool = registered.find((t) => t.name === 'bridge_docs')
   const value = await tool.execute({}, {})
   assert.equal(value.source, 'local-docs')
@@ -102,7 +102,7 @@ test('bridge_docs 无参数时返回结构化错误而不是抛异常', async ()
 
 test('bridge_docs 支持无实例的符号检索（本机无文档时也返回结构化结果）', async () => {
   const { ctx, registered } = mockContext()
-  await plugin.apply(ctx, { auditPath: null })
+  await plugin.apply(ctx, { auditPath: null, agentsRule: false })
   const tool = registered.find((t) => t.name === 'bridge_docs')
   const value = await tool.execute({ symbol: 'Rigidbody', limit: 3 }, {})
   assert.equal(value.source, 'local-docs')

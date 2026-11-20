@@ -117,6 +117,39 @@ test('探针危险能力闸门与 DEFAULT_DANGEROUS 完全一致（双向）', a
   const probeDanger = [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort()
   const policyDanger = [...DEFAULT_DANGEROUS].sort()
   assert.deepEqual(probeDanger, policyDanger, '探针闸门与 policy.DEFAULT_DANGEROUS 漂移')
+  // 顺序也要一致：两侧同步维护时按同一段落下笔，避免「项数对了但语义分组错了」。
+  assert.deepEqual(
+    [...match[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]),
+    [...DEFAULT_DANGEROUS],
+    '探针闸门与 policy.DEFAULT_DANGEROUS 顺序必须一致',
+  )
+})
+
+// P3-70：code.execute 进 _reflectCapabilities 是「默认拒绝」真正生效的唯一条件——
+// EnsureCapabilityAllowed 只遍历这份清单，不在里面就直接放行。
+test('P3-70：unity.code.execute 已进探针闸门，未授权时 EnsureCapabilityAllowed 会拒绝', async () => {
+  const source = readProbeTemplateText()
+  const match = source.match(/_reflectCapabilities = new string\[\] \{([\s\S]*?)\};/)
+  assert.ok(match, '找不到探针 _reflectCapabilities 数组')
+  assert.ok(match[1].includes('"unity.code.execute"'), 'code.execute 必须在这份授权快照清单里')
+  // 闸门本体：命中清单后没有 Granted() 就抛 capability_denied（Security 分片）。
+  assert.match(source, /_reflectCapabilities\[i\][\s\S]*?Granted\(cap\)[\s\S]*?capability_denied/)
+})
+
+// P1-1 / P1-4 闭环：写可编译源码与直接执行代码共用同一份授权快照，
+// 且按扩展名精确拦截（而不是把所有资产写入一刀切）。
+test('P1-1/P1-4：可编译源码写入复用 code.execute 授权快照', async () => {
+  const source = readProbeTemplateText()
+  assert.match(source, /EnsureCompilableSourceWritable\(string assetPath/, '缺少精确写守卫')
+  assert.match(source, /IsCompilableSourcePath/, '必须按扩展名判别可编译源码')
+  const guard = source.match(/static void EnsureCompilableSourceWritable\(string assetPath[\s\S]*?\n        \}/)
+  assert.ok(guard, '找不到 EnsureCompilableSourceWritable 函数体')
+  assert.match(guard[0], /EnsureCapabilityAllowed\("unity\.code\.execute"\)/, '写 .cs 必须查 code.execute 授权')
+  const isCompilable = source.match(/static bool IsCompilableSourcePath\(string assetPath\)[\s\S]*?\n        \}/)
+  assert.ok(isCompilable, '找不到 IsCompilableSourcePath 函数体')
+  for (const ext of ['.cs', '.asmdef', '.asmref']) {
+    assert.ok(isCompilable[0].includes(`"${ext}"`), `可编译扩展名必须包含 ${ext}`)
+  }
 })
 
 // 审计修复（AUD-CODE-001）：P0/P1/P2 关键机制必须在源码里可验证。
@@ -154,7 +187,7 @@ test('审计修复：写保护、输入注入交付标记与参数校验', async
   assert.match(source, /EventModifiers/)
 })
 
-test('审计修复：危险能力闸门扩展到全部危险能力（13 项）', async () => {
+test('审计修复：危险能力闸门扩展到全部危险能力（16 项）', async () => {
   const source = readProbeTemplateText()
   for (const capability of [
     'unity.menu.execute', 'unity.package.add', 'unity.package.remove',

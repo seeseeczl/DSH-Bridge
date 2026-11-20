@@ -41,9 +41,10 @@ namespace DSHBridge
         const double InitRetryInterval = 30.0;
 
         // ===== 安全边界（AA-OPT-001/002/003）=====
-        // 与 DSH 侧 safety/policy.mjs 的 DEFAULT_DANGEROUS 保持**完全一致**（16 项）：
+        // 与 DSH 侧 safety/policy.mjs 的 DEFAULT_DANGEROUS 保持**完全一致**（17 项）：
         // 它们要么能改变宿主状态（资产破坏/导入设置/包依赖/菜单执行/强制刷新/工程级标签层删除/物理推进），
-        // 要么提供常驻反射执行面，因此即使请求绕过 DSH 直接写进 inbox，探针也会拒绝。
+        // 要么提供常驻反射执行面（任意 C# 执行的 code.execute 同位），因此即使请求绕过 DSH 直接写进 inbox，
+        // 探针也会拒绝。
         // 真正的用户授权在 DSH 侧；探针只认安装时渲染进 _grantedCapabilities 的源码快照，
         // 或 argv 整机旁路，运行期无法通过写 Library 下的文件自行提权。
         // 曾经这里只有 4 个反射能力，注释却宣称与 DEFAULT_DANGEROUS 一致，导致
@@ -54,7 +55,11 @@ namespace DSHBridge
             "unity.asset.duplicate", "unity.importer.set", "unity.menu.execute",
             "unity.package.add", "unity.package.remove",
             // v27：工程级破坏操作与物理世界推进，同样默认关闭（与 policy.mjs 逐项对应）。
-            "unity.tag.remove", "unity.layer.remove", "unity.physics.simulate"
+            "unity.tag.remove", "unity.layer.remove", "unity.physics.simulate",
+            // P3-70：写代码 = 执行代码 = 需授权。code.execute 过去是唯一默认开启的高权能力，
+            // 不在本清单里意味着 EnsureCapabilityAllowed 直接放行——即使它在 DSH 侧被 bridge.dangerous
+            // 收紧，绕过 DSH 直接写 inbox 仍可执行任意 C#。现在两侧同时纳入，闸门才真正闭合。
+            "unity.code.execute"
         };
         // 探针侧永久关闭的高危执行面：没有任何配置能打开，避免"换个能力名就绕过反射限制"。
         // 用户决策（2026-11-18）：能力与自由优先，unity.menu.execute 从永久封禁降级为
@@ -88,6 +93,8 @@ namespace DSHBridge
         const int SearchFileBudget = 4000;
 
         static string _projectRoot;
+        // 工程根的真实路径（跟随符号链接）。只用于「是否允许」的判定，不改变对外路径形态。
+        static string _projectRootReal;
         static string _rootDir;
         static string _inboxDir;
         static string _outboxDir;
@@ -212,6 +219,15 @@ namespace DSHBridge
         {
             _projectRoot = Directory.GetParent(Application.dataPath).FullName;
             _rootDir = Path.Combine(_projectRoot, RootRelative);
+            // AA-SEC-003：解析工程根的真实路径。工程根自身在符号链接下（/tmp/link、macOS 的 /var）时，
+            // 字符串比较会把「真实在工程内」的路径误判成越界；以真实根为基准才能既挡外逃又不误伤。
+            // 解析失败（P/Invoke 不可用等）时降级为字符串检查，避免整台机器不可用。
+            _projectRootReal = CanonicalizeExistingPrefix(_projectRoot);
+            if (string.IsNullOrEmpty(_projectRootReal))
+            {
+                _projectRootReal = _projectRoot;
+                _realpathFallback = true;
+            }
 
             var self = Process.GetCurrentProcess();
             _pid = self.Id;
@@ -554,6 +570,9 @@ namespace DSHBridge
                 _nextOutboxSweep = now + OutboxSweepInterval;
                 try { SweepStaleOutbox(); }
                 catch (Exception e) { LogTickFailure("outbox-sweep", e); }
+                // done/ 与 outbox 共用同一节奏（60s）；独立 try/catch 保证一侧失败不影响另一侧。
+                try { SweepDoneArchive(); }
+                catch (Exception e) { LogTickFailure("done-sweep", e); }
             }
             try { JobTick(); }
             catch (Exception e) { LogTickFailure("job-tick", e); }
@@ -594,15 +613,58 @@ namespace DSHBridge
         const int MaxDiscardsPerScan = 8;
 
         /// <summary>
+        /// 一次扫描最多执行多少个有效请求（P2-25）。
+        ///
+        /// 旧实现「消费一个就 break」把吞吐钉死在 10 req/s（ScanInterval=0.1s → 一帧一个），
+        /// 并发调用时队头阻塞会直接把后续请求拖到调用方超时。这里允许一次扫描连续执行若干个，
+        /// 并用 ScanBudgetMs 兜住主线程占用；单个请求本身的耗时无法中断，预算只决定
+        /// 「是否再取下一个」，这是探针能给出的边界。
+        /// </summary>
+        const int MaxRequestsPerScan = 4;
+
+        /// <summary>一次扫描的执行预算（毫秒）：已执行过请求且超出预算时不再取下一个。</summary>
+        const double ScanBudgetMs = 50;
+
+        /// <summary>
+        /// inbox 待处理上限（P2-47）：与 DSH 侧 transport/mailbox.mjs 的 `MAX_INBOX_FILES`
+        /// **同名同值**（64）。两侧各守一段：
+        ///   - DSH 写请求前：积压 ≥ 上限即抛 `instance_busy`（可重试），请求根本不会落盘；
+        ///   - 探针扫描前：超过上限的部分立即回写同名 `instance_busy` 并移出 inbox，
+        ///     兜住「绕过 DSH 直接写 inbox」与「DSH 侧上限被改动/未生效」的情况。
+        /// 用同一个错误码是为了让调用方的退避逻辑只认一个名字，不需要区分错误来源。
+        /// </summary>
+        const int MaxInboxBacklog = 64;
+
+        /// <summary>
+        /// 一次扫描最多回写多少个积压拒绝（P2-47）：拒绝本身只是写一个小 JSON + 归档，
+        /// 但上限仍要设，否则外部一次性写满 inbox 时这一轮扫描会长时间占住主线程。
+        /// 剩下的由下一轮扫描（每 0.1s）继续，最终仍会清空。
+        /// </summary>
+        const int MaxBacklogRejectsPerScan = 64;
+
+        /// <summary>
         /// outbox 响应的保留时长。超过这个时长还没被调用方取走，说明该调用早已放弃
         /// （超时返回），留着只会无限累积、并把通道变成一个越来越大的伪造/误配对来源。
         ///
-        /// 只清 outbox，**不动 done/**：done 是审计与排障痕迹，删掉就无法回答「上次到底做了什么」。
+        /// 这里只管 outbox；done/（请求/响应的历史归档）由 SweepDoneArchive 按
+        /// DoneRetentionMs（7 天）与 MaxDoneFiles（2000 条）回收，口径与治理文档一致。
         /// </summary>
         const double OutboxRetentionMs = 10 * 60 * 1000;
 
         /// <summary>清理节奏：每 60 秒最多扫一次，避免每帧做目录遍历。</summary>
         const double OutboxSweepInterval = 60;
+
+        /// <summary>
+        /// done/ 归档的保留时长（P2-26/P2-35/P2-56/P3-69/P3-110）。
+        ///
+        /// 与治理文档承诺的「请求/响应保留 7 天」一致。旧实现把 done/ 当成「永不删除的
+        /// 排障现场」，实际是每次调用留下 1~2 个文件（请求 + 响应，含完整 args 原文）的
+        /// 无界增长源；卸载后也没有任何进程会再清扫它。
+        /// </summary>
+        const double DoneRetentionMs = 7 * 24 * 60 * 60 * 1000;
+
+        /// <summary>done/ 归档的条数上限：超出时按 mtime 删除最旧的，保留最近 2000 条排障现场。</summary>
+        const int MaxDoneFiles = 2000;
 
         static double _nextOutboxSweep;
 
@@ -648,6 +710,65 @@ namespace DSHBridge
         }
 
         /// <summary>
+        /// 回收 done/ 里超龄或超量的归档（P2-26/P2-35/P2-56/P3-69/P3-110）。
+        ///
+        /// done/ 里的文件是**已完成请求的原始请求体与响应体**（可能包含 code.execute 的源码、
+        /// asset.read 的资产正文、完整 args），旧策略是「永不删除、只随整条 bootId 目录陈旧回收」，
+        /// 结果是同一个编辑器会话内随调用次数线性增长，且卸载后无人清理。
+        ///
+        /// 回收口径与治理文档一致：超过 DoneRetentionMs（7 天）删除；数量超过 MaxDoneFiles 时
+        /// 只删最旧的，保留最近 2000 条排障现场。按 mtime 升序删除，最新的一条永不因此丢失。
+        /// </summary>
+        static void SweepDoneArchive()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_doneDir) || !Directory.Exists(_doneDir)) return;
+                var files = Directory.GetFiles(_doneDir, "*");
+                if (files.Length == 0) return;
+
+                var nowMs = NowMs();
+                var entries = new List<KeyValuePair<string, double>>(files.Length);
+                for (var i = 0; i < files.Length; i++)
+                {
+                    try
+                    {
+                        var mtime = File.GetLastWriteTimeUtc(files[i]).ToUniversalTime().Subtract(
+                            new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                        entries.Add(new KeyValuePair<string, double>(files[i], mtime));
+                    }
+                    catch (Exception) { }
+                }
+                if (entries.Count == 0) return;
+                entries.Sort(delegate (KeyValuePair<string, double> a, KeyValuePair<string, double> b)
+                {
+                    return a.Value.CompareTo(b.Value);
+                });
+
+                // 升序排序后：超龄的一定是前缀，超量的也一定是最旧的那些 —— 取两者较大值。
+                var overAge = 0;
+                for (var i = 0; i < entries.Count; i++)
+                {
+                    if (nowMs - entries[i].Value > DoneRetentionMs) overAge = i + 1;
+                }
+                var overCount = entries.Count - MaxDoneFiles;
+                var toRemove = Math.Max(overAge, overCount);
+                var removed = 0;
+                for (var i = 0; i < toRemove && i < entries.Count; i++)
+                {
+                    try
+                    {
+                        File.Delete(entries[i].Key);
+                        removed += 1;
+                    }
+                    catch (Exception) { }
+                }
+                if (removed > 0) AddDiagnostic("done-swept:" + removed);
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
         /// 请求内容的摘要（原始文件字节的 SHA-256 前 16 个十六进制字符）。
         ///
         /// 用途：调用方校验「这条响应确实对应我写进去的那份请求」，防止同 id 的迟到响应
@@ -682,22 +803,166 @@ namespace DSHBridge
             if (files.Length == 0) return;
             Array.Sort(files, StringComparer.Ordinal);
 
-            // 约束不变：一次扫描**只执行一个**有效请求，避免阻塞主线程过久。
-            // 但无效文件（半写 JSON、别的实例的残留）允许在本次扫描内连续丢弃——
+            // 积压快速失败（P2-47）：本轮扫描开始前先看队列长度，超过 MaxInboxBacklog
+            // 的部分立即回写 instance_busy 并移出 inbox。
+            //
+            // 为什么必须在扫描**前**判断：探针是单槽串行执行器，一次扫描最多取
+            // MaxRequestsPerScan 个；inbox 堆到几十个时，队尾请求在调用方的 timeout_ms
+            // 内根本轮不到执行。让它们安静排队的结果是每个调用都变成「超时 + 目标是否
+            // 已执行的未知状态」，而这恰恰是最容易诱发重复破坏性操作的状态。
+            // 立刻回写一个可重试的结论，比让调用方超时更有信息量。
+            var overflow = files.Length - MaxInboxBacklog;
+            if (overflow > 0)
+            {
+                files = RejectBacklogFiles(files, overflow);
+                if (files.Length == 0) return;
+            }
+
+            // 一次扫描可以连续执行多个有效请求（P2-25）：旧实现「消费一个就 break」把吞吐
+            // 钉死在 10 req/s，并发调用时后面的请求要等 N 个扫描周期才出队，很容易撞上
+            // 调用方默认 30s 超时。这里用 MaxRequestsPerScan + ScanBudgetMs 双重上限兜住
+            // 主线程占用；单个请求本身的耗时不可中断，预算只决定「是否再取下一个」。
+            //
+            // 无效文件（半写 JSON、别的实例的残留）仍允许在本次扫描内连续丢弃——
             // 否则 inbox 里残留 N 个坏文件时，每个正常请求都要多等 N 个扫描周期。
             //
             // 旧的 `_scanning` 重入标志已删除：Poll 只由 Tick 在主线程调用，
             // 重入不可能发生，保留它属于死代码（AUD-CODE-001 P2）；异常由 Tick 的分段
             // try/catch 兜住，不会把「扫描中」状态永久卡住。
             var discarded = 0;
+            var executed = 0;
+            var budget = Stopwatch.StartNew();
             for (var i = 0; i < files.Length; i++)
             {
                 if (discarded >= MaxDiscardsPerScan) break;
+                if (executed >= MaxRequestsPerScan) break;
+                if (executed > 0 && budget.ElapsedMilliseconds >= ScanBudgetMs) break;
                 var outcome = HandleFile(files[i]);
                 if (outcome == HandleOutcome.Absent) break;
-                if (outcome == HandleOutcome.Consumed) break;
+                if (outcome == HandleOutcome.Consumed)
+                {
+                    executed += 1;
+                    continue;
+                }
                 discarded += 1;
             }
+        }
+
+        /// <summary>
+        /// 把超出 MaxInboxBacklog 的请求立刻拒绝（P2-47），返回本轮仍需正常处理的文件。
+        ///
+        /// 保留序号最小（最早写入）的 MaxInboxBacklog 个继续走正常路径：
+        /// 它们是最可能被调用方仍等待着的请求，必须先被消化。
+        /// 溢出部分逐个 <see cref="RejectBacklogFile"/>；本轮最多处理
+        /// MaxBacklogRejectsPerScan 个，剩下的留在 inbox 交给下一轮（Poll 每 0.1s 一次），
+        /// 绝不因为一次清理长时间占用主线程。
+        /// </summary>
+        static string[] RejectBacklogFiles(string[] files, int overflow)
+        {
+            var keepCount = files.Length - overflow;
+            if (keepCount < 0) keepCount = 0;
+            var keep = new string[keepCount];
+            Array.Copy(files, keep, keepCount);
+            var rejected = 0;
+            for (var i = keepCount; i < files.Length; i++)
+            {
+                if (rejected >= MaxBacklogRejectsPerScan) break;
+                var outcome = RejectBacklogFile(files[i]);
+                if (outcome == HandleOutcome.Absent) continue;
+                rejected += 1;
+            }
+            return keep;
+        }
+
+        /// <summary>
+        /// 单个溢出请求的拒绝路径（P2-47）：写回 instance_busy + 从 inbox 移除。
+        ///
+        /// 两个动作缺一不可：
+        ///   - 只写响应不移除 → 下一轮扫描会再次命中同一个文件并重复回写（且 id 已进 done，
+        ///     变成重复投递）；
+        ///   - 只移除不写响应 → 调用方只能等到 timeout，无法区分「目标忙」与「目标没在跑」。
+        ///
+        /// 复用 HandleFile 的读取上限与四元组校验：不属于本实例的请求绝不能被写响应
+        /// （那会把「忙」伪造进别的会话的 outbox），只能归档丢弃。
+        /// </summary>
+        static HandleOutcome RejectBacklogFile(string path)
+        {
+            var fileName = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(fileName)) return HandleOutcome.Absent;
+            var progressPath = Path.Combine(_progressDir, fileName);
+            var donePath = Path.Combine(_doneDir, fileName);
+
+            byte[] rawBytes;
+            try
+            {
+                var info = new FileInfo(path);
+                if (!info.Exists) return HandleOutcome.Absent;
+                if (info.Length > MaxRequestBytes)
+                {
+                    AddChannelDiagnosticSafe("oversized-request:" + info.Length.ToString(CultureInfo.InvariantCulture));
+                    Finish(path, donePath);
+                    return HandleOutcome.Discarded;
+                }
+                rawBytes = File.ReadAllBytes(path);
+            }
+            catch { return HandleOutcome.Absent; }
+            if (rawBytes.Length > MaxRequestBytes)
+            {
+                AddChannelDiagnosticSafe("oversized-request-race:" + rawBytes.Length.ToString(CultureInfo.InvariantCulture));
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+
+            Dictionary<string, object> req = null;
+            try { req = MiniJson.Parse(new UTF8Encoding(false).GetString(rawBytes)) as Dictionary<string, object>; }
+            catch { }
+            if (req == null)
+            {
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+
+            var id = GetString(req, "id");
+            if (string.IsNullOrEmpty(id) || !IsSafeRequestId(id))
+            {
+                AddDiagnostic("backlog-unsafe-id");
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+            if (GetString(req, "instanceId") != _instanceId
+                || GetString(req, "bootId") != _bootId
+                || GetString(req, "nonce") != _nonce)
+            {
+                // 不是本实例会话的请求：回写响应会污染别人（或可被伪造），只归档。
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+
+            // 已经处理过的 id 绝不覆盖：outbox/done 里可能是一条真实结果。
+            if (File.Exists(Path.Combine(_outboxDir, id + ".json")) || File.Exists(Path.Combine(_doneDir, id + ".json")))
+            {
+                AddChannelDiagnosticSafe("backlog-duplicate-dropped:" + id);
+                Finish(path, donePath);
+                return HandleOutcome.Discarded;
+            }
+
+            try
+            {
+                if (File.Exists(progressPath)) File.Delete(progressPath);
+                File.Move(path, progressPath);
+            }
+            catch { return HandleOutcome.Absent; }
+
+            AddChannelDiagnosticSafe("backlog-rejected:" + id);
+            return RespondError(
+                id,
+                CreateResponseSkeleton(id, rawBytes),
+                "instance_busy",
+                "目标编辑器是单槽串行执行器，inbox 已积压超过 " + MaxInboxBacklog + " 个待处理请求，"
+                    + "本请求未被取回执行（未产生任何副作用）。请退避后重试：不要并发堆请求，"
+                    + "必要时把批量操作拆成串行调用。",
+                progressPath,
+                donePath);
         }
 
         /// <summary>
@@ -753,7 +1018,24 @@ namespace DSHBridge
                         var existingOutbox = Path.Combine(_outboxDir, id + ".json");
                         if (!File.Exists(existingOutbox))
                         {
-                            try { WriteAtomic(existingOutbox, MiniJson.Serialize(resp)); } catch { }
+                            // P2-30：补写 unknown 失败时**绝不能归档 in-progress**。
+                            // 归档会让调用方的 isInProgress=false 且 outbox 里没有任何结论，
+                            // 「可能已执行」的唯一证据被抹掉，调用方会按「未执行」安全重试，
+                            // 破坏性操作（asset.delete / menu.execute / code.execute）就会重复执行。
+                            // 保留 in-progress 文件，让本次和下次回收（以及 DSH 的 in_flight 判定）
+                            // 仍然能看到它，并留下通道诊断供排障。
+                            var published = false;
+                            try
+                            {
+                                WriteAtomic(existingOutbox, MiniJson.Serialize(resp));
+                                published = true;
+                            }
+                            catch { }
+                            if (!published)
+                            {
+                                AddChannelDiagnosticSafe("recover-publish-failed:" + id);
+                                continue;
+                            }
                         }
                     }
                     Finish(file, Path.Combine(_doneDir, Path.GetFileName(file)));
@@ -868,26 +1150,14 @@ namespace DSHBridge
             }
 
             // 四元组校验：拒绝不属于本实例会话的请求。
-            var resp = new Dictionary<string, object>();
-            resp["v"] = 1L;
-            resp["id"] = id;
-            resp["instanceId"] = _instanceId;
-            resp["bootId"] = _bootId;
-            resp["nonce"] = _nonce;
-            resp["probeVersion"] = ProbeVersion;
-            resp["executionState"] = "not-started";
-            // 归属证据：摘要基于**调用方写入的原始字节**，双方算的是同一串，不需要 JSON 规范化。
-            resp["requestHash"] = RequestHashOfBytes(rawBytes);
+            var resp = CreateResponseSkeleton(id, rawBytes);
 
             var incomingInstance = GetString(req, "instanceId");
             var incomingBoot = GetString(req, "bootId");
             var incomingNonce = GetString(req, "nonce");
             if (incomingInstance != _instanceId || incomingBoot != _bootId || incomingNonce != _nonce)
             {
-                resp["ok"] = false;
-                resp["error"] = Error("pairing_mismatch", "请求不属于本实例会话", null);
-                PublishResponse(id, resp, progressPath, donePath);
-                return HandleOutcome.Consumed;
+                return RespondError(id, resp, "pairing_mismatch", "请求不属于本实例会话", progressPath, donePath);
             }
 
             // 过期校验：DSH 已放弃的请求绝不能产生副作用（例如延迟切进 Play Mode）。
@@ -896,11 +1166,7 @@ namespace DSHBridge
             var nowMs = NowMs();
             if (issuedAt > 0 && deadlineMs > 0 && nowMs > issuedAt + deadlineMs)
             {
-                resp["ok"] = false;
-                resp["error"] = Error("expired", "请求已超过 deadline，出于安全未执行", null);
-                resp["elapsedMs"] = 0L;
-                PublishResponse(id, resp, progressPath, donePath);
-                return HandleOutcome.Consumed;
+                return RespondError(id, resp, "expired", "请求已超过 deadline，出于安全未执行", progressPath, donePath);
             }
 
             // 重复 id：同一 id 再次投递时不能静默覆盖已有响应/归档，也不能让人误以为执行了两次。
@@ -908,11 +1174,7 @@ namespace DSHBridge
             var archivedPath = Path.Combine(_doneDir, id + ".json");
             if (File.Exists(outboxPath) || File.Exists(archivedPath))
             {
-                resp["ok"] = false;
-                resp["error"] = Error("duplicate_id", "请求 id 已处理过；请为每次调用使用新的 id", null);
-                resp["elapsedMs"] = 0L;
-                PublishResponse(id, resp, progressPath, donePath);
-                return HandleOutcome.Consumed;
+                return RespondError(id, resp, "duplicate_id", "请求 id 已处理过；请为每次调用使用新的 id", progressPath, donePath);
             }
 
             var cap = GetString(req, "cap");
@@ -922,11 +1184,7 @@ namespace DSHBridge
             // JSON null 与缺省同义，按空对象处理。
             if (req.ContainsKey("args") && req["args"] != null && !(req["args"] is Dictionary<string, object>))
             {
-                resp["ok"] = false;
-                resp["error"] = Error("invalid_argument", "args 必须是 JSON object", null);
-                resp["elapsedMs"] = 0L;
-                PublishResponse(id, resp, progressPath, donePath);
-                return HandleOutcome.Consumed;
+                return RespondError(id, resp, "invalid_argument", "args 必须是 JSON object", progressPath, donePath);
             }
             var args = req.ContainsKey("args") ? req["args"] as Dictionary<string, object> : null;
             if (args == null) args = new Dictionary<string, object>();
@@ -951,6 +1209,50 @@ namespace DSHBridge
             sw.Stop();
             resp["elapsedMs"] = sw.ElapsedMilliseconds;
 
+            PublishResponse(id, resp, progressPath, donePath);
+            return HandleOutcome.Consumed;
+        }
+
+        /// <summary>
+        /// 响应骨架（P2-47 收口）：HandleFile 与积压拒绝共用，避免两条路径的字段漂移。
+        ///
+        /// 字段必须与 DSH 侧 takeResponse 的解析一致：`v` 参与协议版本校验（P3-78/P3-92），
+        /// `id`/`instanceId`/`bootId`/`nonce` 参与四元组配对，`requestHash` 是归属证据。
+        /// `executionState` 预填 "not-started"：此刻尚未进入执行，调用方可安全重试。
+        /// </summary>
+        static Dictionary<string, object> CreateResponseSkeleton(string id, byte[] rawBytes)
+        {
+            var resp = new Dictionary<string, object>();
+            resp["v"] = 1L;
+            resp["id"] = id;
+            resp["instanceId"] = _instanceId;
+            resp["bootId"] = _bootId;
+            resp["nonce"] = _nonce;
+            resp["probeVersion"] = ProbeVersion;
+            resp["executionState"] = "not-started";
+            // 归属证据：摘要基于**调用方写入的原始字节**，双方算的是同一串，不需要 JSON 规范化。
+            resp["requestHash"] = RequestHashOfBytes(rawBytes);
+            return resp;
+        }
+
+        /// <summary>
+        /// 拒绝响应模板（P3-89）：把「填 error + 归档 + 消费」收敛成一次调用。
+        ///
+        /// HandleFile 里原先逐字复制了 4 份拒绝路径（pairing_mismatch / expired /
+        /// duplicate_id / invalid_argument），任何一处漏改都会让拒绝响应的结构不一致，
+        /// 而 DSH 侧 takeResponse 是按同一结构解析 error/elapsedMs 的。
+        /// executionState 已由调用方预填为 "not-started"（未进入执行，可安全重试），
+        /// 这里只补齐 ok / error / elapsedMs。
+        /// 积压快速失败（P2-47）复用同一出口：instance_busy 也必须归档 + 消费，
+        /// 否则请求会留在 inbox 里被反复处理。
+        /// </summary>
+        static HandleOutcome RespondError(
+            string id, Dictionary<string, object> resp, string code, string message,
+            string progressPath, string donePath)
+        {
+            resp["ok"] = false;
+            resp["error"] = Error(code, message, null);
+            resp["elapsedMs"] = 0L;
             PublishResponse(id, resp, progressPath, donePath);
             return HandleOutcome.Consumed;
         }
@@ -1012,12 +1314,19 @@ namespace DSHBridge
             return _reflectEnabled.HasValue ? _reflectEnabled.Value : AuthorizedByArgv();
         }
 
+        /// <summary>
+        /// 不值得作为事件上报的「调用方错误」：请求本身不可用/已放弃，与安全边界和内部故障无关。
+        /// 其余错误码（含 probe_error / io_error 这类内部失败）一律留事件——
+        /// 旧实现只记录 8 个越权类错误码，导致探针内部失败在事件流里完全不可见（P3-101）。
+        /// </summary>
+        static readonly HashSet<string> _rejectionNoiseCodes = new HashSet<string>(StringComparer.Ordinal) {
+            "expired", "duplicate_id", "invalid_argument", "pairing_mismatch"
+        };
+
         /// <summary>越权尝试要留下事件，否则注入攻击在事件流里完全不可见（AA-OBS-001）。</summary>
         static void RecordRejection(string id, string cap, string code, string message)
         {
-            if (code != "capability_denied" && code != "path_escape" && code != "member_not_public"
-                && code != "member_denied" && code != "type_denied" && code != "editor_busy"
-                && code != "path_denied" && code != "already_exists") return;
+            if (!string.IsNullOrEmpty(code) && _rejectionNoiseCodes.Contains(code)) return;
             var payload = new Dictionary<string, object>
             {
                 { "requestId", id ?? "" },

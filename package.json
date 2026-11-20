@@ -1,7 +1,7 @@
 {
   "name": "dsh-bridge-workspace",
   "license": "MIT",
-  "version": "0.0.10",
+  "version": "0.0.12",
   "private": true,
   "type": "module",
   "description": "DSH-Bridge workspace: DSH-side bridge plugin and its governance artifacts.",
@@ -13,8 +13,12 @@
     "doctor": "node scripts/bridge-doctor.mjs",
     "verify:live": "node scripts/verify-live-capabilities.mjs",
     "verify:tools": "node scripts/verify-dsh-tool-surface.mjs",
-    "verify": "npm run test && npm run check:probe && npm run check:docs && openspec validate --specs && node scripts/check-openspec-state.mjs && python3 /Users/long/.dsh/skills/project-architect/scripts/check_project_architecture.py --root . --check-docs --check-kickoff --check-traceability --check-fitness --strict",
-    "check:docs": "node scripts/check-doc-consistency.mjs"
+    "verify:arch": "node scripts/check-project-architecture.mjs",
+    "verify:full": "npm run verify && npm run verify:arch",
+    "verify": "npm run test && npm run lint && npm run check:boundaries && npm run check:probe && npm run check:docs && openspec validate --specs && node scripts/check-openspec-state.mjs",
+    "check:docs": "node scripts/check-doc-consistency.mjs",
+    "check:boundaries": "node scripts/check-module-boundaries.mjs",
+    "lint": "node scripts/check-code-style.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createUnityAdapter, UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
-import { instanceIdFor } from '../../packages/dsh-bridge/core/identity.mjs'
+import { instanceIdFor } from '../../packages/dsh-bridge/shared/identity.mjs'
 import { Bridge } from '../../packages/dsh-bridge/core/bridge.mjs'
 import { FakeEditor } from '../fixtures/fake-editor.mjs'
 

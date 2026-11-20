@@ -94,7 +94,22 @@
 
 - **WHEN** 系统计算危险能力清单
 - **THEN** 清单包含全部可改变宿主状态的执行面（反射、资产破坏性操作、导入设置、强制刷新）
+- **AND** 清单包含 `unity.code.execute`（**写代码 = 执行代码**，不得默认开启）
 - **AND** 探针侧永久关闭的能力不进入可授权清单
+- **AND** 探针侧能力闸门与 DSH 侧危险清单逐项一致（任一侧漏加都会让「默认关闭」变成假安全）
+
+#### Scenario: 高权能力在审计不可用时拒绝
+
+- **WHEN** 调用的能力属于 `ALWAYS_HIGH_RISK`（`unity.code.execute`、`unity.script.apply_edits`）
+- **AND** 审计被禁用或最近写入失败
+- **THEN** 系统在发送请求前拒绝该调用（`audit_unavailable`）
+- **AND** 该拒绝本身也尝试写入审计
+
+#### Scenario: 资产写入按扩展名分级
+
+- **WHEN** 调用 `unity.asset.create` 写入 `.cs` / `.asmdef` / `.asmref`
+- **THEN** 该写入与 `unity.code.execute` 共用同一份授权快照
+- **AND** 写普通资产（`.txt` / `.prefab` / `.mat` 等）不需要该授权
 
 #### Scenario: 同工程多编辑器
 
@@ -106,7 +121,14 @@
 
 - **WHEN** 系统创建实例通道目录
 - **THEN** 目录权限必须为 `0700`
-- **AND** 实例注册文件必须只包含可验证的身份字段，不包含凭据
+- **AND** 实例注册文件必须只包含可验证的身份字段，不包含用户凭据
+
+#### Scenario: 配对密钥不外发
+
+- **WHEN** 系统暴露实例列表给调用方（`bridge_targets`）
+- **THEN** 输出中不得包含 `nonce`
+- **AND** `nonce` 是通道配对的**短期共享密钥**（每次启动轮换），只存在于工程内 `0600` 的注册文件与进程内存
+- **AND** 它不进入工具输出、模型上下文或调用日志
 
 ### Requirement: 可观测性
 
@@ -115,8 +137,17 @@
 #### Scenario: 探针版本漂移
 
 - **WHEN** 实例探针版本与 DSH 侧期望版本不一致
-- **THEN** 实例被标记为 `version_mismatch`
-- **AND** 平台提供升级动作
+- **THEN** 实例条目的 `probeOutdated` 为 `true`（字段名就是 `probeOutdated`，不存在 `version_mismatch`）
+- **AND** 调用在发送前被拒绝（`probe_outdated`），并提示执行 `bridge_install` 升级
+
+#### Scenario: 通道状态完整枚举
+
+- **WHEN** 调用方读取实例的 channel status
+- **THEN** 取值必为以下六者之一，且每个都有明确处置：
+  `unprobed`（未安装探针 → `bridge_install`）、`ready`（可直接调用）、
+  `idle`（编辑器在后台，**仍可调用**：系统会先唤醒）、`channel_missing`（心跳正常但 `bootId` 目录丢失 → `bridge_install`）、
+  `stale`（进程已消失）、`error`（适配器发现失败 → 看 `error.code`）
+- **AND** 「探测失败」不得被渲染成「没有实例」
 
 #### Scenario: 心跳
 

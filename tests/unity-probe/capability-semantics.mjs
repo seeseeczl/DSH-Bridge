@@ -4,7 +4,7 @@
 // 用法：node tests/unity-probe/capability-semantics.mjs
 // 退出码非 0 表示探针存在越权/异常行为；同时把失败项打印出来（AA-OPT-007 的「修复前必须红」依据）。
 import { execFile, spawn } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -90,6 +90,12 @@ public static class Harness
             Args(new object[] { "kind", "text", "path", "../../../../tmp/dsh-bridge-escape.txt", "content", "escaped" }));
         ExpectEscape(true); Run(results, "asset.create-absolute", "unity.asset.create",
             Args(new object[] { "kind", "text", "path", "/tmp/dsh-bridge-absolute.txt", "content", "absolute" }));
+        // AA-SEC-003：工程内符号链接指向工程外时，字符串前缀检查会通过，必须由真实路径判定拦下。
+        ExpectEscape(true); Run(results, "asset.create-symlink-escape", "unity.asset.create",
+            Args(new object[] { "kind", "text", "path", "Assets/link/escaped.txt", "content", "escaped" }));
+        ExpectEscape(true); Run(results, "asset.read-symlink-escape", "unity.asset.read",
+            Args(new object[] { "path", "Assets/link/secret.txt" }));
+        ExpectEscape(false);
         Run(results, "asset.create-inside-project", "unity.asset.create",
             Args(new object[] { "kind", "text", "path", "Assets/Generated/inside.txt", "content", "ok" }));
         ExpectEscape(true); Run(results, "search.content-absolute-folder", "unity.search.content",
@@ -189,6 +195,64 @@ public static class Harness
             try { Submit("unity.code.execute", Args(new object[] { "code", "return " + repeat + ";" })); }
             catch (System.Exception) { }
         }
+
+        // ===== P2-40：写守卫 / 读取白名单 / 检索预算的**行为级**用例 =====
+        // 这一组刻意断言"探针实际返回什么"，而不是源码里有没有某个字符串：
+        //   - 探针自身源码目录（embedded package 与旧版目录）任何授权下都不可写；
+        //   - 写可编译源码（.cs/.asmdef/.asmref）复用 unity.code.execute 授权快照；
+        //   - asset.read 的通道目录白名单（Library/、ProjectSettings/）不可读；
+        //   - search.content 的 budgetMs 必须被硬上限夹紧。
+        // 夹具：apply_edits 需要真实存在的文件，否则会先撞 not_found 掩盖写守卫。
+        File.WriteAllText(Path.Combine(projectRoot, "Assets", "W2fEditable.txt"), "alpha\\nbeta\\n");
+        File.WriteAllText(Path.Combine(projectRoot, "Assets", "W2fSourceA.cs"), "line1\\nline2\\n");
+        File.WriteAllText(Path.Combine(projectRoot, "Assets", "W2fSourceB.cs"), "line1\\nline2\\n");
+
+        Run(results, "script.apply_edits-probe-package", "unity.script.apply_edits",
+            ApplyEditsArgs("Packages/com.dsh.bridge/Editor/DSHBridgeProbe.cs", "hacked"));
+        // 已授权也必须拒绝：这条守卫与授权无关（授权改了它就是"一次安装后永久敞开"）。
+        RunAuthorized(results, "script.apply_edits-probe-package-authorized", "unity.script.apply_edits",
+            ApplyEditsArgs("Packages/com.dsh.bridge/Editor/DSHBridgeProbe.cs", "hacked"));
+        Run(results, "script.apply_edits-legacy-probe", "unity.script.apply_edits",
+            ApplyEditsArgs("Assets/DSHBridge/Editor/DSHBridgeProbe.cs", "hacked"));
+        // 正对照：普通文本资产在没有 code.execute 授权时仍可编辑（守卫不能一刀切）。
+        Run(results, "script.apply_edits-text-unauthorized", "unity.script.apply_edits",
+            ApplyEditsArgs("Assets/W2fEditable.txt", "ALPHA"));
+        // 写可编译源码与 code.execute 共用授权：未授权拒绝，授权后放行。
+        Run(results, "script.apply_edits-script-unauthorized", "unity.script.apply_edits",
+            ApplyEditsArgs("Assets/W2fSourceA.cs", "FIRST"));
+        RunAuthorized(results, "script.apply_edits-script-authorized", "unity.script.apply_edits",
+            ApplyEditsArgs("Assets/W2fSourceB.cs", "FIRST"));
+
+        Run(results, "asset.create-script-unauthorized", "unity.asset.create",
+            Args(new object[] { "kind", "script", "path", "Assets/W2fNoAuth.cs", "content", "public class W2fNoAuth {}" }));
+        RunAuthorized(results, "asset.create-script-authorized", "unity.asset.create",
+            Args(new object[] { "kind", "script", "path", "Assets/W2fAuth.cs", "content", "public class W2fAuth {}" }));
+        // 正对照：kind=text 写普通资产不能因为"写入通道"而被授权闸门误伤。
+        Run(results, "asset.create-text-unauthorized", "unity.asset.create",
+            Args(new object[] { "kind", "text", "path", "Assets/W2fNote.txt", "content", "plain text" }));
+
+        // asset.read 只允许 Assets/ 与 Packages/：通道目录与工程设置一律不可读。
+        Run(results, "asset.read-channel-instance", "unity.asset.read",
+            Args(new object[] { "path", "Library/DSHBridge/instance.json" }));
+        Run(results, "asset.read-channel-done", "unity.asset.read",
+            Args(new object[] { "path", "Library/DSHBridge/0000000000000000/done/req_test.json" }));
+        Run(results, "asset.read-project-settings", "unity.asset.read",
+            Args(new object[] { "path", "ProjectSettings/ProjectSettings.asset" }));
+
+        // search.content 的 budgetMs 上下界都必须夹紧（请求 60s 不得真跑 60s）。
+        Run(results, "search.content-budget-clamp", "unity.search.content",
+            Args(new object[] { "query", "x", "budgetMs", 60000L }));
+        Run(results, "search.content-budget-floor", "unity.search.content",
+            Args(new object[] { "query", "x", "budgetMs", 1L }));
+
+        // ===== P2-42：控制台脱敏走真实 OnLog → 环形队列 → unity.console.read 链路 =====
+        // 断言目标有两面：凭据必须被掩掉，普通日志必须逐字节不变（误掩会破坏排障可读性）。
+        RunAuthorized(results, "console.redact-normal", "unity.console.read",
+            Args(new object[] { "limit", 400L }),
+            delegate { UnityEngine.Application.RaiseLog("W2F_MARK_NORMAL 重建 Library：12 个文件 30ms rate=1.5", "", UnityEngine.LogType.Log); });
+        RunAuthorized(results, "console.redact-secret", "unity.console.read",
+            Args(new object[] { "limit", 400L }),
+            delegate { UnityEngine.Application.RaiseLog("W2F_MARK_SECRET login password=hunter2 token=abc123def456", "", UnityEngine.LogType.Log); });
 
         // ===== 域级能力用例（tests/unity-probe/cases/*.mjs 注入）=====
 __DOMAIN_CASES_PLACEHOLDER__
@@ -302,6 +366,13 @@ __DOMAIN_CASES_PLACEHOLDER__
         }
         payload["duplicateId"] = duplicateProbe;
 
+        // 探针**自己声明**的闸门集合（_blockedCapabilities + _reflectCapabilities）。
+        // Node 侧据此判断「写可编译源码该被拒还是该放行」，而不是去正则匹配源码文本：
+        // 断言以运行时事实为准，探针增删闸门时测试自动跟随，不会假装通过。
+        var probeGate = new List<object>();
+        foreach (var cap in DSHBridgeProbe.DangerousCapabilitiesForTest()) probeGate.Add(cap);
+        payload["probeGate"] = probeGate;
+
         payload["diagnosticsCount"] = DSHBridgeProbe.__bridge_diagnostics_count__();
         payload["results"] = results;
         File.WriteAllText(outFile, MiniJson.Serialize(payload), new UTF8Encoding(false));
@@ -361,6 +432,24 @@ __DOMAIN_CASES_PLACEHOLDER__
         var d = new Dictionary<string, object>();
         d["path"] = "../../../etc/hosts";
         d["changes"] = changes;
+        return d;
+    }
+
+    /// <summary>
+    /// apply_edits 的最小合法载荷：把第 1 行第 1..6 列替换成 replacement。
+    /// 行列区间刻意保持"对任何 >=5 字符的单行都合法"，这样失败一定来自写守卫而不是 edit_out_of_range。
+    /// </summary>
+    static Dictionary<string, object> ApplyEditsArgs(string path, string replacement)
+    {
+        var edit = new Dictionary<string, object>();
+        edit["startLine"] = 1L; edit["startColumn"] = 1L;
+        edit["endLine"] = 1L; edit["endColumn"] = 6L;
+        edit["text"] = replacement;
+        var edits = new List<object>();
+        edits.Add(edit);
+        var d = new Dictionary<string, object>();
+        d["path"] = path;
+        d["edits"] = edits;
         return d;
     }
 
@@ -608,6 +697,11 @@ export async function runSemantics({ env } = {}) {
   const projectRoot = join(workDir, 'Project')
   await mkdir(join(projectRoot, 'Assets'), { recursive: true })
   await writeFile(join(projectRoot, 'Assets', 'Thing.prefab'), 'x', 'utf8')
+  // AA-SEC-003：工程内某段被替换成指向工程外的符号链接（真实攻击形态）。
+  const outsideDir = join(workDir, 'Outside')
+  await mkdir(outsideDir, { recursive: true })
+  await writeFile(join(outsideDir, 'secret.txt'), 'outside-secret', 'utf8')
+  await symlink(outsideDir, join(projectRoot, 'Assets', 'link'))
   const { exePath, output } = await compile(workDir)
   if (!output.includes('semantics.exe') && !(await readFile(exePath).then(() => true).catch(() => false))) {
     throw new Error(`探针语义测试编译失败：\n${output}`)
@@ -623,6 +717,8 @@ export async function runSemantics({ env } = {}) {
   const exitCode = await new Promise((resolve) => child.on('close', resolve))
   if (exitCode !== 0) throw new Error(`探针语义测试进程退出 ${exitCode}：\n${stderr}`)
   const payload = JSON.parse(await readFile(resultPath, 'utf8'))
+  // 符号链接逃逸目标是否真的出现了文件（必须在 workDir 删除前取证）。
+  payload.symlinkEscapedFileExists = await access(join(outsideDir, 'escaped.txt')).then(() => true).catch(() => false)
   if (!process.env.DSH_BRIDGE_KEEP_WORKDIR) await rm(workDir, { recursive: true, force: true })
   return { payload, projectRoot, workDir }
 }

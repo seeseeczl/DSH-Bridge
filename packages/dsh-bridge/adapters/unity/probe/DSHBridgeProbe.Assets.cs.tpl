@@ -30,6 +30,21 @@ namespace DSHBridge
         // Play Mode 下 target=game 优先用 ScreenCapture（GameView 的真实呈现：Overlay UI、
         // 多相机 stacking、后处理），失败或非 Play Mode 才回退相机渲染，并用 fallback 显式标注。
         const int ScreenshotArtifactRetainCount = 200;
+        // P3-119：序列目录也要有保留上限与清理。旧实现只删文件不删目录，
+        // 每次 screenshot.sequence 都新建一个 sequence-* 目录并永久留下（文件数被 200 约束，
+        // 目录数/inode 却无界增长）；而每次截图都要 AllDirectories 全量枚举，
+        // 于是单次截图成本随历史序列数线性上升。这里按目录保留最近 N 个，并给清理加节流。
+        const int ScreenshotSequenceRetainCount = 50;
+        // 清理节流间隔：连续截图（序列逐帧写盘）时不必每帧都做全量枚举。
+        const int ScreenshotPruneIntervalMs = 60000;
+        static long _nextScreenshotPruneTicks;
+
+        /// <summary>是否是需要按序列目录保留策略清理的序列目录（sequence-* 前缀）。</summary>
+        static bool IsScreenshotSequenceDirectoryName(string name)
+        {
+            return !string.IsNullOrEmpty(name)
+                && name.StartsWith("sequence-", StringComparison.OrdinalIgnoreCase);
+        }
 
         static Dictionary<string, object> ScreenshotCapture(Dictionary<string, object> args)
         {
@@ -147,29 +162,69 @@ namespace DSHBridge
         /// <summary>
         /// 生成前按数量清理 artifacts：只保留最近 ScreenshotArtifactRetainCount 个文件，
         /// 防止长时间使用后目录无界增长。清理失败不影响截图主流程（最坏情况是没清掉）。
+        /// P3-119：同时清理 sequence-* 目录 —— 先删空目录，再按目录保留最近
+        /// ScreenshotSequenceRetainCount 个整体删除（目录项本身也会无界增长）。
+        /// P3-119：加 60s 节流，避免序列逐帧写盘时每帧都做一次全量递归枚举。
         /// </summary>
         static void PruneScreenshotArtifacts()
         {
             try
             {
+                var now = DateTime.UtcNow.Ticks;
+                if (_nextScreenshotPruneTicks > 0 && now < _nextScreenshotPruneTicks) return;
+                _nextScreenshotPruneTicks = now + (long)ScreenshotPruneIntervalMs * TimeSpan.TicksPerMillisecond;
                 var dir = ScreenshotArtifactsDirectory();
                 if (!System.IO.Directory.Exists(dir)) return;
+
+                // 1) 按文件数保留（原有语义）。
                 var files = System.IO.Directory.GetFiles(dir, "*", System.IO.SearchOption.AllDirectories);
-                if (files == null || files.Length <= ScreenshotArtifactRetainCount) return;
-                var ordered = new List<KeyValuePair<string, DateTime>>(files.Length);
-                for (var i = 0; i < files.Length; i++)
+                if (files != null && files.Length > ScreenshotArtifactRetainCount)
                 {
-                    try { ordered.Add(new KeyValuePair<string, DateTime>(files[i], System.IO.File.GetLastWriteTimeUtc(files[i]))); }
+                    var ordered = new List<KeyValuePair<string, DateTime>>(files.Length);
+                    for (var i = 0; i < files.Length; i++)
+                    {
+                        try { ordered.Add(new KeyValuePair<string, DateTime>(files[i], System.IO.File.GetLastWriteTimeUtc(files[i]))); }
+                        catch (Exception) { }
+                    }
+                    ordered.Sort(delegate (KeyValuePair<string, DateTime> left, KeyValuePair<string, DateTime> right)
+                    {
+                        return left.Value.CompareTo(right.Value);
+                    });
+                    var removeCount = ordered.Count - ScreenshotArtifactRetainCount;
+                    for (var i = 0; i < removeCount; i++)
+                    {
+                        try { System.IO.File.Delete(ordered[i].Key); } catch (Exception) { }
+                    }
+                }
+
+                // 2) 序列目录：按目录保留最近 N 个，整体删除更早的（含目录内的帧文件）。
+                var sequenceDirs = new List<KeyValuePair<string, DateTime>>();
+                foreach (var sub in System.IO.Directory.GetDirectories(dir))
+                {
+                    if (!IsScreenshotSequenceDirectoryName(System.IO.Path.GetFileName(sub))) continue;
+                    try { sequenceDirs.Add(new KeyValuePair<string, DateTime>(sub, System.IO.Directory.GetLastWriteTimeUtc(sub))); }
                     catch (Exception) { }
                 }
-                ordered.Sort(delegate (KeyValuePair<string, DateTime> left, KeyValuePair<string, DateTime> right)
+                sequenceDirs.Sort(delegate (KeyValuePair<string, DateTime> left, KeyValuePair<string, DateTime> right)
                 {
                     return left.Value.CompareTo(right.Value);
                 });
-                var removeCount = ordered.Count - ScreenshotArtifactRetainCount;
-                for (var i = 0; i < removeCount; i++)
+                var dropDirs = sequenceDirs.Count - ScreenshotSequenceRetainCount;
+                for (var i = 0; i < dropDirs; i++)
                 {
-                    try { System.IO.File.Delete(ordered[i].Key); } catch (Exception) { }
+                    try { System.IO.Directory.Delete(sequenceDirs[i].Key, true); } catch (Exception) { }
+                }
+
+                // 3) 清掉已经空了的 sequence-* 目录（录屏失败/中断时只留下空壳）。
+                foreach (var sub in System.IO.Directory.GetDirectories(dir))
+                {
+                    if (!IsScreenshotSequenceDirectoryName(System.IO.Path.GetFileName(sub))) continue;
+                    try
+                    {
+                        if (System.IO.Directory.GetFileSystemEntries(sub).Length == 0)
+                            System.IO.Directory.Delete(sub, false);
+                    }
+                    catch (Exception) { }
                 }
             }
             catch (Exception) { }
@@ -272,7 +327,8 @@ namespace DSHBridge
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var full = ResolveProjectPath(path, "path");
-            // P1-2：apply_edits 是默认开启的写能力，必须拒绝写探针自身源码（提权向量）。
+            // P1-5：get_sha 是读侧，但也要拒绝探针自身源码 —— 否则可以先探知源码 sha、
+            // 再配合其它写入口做定向改写。写侧的完整守卫在 ScriptApplyEdits。
             EnsureWritableAssetPath(ToProjectRelative(full), "path");
             EnsureTextable(full, "path");
             if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
@@ -376,6 +432,13 @@ namespace DSHBridge
             var path = GetString(args, "path");
             if (string.IsNullOrEmpty(path)) throw new KnownError("invalid_argument", "缺少 path");
             var full = ResolveProjectPath(path, "path");
+            // P1-1 / P1-5 / P2-21：apply_edits 是默认开启的写能力，必须与 asset.create / get_sha
+            // 走同一道写守卫。缺这道守卫时可直接改写 Packages/com.dsh.bridge/Editor/*.cs
+            // （探针自身源码）或新建任意 .cs，下一次编译即等价于任意代码执行，
+            // 把 DSH 侧与探针侧的能力授权、bridge.denied 全部旁路掉。
+            // EnsureCompilableSourceWritable 同时覆盖"探针源码目录禁止写"与
+            // "写可编译源码需 unity.code.execute 授权"两半。
+            EnsureCompilableSourceWritable(ToProjectRelative(full), "path");
             EnsureTextable(full, "path");
             if (!System.IO.File.Exists(full)) throw new KnownError("not_found", "文件不存在: " + path);
             // 只读一次字节：sha、precondition 与正文解码基于同一份快照，避免中途被外部改动造成错配。

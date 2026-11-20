@@ -2,7 +2,7 @@
 
 ## Purpose
 
-定义第一期 Unity 适配器：在用户已打开的 Unity Editor 上，通过单文件探针提供编辑器级观测与控制能力，并支持多实例并行。
+定义第一期 Unity 适配器：在用户已打开的 Unity Editor 上，通过 embedded package 形态的多文件探针（partial class）提供编辑器级观测与控制能力，并支持多实例并行。
 
 ## Requirements
 
@@ -22,26 +22,43 @@
 - **THEN** 系统合并进程发现结果与探针注册信息，输出单一实例条目
 - **AND** 该条目可供后续调用直接寻址
 
-### Requirement: 单文件探针安装
+### Requirement: 多文件探针包安装
 
-系统 SHALL 通过向工程投放单个 C# 文件完成探针安装。
+系统 SHALL 通过向工程投放一个 **embedded package** 完成探针安装：包清单 + 多个 C# partial class 文件
+（当前 15 个 `.cs` + 1 个 `package.json`），落在 `<工程>/Packages/com.dsh.bridge/Editor/`，不是 `Assets/`。
+多文件拆分由 ADR-0003 决定，取代 ADR-0002 的单文件约束；「整目录删除即卸载」这一目标保持不变。
 
 #### Scenario: 安装
 
 - **WHEN** 调用方对 `unprobed` 实例执行安装
-- **THEN** 系统在工程 `Assets/` 下创建探针目录与单一探针文件
-- **AND** 安装结果包含将创建的文件清单与是否触发一次编译重载
+- **THEN** 系统在工程 `Packages/com.dsh.bridge/Editor/` 下落地包清单与全部 partial class 文件
+- **AND** 安装结果包含将创建的文件清单、内容摘要与是否触发一次编译重载
+- **AND** 探针包在 Project 窗口不可见，且只在本地 `.git/info/exclude` 里被忽略（不修改 `.gitignore`）
+
+#### Scenario: 已运行实例的升级需要重启
+
+- **WHEN** 对已就绪实例安装内容有变化的探针
+- **THEN** 安装结果带 `restartRequired: true`
+- **AND** 渲染文案明确说明「必须重启编辑器才生效」，不得把未重启呈现为已生效
 
 #### Scenario: 安装前预览
 
-- **WHEN** 调用方要求预览
+- **WHEN** 调用方要求预览（`dry_run: true`）
 - **THEN** 系统返回完整文件清单与内容摘要，不写入任何文件
 
 #### Scenario: 卸载
 
 - **WHEN** 调用方执行卸载
-- **THEN** 探针目录被删除
+- **THEN** 探针包目录被删除
+- **AND** `<工程>/Library/DSHBridge/` 通道数据（实例注册、请求归档、事件、截图、作业）一并删除
+- **AND** `keepDiagnostics: true` 时保留排障现场，仅删探针包
 - **AND** 实例回到 `unprobed` 状态
+
+#### Scenario: 旧版单文件探针的迁移清理
+
+- **WHEN** 工程里仍存在旧版 `Assets/DSHBridge/` 探针
+- **THEN** 该目录只作为**迁移清理目标**存在：安装/卸载流程按旧版位置清理并移出 `.git/info/exclude`
+- **AND** 新的安装位置永远不是 `Assets/DSHBridge`（文档门禁会拒绝把它当探针位置）
 
 ### Requirement: 编辑器观测能力
 

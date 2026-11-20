@@ -3,7 +3,8 @@
 // 本模块是 core/docs-index.mjs 的实现细节；loadDocIndex / clearDocIndexCache
 // 由 docs-index.mjs re-export，调用方不需要直接依赖本文件。
 import { readFile, stat } from 'node:fs/promises'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { resolve } from 'node:path'
+import { assertInside } from '../safety/policy.mjs'
 
 const MAX_INDEX_CACHE = 8
 const MAX_SIGNATURES = 8
@@ -61,10 +62,20 @@ export async function loadDocIndex(documentationRoot) {
   return promise
 }
 
-/** 页面 id 只允许落在文档根内；返回 false 时调用方应报 doc_not_found。 */
+/**
+ * 页面 id 只允许落在文档根内；返回 false 时调用方应报 doc_not_found。
+ *
+ * P3-90：「目标路径必须在 root 之内」以前有 4 份实现（policy/installer/knowledge/docs-html），
+ * 语义还互相矛盾。这里改为 safety/policy.mjs 的权威实现 assertInside 的**布尔包装**，
+ * 只把异常翻译成 false，判定口径与其余三处保持一致（target === root 同样算越界）。
+ */
 export function isInside(root, target) {
-  const rel = relative(resolve(root), resolve(target))
-  return Boolean(rel) && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+  try {
+    assertInside(root, target)
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ---------- index.json 解析 ----------
@@ -192,6 +203,21 @@ export function extractDescription(html) {
   return toPlainText(body)
 }
 
+/**
+ * 按**码点**截断（P3-84）。
+ *
+ * `String.prototype.slice` 按 UTF-16 码元切，emoji / 扩展 B 区汉字（代理对）会被切成
+ * 半个字符（孤立 surrogate），既显示成乱码，也会让下游 JSON/日志出现非法序列。
+ * 与 safety/audit.mjs 的 truncateText 同一实现口径：先 Array.from 展开成码点再切。
+ */
+export function truncateToCodePoints(text, maxCodePoints) {
+  const value = String(text ?? '')
+  const limit = Number.isInteger(maxCodePoints) && maxCodePoints > 0 ? maxCodePoints : 0
+  const chars = Array.from(value)
+  if (limit === 0 || chars.length <= limit) return { text: value, truncated: false }
+  return { text: chars.slice(0, limit).join(''), truncated: true }
+}
+
 /** 提取代码示例：官方用 <pre class="codeExampleCS">，也兼容 <pre><code> 与无 class 的 pre。 */
 export function extractCodeExamples(html) {
   const examples = []
@@ -203,8 +229,10 @@ export function extractCodeExamples(html) {
       .replace(/[ \t]+\n/g, '\n')
       .trim()
     if (!text) continue
-    examples.push(text.length > MAX_CODE_EXAMPLE_CHARS
-      ? `${text.slice(0, MAX_CODE_EXAMPLE_CHARS)}\n// …（示例过长，已截断）`
+    // 截断按码点，避免把 emoji/代理对切成半个字符后原样返回给工具面。
+    const clipped = truncateToCodePoints(text, MAX_CODE_EXAMPLE_CHARS)
+    examples.push(clipped.truncated
+      ? `${clipped.text}\n// …（示例过长，已截断）`
       : text)
   }
   return examples

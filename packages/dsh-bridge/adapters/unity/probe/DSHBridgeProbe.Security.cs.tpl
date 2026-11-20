@@ -22,6 +22,149 @@ namespace DSHBridge
 {
     public static partial class DSHBridgeProbe
     {
+        // ===== 符号链接边界（AA-SEC-003）=====
+        // 字符串前缀比较挡不住「工程内某一段是符号链接、实际指向工程外」：
+        // Path.GetFullPath 只做字符串规范化，不跟随链接，因此 Assets/link → /etc 能通过前缀检查。
+        // 这里在放行前解析真实路径：Unix 用 libc realpath，Windows 用 ReparsePoint 逐段检测。
+        // 判定只用于「是否允许」，不改变返回给调用方的路径形态——
+        // 否则 macOS 的 /var → /private/var 会让「工程内相对路径」凭空变成另一种写法。
+        // P2-13：realpath 完全不可用（P/Invoke 缺失）时 _realpathUnavailable 置位；
+        // 工程根真实路径解析失败（含 Windows 上工程位于 ReparsePoint 之下）时 _realpathFallback 置位。
+        // 两个标志都只是**诊断信息**：它们让路径检查 fail-closed（拒绝），
+        // 而不再像旧实现那样把整条符号链接防线静默关闭。见 IsCanonicallyInsideProject / IsRealpathDegraded。
+        static bool _realpathUnavailable;
+        static bool _realpathFallback;
+
+        [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, ExactSpelling = true)]
+        static extern IntPtr realpath(string path, IntPtr resolved);
+
+        static bool IsUnixEditorPlatform()
+        {
+            return Application.platform == RuntimePlatform.OSXEditor || Application.platform == RuntimePlatform.LinuxEditor;
+        }
+
+        /// <summary>
+        /// 把路径解析成真实路径（跟随符号链接）。路径尾部可以尚不存在（例如要创建的新文件）：
+        /// 向上找到最深的已存在祖先解析真实路径，再把不存在的段原样拼回。
+        /// 无法解析时返回 null，由调用方决定拒绝还是降级。
+        /// </summary>
+        static string CanonicalizeExistingPrefix(string full)
+        {
+            if (string.IsNullOrEmpty(full) || full.IndexOf('\0') >= 0) return null;
+            return IsUnixEditorPlatform() ? CanonicalizeUnix(full) : CanonicalizeWindows(full);
+        }
+
+        static string CanonicalizeUnix(string full)
+        {
+            if (_realpathUnavailable) return null;
+            var remaining = new List<string>();
+            var current = full;
+            for (var depth = 0; depth < 128; depth++)
+            {
+                var resolved = TryRealpathNative(current);
+                if (resolved != null)
+                {
+                    for (var i = remaining.Count - 1; i >= 0; i--) resolved = Path.Combine(resolved, remaining[i]);
+                    return resolved;
+                }
+                var parent = Path.GetDirectoryName(current);
+                if (string.IsNullOrEmpty(parent) || string.Equals(parent, current, StringComparison.Ordinal)) return null;
+                remaining.Add(Path.GetFileName(current));
+                current = parent;
+            }
+            return null;
+        }
+
+        /// <summary>调用 libc realpath；只 P/Invoke 一个符号，符合探针「零端口/零第三方」约束。</summary>
+        static string TryRealpathNative(string path)
+        {
+            var buffer = IntPtr.Zero;
+            try
+            {
+                // PATH_MAX 在 macOS/Linux 都是 4096。
+                buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal(4096);
+                if (realpath(path, buffer) == IntPtr.Zero) return null;
+                return System.Runtime.InteropServices.Marshal.PtrToStringAnsi(buffer);
+            }
+            catch (DllNotFoundException) { _realpathUnavailable = true; return null; }
+            catch (EntryPointNotFoundException) { _realpathUnavailable = true; return null; }
+            catch (Exception) { return null; }
+            finally
+            {
+                if (buffer != IntPtr.Zero) System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Windows：没有 libc realpath，改用「已存在段不得是 ReparsePoint」判定。
+        /// 工程内出现 junction/符号链接时无法安全判定其目标，直接拒绝（fail-closed）。
+        /// </summary>
+        static string CanonicalizeWindows(string full)
+        {
+            var remaining = new List<string>();
+            var current = full;
+            for (var depth = 0; depth < 128; depth++)
+            {
+                if (HasReparsePoint(current)) return null;
+                if (Directory.Exists(current) || File.Exists(current))
+                {
+                    for (var i = remaining.Count - 1; i >= 0; i--) current = Path.Combine(current, remaining[i]);
+                    return current;
+                }
+                var parent = Path.GetDirectoryName(current);
+                if (string.IsNullOrEmpty(parent) || string.Equals(parent, current, StringComparison.Ordinal)) return null;
+                remaining.Add(Path.GetFileName(current));
+                current = parent;
+            }
+            return null;
+        }
+
+        static bool HasReparsePoint(string path)
+        {
+            try
+            {
+                var attributes = File.GetAttributes(path);
+                return (attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 真实路径是否仍在工程真实根之内。
+        /// P2-13：**无法判定时一律拒绝（fail-closed）**。
+        /// 旧实现在降级模式（realpath 不可用）下 `return true`，等于把 AA-SEC-003 的
+        /// 「逐段解析符号链接」整条防线在进程存活期内静默关闭：工程内任一符号链接
+        /// （如 Assets/data → /Users/me/.dsh）都能穿过路径检查读写工程外文件。
+        /// 现在降级态改为拒绝，并用 IsRealpathDegraded() 把「本机处于降级态」暴露给诊断/上报，
+        /// 让运维看到的是「能力受限」而不是「边界消失」。
+        /// </summary>
+        static bool IsCanonicallyInsideProject(string full)
+        {
+            var root = _projectRootReal;
+            if (string.IsNullOrEmpty(root)) return false;
+            if (_realpathFallback) return false;
+            var canonical = CanonicalizeExistingPrefix(full);
+            if (string.IsNullOrEmpty(canonical)) return false;
+            if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+            {
+                root = root + Path.DirectorySeparatorChar;
+            }
+            return canonical.StartsWith(root, PathComparison);
+        }
+
+        /// <summary>
+        /// P2-13：本机是否处于「真实路径判定不可用」的降级态。
+        /// 降级态下所有路径检查都按拒绝处理（fail-closed），调用方/诊断应据此告警，
+        /// 而不是误以为探针的越界防护完好。
+        /// </summary>
+        public static bool IsRealpathDegraded()
+        {
+            return _realpathFallback || _realpathUnavailable;
+        }
+
         // ===== 路径边界（AA-OPT-002 / AA-OPT-003）=====
         // 所有真实文件系统访问都必须经过这里：绝对路径与 ../ 逃逸一律拒绝。
         // Project 根用 FullName 参与比较，避免 /tmp 与 /private/tmp 之类的符号链接造成误判。
@@ -32,8 +175,13 @@ namespace DSHBridge
             string full;
             try { full = Path.GetFullPath(Path.IsPathRooted(raw) ? raw : Path.Combine(_projectRoot, raw)); }
             catch (Exception e) { throw new KnownError("path_escape", what + " 无法解析: " + e.Message); }
-            if (IsInsideProject(full)) return full;
-            throw new KnownError("path_escape", what + " 落在工程之外，已拒绝：" + raw);
+            if (!IsInsideProject(full)) throw new KnownError("path_escape", what + " 落在工程之外，已拒绝：" + raw);
+            // AA-SEC-003：字符串包含成立还不够——工程内某一段可能是指向工程外的符号链接。
+            if (!IsCanonicallyInsideProject(full))
+            {
+                throw new KnownError("path_escape", what + " 经符号链接指向工程之外，已拒绝：" + raw);
+            }
+            return full;
         }
 
         /// <summary>
@@ -109,7 +257,7 @@ namespace DSHBridge
         }
 
         // ===== 授权闸门（AA-OPT-001 / AUD-CODE-001 P1-5）=====
-        // 与 DSH 侧 DEFAULT_DANGEROUS 完全一致的 16 项危险能力，在探针侧同样默认关闭：
+        // 与 DSH 侧 DEFAULT_DANGEROUS 完全一致的 17 项危险能力，在探针侧同样默认关闭：
         // 只有「安装时注入的源码快照」或 argv 整机旁路能放行，绕过 DSH 直接写 inbox 也一样会被拒绝。
         // 闸门必须发生在 Execute 之前：被拒绝的请求 executionState=not-started，调用方可安全重试。
         //
@@ -151,7 +299,7 @@ namespace DSHBridge
         }
 
         /// <summary>
-        /// 探针在本地关闭/需授权的能力清单（13 项 = _blockedCapabilities + _reflectCapabilities），
+        /// 探针在本地关闭/需授权的能力清单（17 项 = _blockedCapabilities + _reflectCapabilities），
         /// 供诊断与测试断言。命名为 ForTest 是历史原因；它描述的是真实闸门集合，不是测试专用清单。
         /// </summary>
         public static string[] DangerousCapabilitiesForTest()

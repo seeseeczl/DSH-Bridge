@@ -1,7 +1,10 @@
-// 安全边界：危险能力白名单、路径包含校验、追加式审计日志。
-import { open, rename, stat } from 'node:fs/promises'
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
-import { mkdir } from 'node:fs/promises'
+// 安全边界：危险能力清单、授权判定与路径包含校验。
+//
+// 审计实现（createAudit / summarize）已拆到同目录 audit.mjs，这里用 re-export 保持对外 API
+// 完全不变——既有 `import { createAudit, summarize } from '.../safety/policy.mjs'` 不需要任何改动。
+import { isAbsolute, relative, resolve, sep } from 'node:path'
+
+export { createAudit, defaultAuditPath, summarize } from './audit.mjs'
 
 /**
  * 默认危险能力：必须由插件配置显式开启（AA-OPT-001）。
@@ -17,9 +20,9 @@ import { mkdir } from 'node:fs/promises'
  * unity.api.batch 与 api.invoke 等价（能触达私有成员，只是支持一次多条 + 共享 Undo 组），
  * 因此同样默认关闭；探针侧也把它放在需要授权快照的清单里，两侧必须一致。
  *
- * unity.code.execute 是**唯一默认开启**的高权能力：它是 MCP execute_code 的等价通道，
- * ASE 编辑流程依赖它（见 docs 的迁移说明）。它不受白名单/硬拒绝清单约束——一旦允许写代码，
- * 那些清单就不再构成边界。需要收紧时，把能力名加进插件配置 `bridge.dangerous` 即可让它重新变成「需显式授权」。
+ * 本清单与探针 `_reflectCapabilities` 逐项一致是项目硬约束
+ * （`tests/unit/probe-source-shape.test.mjs` 有双向断言）：单侧漏加会让「DSH 默认关闭」变成假安全，
+ * 绕过 DSH 直接写 inbox 就能执行。任何增删必须两侧同时改，顺序也保持一致。
  */
 export const DEFAULT_DANGEROUS = Object.freeze([
   'unity.reflect.invoke',
@@ -42,11 +45,54 @@ export const DEFAULT_DANGEROUS = Object.freeze([
   'unity.tag.remove',
   'unity.layer.remove',
   'unity.physics.simulate',
+  // P3-70（默认授权模型收敛）：写代码 = 执行代码 = 需授权。
+  // 它过去是「唯一默认开启」的高权能力，零配置即可在编辑器进程内编译执行任意 C#，
+  // 等于让本清单对「任意代码执行」这一类后果失去约束力。现在与 api.invoke 同级：
+  // 默认拒绝，需要时由调用方在 allowDangerous 里显式开启（ASE 流程通过 cordis.patch.yml 授权）。
+  // 探针侧必须同步把它加入 `_reflectCapabilities`，否则该授权快照不覆盖 code.execute，
+  // EnsureCapabilityAllowed('unity.code.execute') 会直接放行。
+  'unity.code.execute',
 ])
 
 /** 探针侧永久关闭的能力：即使 DSH 放行，探针也会拒绝。
  *  用户决策（2026-11-18）：能力与自由优先，当前为空；`unity.menu.execute` 已降级为可授权危险能力。 */
 export const PROBE_BLOCKED = Object.freeze([])
+
+/**
+ * 非适配器能力、但同样属于高权写入的 DSH 侧动作：预植入会向磁盘上多个工程写探针包。
+ * 它不进 DEFAULT_DANGEROUS（那张表必须与探针 `_reflectCapabilities` 逐项一致），
+ * 单独作为「需显式授权」的能力名参与同一套 allowDangerous 语义。
+ */
+export const PREINSTALL_APPLY = 'bridge.preinstall.apply'
+
+/**
+ * 无论配置如何都按高权处理的执行面：一旦放行就没有第二道闸门，
+ * 唯一运行时补偿控制是审计留痕，因此审计不可用时必须 fail-closed（AA-SEC-004）。
+ *
+ * - `unity.code.execute`：进程内编译执行任意 C#（MCP execute_code 的等价通道）。
+ * - `unity.script.apply_edits`：行列级 patch 可改写任意 .cs（含探针自身源码），
+ *   编辑器下一次编译/域重载即执行任意 C#——后果与 code.execute 完全相同，因此同级处理（P1-1）。
+ *   它**不进** DEFAULT_DANGEROUS：写可编译源码的判定下沉到探针 `EnsureCompilableSourceWritable`，
+ *   按 .cs/.asmdef/.asmref 扩展名精确拦截并复用 code.execute 授权快照（P1-1/P1-4）。
+ *   DSH 侧按能力名一刀切既与探针重复，又会误伤普通资产创建（写 Assets/X.txt 本不需要授权）。
+ */
+export const ALWAYS_HIGH_RISK = Object.freeze(['unity.code.execute', 'unity.script.apply_edits'])
+
+/**
+ * 能力是否需要显式授权：只看危险清单。
+ *
+ * 曾经的 CODE_WRITE_CAPABILITIES（unity.asset.create / unity.script.apply_edits）已删除：
+ * 「写可编译源码」不再由 DSH 侧按能力名拦截，改为探针侧按扩展名精确拦截（见 ALWAYS_HIGH_RISK 注释）。
+ * 收敛后的语义：默认配置下 code.execute 被拒；asset.create 写普通资产放行，写 .cs 需 code.execute 授权。
+ */
+export function requiresAuthorization(capability, dangerous = DEFAULT_DANGEROUS) {
+  return dangerous.includes(capability)
+}
+
+/** 能力是否属于高权执行面：需授权的能力，或无论配置都按高权处理的 ALWAYS_HIGH_RISK。 */
+export function isHighRiskCapability(capability, dangerous = DEFAULT_DANGEROUS) {
+  return requiresAuthorization(capability, dangerous) || ALWAYS_HIGH_RISK.includes(capability)
+}
 
 export class PolicyError extends Error {
   constructor(code, message, detail) {
@@ -58,11 +104,33 @@ export class PolicyError extends Error {
 }
 
 /**
+ * 能力清单类型校验（P3-82）：字符串会退化成 `String.prototype.includes` 的子串匹配，
+ * 既可能误放行（"xunity.asset.delete"）也可能误拒绝。配置错误必须在判定入口暴露，
+ * 而不是静默降级成不可预期的授权语义。
+ */
+function assertCapabilityList(value, label) {
+  if (!Array.isArray(value)) {
+    throw new PolicyError(
+      'invalid_config',
+      `配置 ${label} 必须是字符串数组，实际收到 ${value === null ? 'null' : typeof value}`,
+      { label, received: typeof value },
+    )
+  }
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0) {
+      throw new PolicyError('invalid_config', `配置 ${label} 只能包含非空字符串，实际收到 ${typeof item}`, { label })
+    }
+  }
+}
+
+/**
  * 能力授权：危险能力需 allowDangerous 包含该能力名。
  * @returns {{ok: true} | {ok: false, code: string, message: string}}
  */
 export function authorizeCapability(capability, { allowDangerous = [], dangerous = DEFAULT_DANGEROUS } = {}) {
-  if (!dangerous.includes(capability)) return { ok: true }
+  assertCapabilityList(allowDangerous, 'allowDangerous')
+  assertCapabilityList(dangerous, 'dangerous')
+  if (!requiresAuthorization(capability, dangerous)) return { ok: true }
   if (allowDangerous.includes(capability)) return { ok: true }
   return {
     ok: false,
@@ -82,53 +150,25 @@ export function assertInside(root, target) {
   return full
 }
 
-const MAX_AUDIT_BYTES = 8 * 1024 * 1024
+const LOG_LEVELS = Object.freeze({ debug: 10, info: 20, warn: 30, error: 40 })
 
 /**
- * 追加式审计：每行一个 JSON。
- * 文件以 0600 创建并强制回正权限，超过阈值轮转为 .1，避免无限增长。
+ * 极简结构化日志：只写 stderr，默认 level=warn，`DSH_BRIDGE_LOG_LEVEL=debug|info` 可临时提级（P3-99）。
+ *
+ * 插件侧此前没有任何运行日志设施，传输层/发现层的 catch 全部静默返回中性值，
+ * 故障只表现为「调用都超时」而没有痕迹。这里是单一定义，供各模块按需调用；
+ * 日志自身失败绝不影响主流程（返回 false 而不是抛错）。
  */
-export function createAudit(logPath, { enabled = true, maxBytes = MAX_AUDIT_BYTES } = {}) {
-  let ready = null
-  let lastRotateCheck = 0
-  const ensure = () => {
-    ready ??= mkdir(dirname(logPath), { recursive: true, mode: 0o700 })
-    return ready
-  }
-  return {
-    path: logPath,
-    async record(entry) {
-      if (!enabled) return
-      try {
-        await ensure()
-        if (maxBytes > 0 && Date.now() - lastRotateCheck > 5000) {
-          lastRotateCheck = Date.now()
-          const info = await stat(logPath).catch(() => null)
-          if (info && info.size > maxBytes) await rename(logPath, `${logPath}.1`).catch(() => {})
-        }
-        const handle = await open(logPath, 'a', 0o600)
-        try {
-          // 文件已存在时 open 不会改权限，这里显式回正。
-          await handle.chmod(0o600).catch(() => {})
-          await handle.writeFile(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, 'utf8')
-        } finally {
-          await handle.close()
-        }
-      } catch {
-        // 审计失败不得影响调用结果；doctor 可检查审计可用性。
-      }
-    },
-  }
-}
-
-/** 参数摘要：只保留结构形状，避免把业务内容整体写进日志。 */
-export function summarize(value, maxLength = 200) {
-  if (value === undefined || value === null) return null
-  let text
+export function logEvent(level, event, detail = {}) {
+  const name = LOG_LEVELS[level] === undefined ? 'warn' : level
+  const configured = String(process.env.DSH_BRIDGE_LOG_LEVEL ?? 'warn').toLowerCase()
+  const threshold = LOG_LEVELS[configured] ?? LOG_LEVELS.warn
+  if (LOG_LEVELS[name] < threshold) return false
   try {
-    text = typeof value === 'string' ? value : JSON.stringify(value)
+    const payload = detail !== null && typeof detail === 'object' ? detail : { detail }
+    process.stderr.write(`${JSON.stringify({ ts: new Date().toISOString(), level: name, event, ...payload })}\n`)
+    return true
   } catch {
-    text = String(value)
+    return false
   }
-  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text
 }

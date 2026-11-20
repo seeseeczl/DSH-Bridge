@@ -31,8 +31,8 @@ test('请求原子投递且不残留临时文件', async () => {
 
 test('精确取件：只消费自己的响应，别人的留在原地', async () => {
   const dir = await project()
-  await writeResponse(dir, 'b1', { id: 'req_a', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
-  await writeResponse(dir, 'b1', { id: 'req_b', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_a', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_b', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
 
   const identity = identityFor(dir)
   const mine = await takeResponse(identity, 'req_a')
@@ -49,7 +49,7 @@ test('精确取件：只消费自己的响应，别人的留在原地', async ()
 test('同一响应不会被取两次', async () => {
   const dir = await project()
   const identity = identityFor(dir)
-  await writeResponse(dir, 'b1', { id: 'req_1', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_1', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
   assert.ok(await takeResponse(identity, 'req_1'))
   assert.equal(await takeResponse(identity, 'req_1'), null)
 })
@@ -57,7 +57,7 @@ test('同一响应不会被取两次', async () => {
 test('配对不匹配的响应被消费并报错，不阻塞等待', async () => {
   const dir = await project()
   const identity = identityFor(dir)
-  await writeResponse(dir, 'b1', { id: 'req_1', instanceId: 'unity:x', bootId: 'b1', nonce: 'WRONG', ok: true })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_1', instanceId: 'unity:x', bootId: 'b1', nonce: 'WRONG', ok: true })
   await assert.rejects(() => takeResponse(identity, 'req_1'), (e) => e.code === 'pairing_mismatch')
 })
 
@@ -127,8 +127,8 @@ test('等待响应：别人的响应不影响自己，超时只在自己 deadlin
   const dir = await project()
   const identity = identityFor(dir)
   const promise = waitForResponse(identity, 'req_ok', { timeoutMs: 1500, pollMs: 15 })
-  await writeResponse(dir, 'b1', { id: 'req_other', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
-  await writeResponse(dir, 'b1', { id: 'req_ok', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true, data: { v: 1 } })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_other', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true })
+  await writeResponse(dir, 'b1', { v: 1, id: 'req_ok', instanceId: 'unity:x', bootId: 'b1', nonce: 'n1', ok: true, data: { v: 1 } })
   const response = await promise
   assert.equal(response.id, 'req_ok')
   // 别人的响应仍在 outbox，交给它自己的等待者。

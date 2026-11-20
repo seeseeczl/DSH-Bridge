@@ -54,7 +54,7 @@ evidence: []
 
 ## BUG-0002 整改（v0.0.6）
 
-> 来源：`docs/03-quality/BUG-0002.md`
+> 来源：`docs/03-quality/defect-0002-tool-surface.md`
 > 发布：`docs/04-delivery/REL-0003.md`
 
 | 任务 | 关联缺陷 | 状态 | 产物 | 验收（回归） |

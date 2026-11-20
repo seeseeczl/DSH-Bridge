@@ -2,6 +2,7 @@
 // 与探针侧的 unity.docs.search / unity.docs.get 互补：不需要引擎在运行，也不走邮箱通道。
 // 输出统一带 source="local-docs"，避免被误认为在线检索结果。
 import { docsDiscoverySupport, getDoc, searchDocs } from '../core/docs-index.mjs'
+import { truncateToCodePoints } from '../core/docs-html.mjs'
 
 const ENGINE_VALUES = new Set(['auto', 'unity', 'tuanjie'])
 const DEFAULT_LIMIT = 10
@@ -39,7 +40,7 @@ export function createDocsTool(tool) {
       },
       limit: {
         type: 'integer',
-        description: '搜索返回条数，默认 10，上限 50。',
+        description: '搜索返回条数，默认 10，允许 1-50；超出范围按 invalid_args 拒绝（不静默改值）。',
       },
     },
     output: {
@@ -65,13 +66,20 @@ async function executeDocs(args) {
     const engine = (textArg(args.engine) || 'auto').toLowerCase()
     const version = textArg(args.version) || undefined
     const language = textArg(args.language) || undefined
-    const limit = normalizeLimit(args.limit)
+    const normalized = normalizeLimit(args.limit)
     const support = docsDiscoverySupport()
     const base = {
       source: 'local-docs',
       platform: support.platform,
       discoveryNote: support.note,
-      request: { symbol: symbol || null, query: query || null, engine, version: version ?? null, language: language ?? null, limit },
+      request: {
+        symbol: symbol || null,
+        query: query || null,
+        engine,
+        version: version ?? null,
+        language: language ?? null,
+        limit: normalized.limit ?? null,
+      },
     }
 
     if (!ENGINE_VALUES.has(engine)) {
@@ -87,6 +95,12 @@ async function executeDocs(args) {
           + 'symbol 查单个页面（如 Rigidbody.AddForce），query 按标题搜索（如 ForceMode）。',
       } }
     }
+
+    // P3-77：非法 limit 必须报错，而不是悄悄换回默认值——否则调用方无法区分
+    // 「参数被忽略」与「按默认值执行」，也看不到真正的取值范围。
+    // 放在 engine / symbol 校验之后：既有错误优先级保持不变，排查顺序可预期。
+    if (normalized.error) return { ...base, mode: 'error', error: normalized.error }
+    const limit = normalized.limit
 
     // symbol 优先：精确命中直接读页面；只有近似命中的时候先返回候选，避免把无关页面当答案。
     if (symbol) {
@@ -171,10 +185,23 @@ function textArg(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+/**
+ * limit 归一（P3-77）：非整数/越界一律返回结构化 error，由调用方渲染成可解释的失败，
+ * 而不是静默回退默认值。未提供时才使用默认值。
+ * @returns {{limit?: number, error?: {code: string, message: string}}}
+ */
 function normalizeLimit(value) {
+  if (value === undefined || value === null || value === '') return { limit: DEFAULT_LIMIT }
   const limit = Number(value)
-  if (!Number.isFinite(limit) || limit <= 0) return DEFAULT_LIMIT
-  return Math.min(MAX_LIMIT, Math.max(1, Math.floor(limit)))
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    return {
+      error: {
+        code: 'invalid_args',
+        message: `limit 必须是 1-${MAX_LIMIT} 的整数（默认 ${DEFAULT_LIMIT}），收到「${String(value)}」。`,
+      },
+    }
+  }
+  return { limit }
 }
 
 /** 人读摘要：错误、单页详情、搜索结果三种形态。 */
@@ -216,6 +243,7 @@ function renderDocs(value) {
 }
 
 function preview(text, max) {
-  const value = String(text ?? '')
-  return value.length <= max ? value : `${value.slice(0, max)}…`
+  // P3-84：按码点而不是 UTF-16 码元截断，避免把 emoji / 代理对切成孤立字符。
+  const { text: clipped, truncated } = truncateToCodePoints(text, max)
+  return truncated ? `${clipped}…` : clipped
 }

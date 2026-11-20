@@ -79,6 +79,24 @@ async function waitJob(jobId, timeoutMs) {
 instance = await loadInstance()
 record('P00', '探针就绪', true, { probe: instance.raw.probeVersion, caps: instance.raw.capabilities?.length, sourceHash: instance.raw.sourceHash })
 
+// 前置条件（v0.0.10 默认授权模型）：unity.code.execute 已从「默认开启」收敛为 DEFAULT_DANGEROUS 第 17 项，
+// 因此它是否可用取决于**安装探针时的授权快照**，而不是本脚本。脚本里大量用例要走 code.execute / 写 .cs，
+// 所以必须先明确告诉使用者该怎么准备，而不是让它们在 A03 处莫名其妙地 capability_denied。
+const granted = new Set(instance.raw.grantedCapabilities ?? [])
+const codeGranted = granted.has('unity.code.execute')
+record('P01', '授权快照含 unity.code.execute', codeGranted, {
+  granted: [...granted].sort(),
+  hint: codeGranted
+    ? 'ok'
+    : '请以 allowDangerous 含 unity.code.execute 重新 bridge_install 后再跑真机验收'
+      + '（默认配置下写任意 C# 与写 .cs 资产都会被 capability_denied 拒绝，这是预期行为）',
+})
+if (!codeGranted) {
+  console.error('\n前置条件不满足：探针授权快照不含 unity.code.execute。')
+  console.error('这是 v0.0.10 的默认授权模型；真机验收需要显式授权后才能跑完 A03/D02/E04/E05 等用例。')
+  process.exit(2)
+}
+
 await expectPass('A01', 'editor.status', 'unity.editor.status', {}, (d) => ({ pass: typeof d.unityVersion === 'string' && typeof d.isPlaying === 'boolean' }))
 await expectPass('A02', 'asset.create folder', 'unity.asset.create', { kind: 'folder', path: 'Assets/VerifyLive' }, (d) => ({ pass: d.created === true }))
 await expectPass('A03', 'code.execute', 'unity.code.execute', { code: 'return 40 + 2;' }, (d) => ({ pass: d.result === 42 }))

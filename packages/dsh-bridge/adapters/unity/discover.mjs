@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { instanceIdFor } from '../../core/identity.mjs'
+import { instanceIdFor } from '../../shared/identity.mjs'
 
 const run = promisify(execFile)
 
@@ -61,11 +61,20 @@ export function projectPathFromArgs(args) {
   return joined || null
 }
 
+// 进程表缓存 TTL（P3-107）：bridge_targets 是高频廉价操作，但每次都要 spawn 一次 ps
+// 并解析整张进程表。1s 内的重复发现（targets + 紧随其后的 requireInstance 未命中）
+// 复用同一份结果；失败不缓存，避免把瞬时故障钉死一秒。
+const PROCESS_LIST_TTL_MS = 1000
+let processListCache = null
+let processListFetchedAt = 0
+
 async function processList() {
+  const now = Date.now()
+  if (processListCache && now - processListFetchedAt < PROCESS_LIST_TTL_MS) return processListCache
   // 注意：macOS 的 `ps comm` 只保留 16 字符，不能用来识别引擎；
   // 这里只取 args（完整命令行，首段即可执行路径）。
   const { stdout } = await run('ps', ['-Ao', 'pid=,args='], { maxBuffer: 8 * 1024 * 1024 })
-  return stdout
+  processListCache = stdout
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
@@ -75,6 +84,8 @@ async function processList() {
       return { pid: Number(m[1]), command: m[2], args: m[2] }
     })
     .filter(Boolean)
+  processListFetchedAt = Date.now()
+  return processListCache
 }
 
 async function hasProjectSettings(projectPath) {
@@ -128,8 +139,15 @@ export async function discoverUnityInstances({ ps = processList } = {}) {
   let processes
   try {
     processes = await ps()
-  } catch {
-    return []
+  } catch (error) {
+    // 探测失败 ≠ 没有实例（P3-102）：过去这里静默 return []，bridge_targets 于是显示
+    // 「发现 0 个实例」，把「ps 不可用 / 被沙箱挡住」伪装成「一切正常」。
+    // 改为抛结构化错误，由 core/discovery.mjs 记录成 status:'error' 的发现条目，
+    // 让运维能区分「未探测到」与「探测失败」。
+    throw Object.assign(
+      new Error(`无法读取进程列表（ps 不可用），本次发现结果未知：${error?.message ?? error}`),
+      { code: 'ps_failed', cause: error?.code ?? null },
+    )
   }
   const out = []
   for (const proc of processes) {

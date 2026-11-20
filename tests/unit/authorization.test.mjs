@@ -3,7 +3,14 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DEFAULT_DANGEROUS, PROBE_BLOCKED, authorizeCapability } from '../../packages/dsh-bridge/safety/policy.mjs'
+import {
+  ALWAYS_HIGH_RISK,
+  DEFAULT_DANGEROUS,
+  PROBE_BLOCKED,
+  authorizeCapability,
+  isHighRiskCapability,
+  requiresAuthorization,
+} from '../../packages/dsh-bridge/safety/policy.mjs'
 import { UNITY_CAPABILITIES } from '../../packages/dsh-bridge/adapters/unity/index.mjs'
 import { Bridge } from '../../packages/dsh-bridge/core/bridge.mjs'
 import { knowledgeRoot, readTopic, removeTopic, saveTopic } from '../../packages/dsh-bridge/core/knowledge.mjs'
@@ -47,6 +54,49 @@ test('危险能力清单只包含真实声明过的能力', () => {
   for (const capability of [...DEFAULT_DANGEROUS, ...PROBE_BLOCKED]) {
     assert.ok(known.has(capability), `${capability} 未在适配器能力表中声明`)
   }
+})
+
+// P3-70（默认授权模型收敛）：写代码 = 执行代码 = 需授权。
+test('unity.code.execute 默认需显式授权（P3-70）', () => {
+  assert.ok(DEFAULT_DANGEROUS.includes('unity.code.execute'), 'code.execute 必须在默认危险清单里')
+  assert.ok(UNITY_CAPABILITIES.includes('unity.code.execute'), 'code.execute 仍是真实声明过的能力')
+  const denied = authorizeCapability('unity.code.execute')
+  assert.equal(denied.ok, false, '默认配置下必须拒绝')
+  assert.equal(denied.code, 'capability_disabled')
+  assert.equal(
+    authorizeCapability('unity.code.execute', { allowDangerous: ['unity.code.execute'] }).ok,
+    true,
+    '显式 allowDangerous 后按原语义放行（能力与自由优先）',
+  )
+  // 非危险能力不受影响：收敛默认值不等于把守卫扩散成全面不可用。
+  assert.equal(authorizeCapability('unity.editor.status').ok, true)
+})
+
+// P1-1 / P1-4 收口：写可编译源码的闸门下沉到探针侧按扩展名精确拦截，
+// DSH 侧不再按能力名一刀切（否则会误伤普通资产创建）。
+test('asset.create 不再由 DSH 按能力名拦截，apply_edits 仍按高权审计 fail-closed', () => {
+  assert.equal(requiresAuthorization('unity.asset.create'), false, '普通资产创建不应需要授权')
+  assert.equal(authorizeCapability('unity.asset.create').ok, true, '默认配置下放行 asset.create')
+  assert.equal(requiresAuthorization('unity.script.apply_edits'), false, 'apply_edits 不在危险清单里')
+  // 但一旦放行就没有第二道闸门：审计不可用时必须 fail-closed，与 code.execute 同级。
+  assert.ok(ALWAYS_HIGH_RISK.includes('unity.code.execute'))
+  assert.ok(ALWAYS_HIGH_RISK.includes('unity.script.apply_edits'))
+  assert.equal(isHighRiskCapability('unity.script.apply_edits'), true, 'apply_edits 必须按高权审计')
+  assert.equal(isHighRiskCapability('unity.code.execute'), true)
+  // asset.create 自身不写代码就是普通资产编辑，不享受 fail-closed 拦截。
+  assert.equal(isHighRiskCapability('unity.asset.create'), false)
+  assert.equal(isHighRiskCapability('unity.editor.status'), false, '只读能力不受影响')
+})
+
+test('CODE_WRITE_CAPABILITIES 已收敛删除，审计实现拆分后对外 API 不变', async () => {
+  const policy = await import('../../packages/dsh-bridge/safety/policy.mjs')
+  assert.equal('CODE_WRITE_CAPABILITIES' in policy, false, '该常量已收敛进探针侧扩展名闸门')
+  // 审计器拆到 audit.mjs 后仍必须从 policy.mjs 导出（现有 import 不得改动）。
+  assert.equal(typeof policy.createAudit, 'function')
+  assert.equal(typeof policy.summarize, 'function')
+  const audit = await import('../../packages/dsh-bridge/safety/audit.mjs')
+  assert.equal(policy.createAudit, audit.createAudit, 'policy.mjs 的 createAudit 必须是同一个实现')
+  assert.equal(policy.summarize, audit.summarize, 'policy.mjs 的 summarize 必须是同一个实现')
 })
 
 test('bridge_targets 暴露的危险标记与清单一致', async () => {

@@ -62,7 +62,10 @@ export async function searchDocs({
       },
     }
   }
-  const max = normalizeLimit(limit)
+  const normalizedLimit = normalizeLimit(limit)
+  // P3-77：非法 limit 报结构化错误，不静默回退默认值。
+  if (normalizedLimit.error) return emptySearch({ error: normalizedLimit.error })
+  const max = normalizedLimit.limit
   // 按偏好顺序逐个尝试：某个安装的索引缺失/为空时继续下一个，不让单个坏安装拖垮查询。
   for (const candidate of selected) {
     const entries = await loadDocIndex(candidate.documentationRoot)
@@ -191,10 +194,23 @@ function emptySearch(extra = {}) {
   }
 }
 
+/**
+ * limit 归一（P3-77）：未提供时取默认值；非整数/非正数返回结构化 error。
+ * 超过 MAX_SEARCH_LIMIT 仍按上限收敛（上限是协议的一部分，不是调用方的错）。
+ * @returns {{limit?: number, error?: {code: string, message: string}}}
+ */
 function normalizeLimit(limit) {
+  if (limit === undefined || limit === null || limit === '') return { limit: DEFAULT_SEARCH_LIMIT }
   const value = Number(limit)
-  if (!Number.isFinite(value) || value <= 0) return DEFAULT_SEARCH_LIMIT
-  return Math.min(MAX_SEARCH_LIMIT, Math.max(1, Math.floor(value)))
+  if (!Number.isInteger(value) || value < 1) {
+    return {
+      error: {
+        code: 'invalid_args',
+        message: `limit 必须是正整数（默认 ${DEFAULT_SEARCH_LIMIT}，上限 ${MAX_SEARCH_LIMIT}），收到「${String(limit)}」。`,
+      },
+    }
+  }
+  return { limit: Math.min(MAX_SEARCH_LIMIT, value) }
 }
 
 /** 生成符号候选写法：原样、去命名空间前缀、把 C# 的 :: 统一成点号。 */

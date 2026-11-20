@@ -79,6 +79,22 @@ test('AA-SEC-003 探针拒绝把资产写到工程之外', async (t) => {
   assert.equal(inside.writesOutsideProject, false)
 })
 
+test('AA-SEC-003 工程内符号链接指向外部时，读写都必须拒绝', async (t) => {
+  const result = await semantics()
+  if (!result) return t.skip(skipReason)
+  // 只查前缀的旧实现会放行（Assets/link/... 的字符串前缀仍在工程内），
+  // 必须以真实路径判定拦下，否则「工程内链接」就是一条稳定的越界读写通道。
+  const create = await row('asset.create-symlink-escape')
+  assert.equal(create.ok, false, '经符号链接的写入必须被拒绝')
+  assert.equal(create.errorCode, 'path_escape')
+
+  const read = await row('asset.read-symlink-escape')
+  assert.equal(read.ok, false, '经符号链接的读取必须被拒绝')
+  assert.equal(read.errorCode, 'path_escape')
+
+  assert.equal(result.payload.symlinkEscapedFileExists, false, '链接目标目录不得出现任何文件')
+})
+
 test('AA-SEC-001 反射执行面必须受危险能力/成员策略约束', async (t) => {
   if (skipReason) return t.skip(skipReason)
   const menu = await row('menu.execute')

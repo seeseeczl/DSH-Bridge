@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { instanceIdFor, isHex, newBootId, newNonce, normalizeInstance, projectHash, verifyPairing } from '../../packages/dsh-bridge/core/identity.mjs'
+import { instanceIdFor, isHex, newBootId, newNonce, normalizeInstance, projectHash, verifyPairing } from '../../packages/dsh-bridge/shared/identity.mjs'
 
 test('工程哈希稳定且区分不同路径', () => {
   assert.equal(projectHash('/tmp/a'), projectHash('/tmp/a'))
